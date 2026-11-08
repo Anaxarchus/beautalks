@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Radio images: your own radios' backups stay local.
+# (Test fixtures live in testdata/ and are tracked.)
+/*.img
+/backups/
+
+# Build output
+/build/
+/out/
+*.o
+.DS_Store
