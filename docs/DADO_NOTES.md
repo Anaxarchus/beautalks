@@ -50,3 +50,21 @@
 - Tests that spawn tools/emu.py are killed by any `pkill -f emu.py` run at the
   same time (and that pkill also kills the shell whose command line holds
   "emu.py"). Don't run manual emulator sessions while `dado test` runs.
+- **Apple silicon: `#heap` refuses `mem.MAX_ALIGN` (rc.9 bug).** `core:mem` has
+  `const u64 MAX_ALIGN = 16`, but the C runtime's root allocator
+  (`dado_rt__heap`) returns NULL for `align > DADO_MAX_ALIGN`, the `offsetof`
+  of a `{long double, void*, long long}` probe union: 8 on Apple arm64 (long
+  double is a double there). So every `#heap` request at `mem.MAX_ALIGN` fails
+  on the Mac: core:script's VM and handle table ("no memory for a VM", "no
+  memory for the handle table", `script/handles.dado:190`), and potentially
+  arena/slab/bump/gc. `#script_vm(libc.allocator())` works; `#script_vm(#heap)`
+  does not. Workaround: `./build.sh` (dev builds, `./build.sh test`, the
+  release's macOS build) probes for the bug on an Apple arm64 host and, when
+  present, builds against a patched copy of the collections
+  (`build/.dado-collections-patched/<dado version>-<hash>`, via
+  `DADO_COLLECTIONS`) where `MAX_ALIGN` is
+  `when #OS == #DARWIN && #ARCH == #AARCH64: 8 else: 16`. Run tests on the Mac
+  with `./build.sh test [pkgs]`, not bare `dado test`. Once a Dado release
+  fixes it, the probe passes and the stock collections are used again; then
+  delete the block "the Apple-silicon alignment workaround" from build.sh and
+  `build/.dado-collections-patched/`. Report upstream.

@@ -1,0 +1,144 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Radio page's port list on the owner's Mac: the CH340 cable
+// (/dev/cu.usbserial-140, "USB Serial", idVendor 6790 = 0x1A86, idProduct
+// 29987 = 0x7523) comes first as a known programming cable and is the
+// active port; the debug console, Bluetooth-Incoming-Port and a Bluetooth
+// headset (JLab) are "Other ports". Also: USB serial adapters in between,
+// and a cu.usbserial-* whose IDs could not be read still counts as the
+// likely cable.
+//
+// The ioreg text is the owner's (trimmed). The library reads it in
+// radio/ports.dado (ioreg_ids, private); `ioreg_pairs` below reads the
+// same lines the same way (a "key" = value per line; the device's IDs come
+// before its IOCalloutDevice), to pin the text's shape. Library request:
+// expose ioreg_ids over a text so this test can call it directly.
+package main
+
+import "core:strings"
+import "core:strings/parse"
+
+const string8 OWNER_IOREG = """
++-o USB Serial@00140000  <class IOUSBHostDevice, id 0x100001234, registered, matched, active, busy 0 (12 ms), retain 30>
+  | {
+  |   "sessionID" = 1234567890
+  |   "USB Product Name" = "USB Serial"
+  |   "idProduct" = 29987
+  |   "locationID" = 1310720
+  |   "USB Vendor Name" = ""
+  |   "idVendor" = 6790
+  |   "kUSBCurrentConfiguration" = 1
+  | }
+  |
+  +-o AppleUSBHostLegacyClient  <class AppleUSBHostLegacyClient, id 0x100001235>
+  +-o AppleUSBHostCompositeDevice  <class AppleUSBHostCompositeDevice, id 0x100001236>
+  +-o USB Serial@0  <class IOUSBHostInterface, id 0x100001237>
+    | {
+    |   "idProduct" = 29987
+    |   "idVendor" = 6790
+    |   "bInterfaceNumber" = 0
+    | }
+    +-o AppleUSBCHCOM  <class AppleUSBCHCOM, id 0x100001240>
+      +-o IOSerialBSDClient  <class IOSerialBSDClient, id 0x100001242>
+          {
+            "IOTTYBaseName" = "usbserial-"
+            "IOCalloutDevice" = "/dev/cu.usbserial-140"
+            "IODialinDevice" = "/dev/tty.usbserial-140"
+            "IOTTYSuffix" = "140"
+          }
+"""
+
+// (callout path, vid, pid) pairs from ioreg text, read line by line as the
+// library does.
+type IoregPort: (string8 path, i32 vid, i32 pid)
+
+private ref []IoregPort ioreg_pairs(string8 text):
+    ref []IoregPort out = nil
+    i32 vid = -1
+    i32 pid = -1
+    string8 line
+    strings.Splitter it = strings.splitter(text, "\n")
+    for strings.split_next(&it, &line):
+        i64 eq = strings.find(line, "\" = ")
+        if eq <= 0:
+            continue
+        string8 val = strings.trim(line[eq + 4..<#len(line)])
+        if strings.contains(line, "\"idVendor\""):
+            i64 v = -1
+            try v = parse.to_i64(val) else:
+                v = -1
+            vid = i32(v)
+        else if strings.contains(line, "\"idProduct\""):
+            i64 v = -1
+            try v = parse.to_i64(val) else:
+                v = -1
+            pid = i32(v)
+        else if strings.contains(line, "\"IOCalloutDevice\""):
+            out = #append(out, IoregPort((strings.trim_suffix(strings.trim_prefix(val, "\""), "\""), vid, pid)))
+    return out
+
+private i32 vid_of(ref []IoregPort ids, string8 path):
+    for x in ids:
+        if x.path == path:
+            return x.vid
+    return -1
+
+private i32 pid_of(ref []IoregPort ids, string8 path):
+    for x in ids:
+        if x.path == path:
+            return x.pid
+    return -1
+
+i32 test():
+    bool ok = true
+    ref []IoregPort ids = ioreg_pairs(OWNER_IOREG)
+    ok = #expect(#len(ids) == 1 && ids[0].path == "/dev/cu.usbserial-140", "ioreg: the callout device") && ok
+    ok = #expect(vid_of(ids, "/dev/cu.usbserial-140") == 0x1A86 && pid_of(ids, "/dev/cu.usbserial-140") == 0x7523, "ioreg: 6790/29987 = 1A86:7523 (CH340)") && ok
+    // the Mac's /dev/cu.* listing, in the order the system gives it
+    [5]string8 mac = ["/dev/cu.Bluetooth-Incoming-Port", "/dev/cu.JLabRewind2", "/dev/cu.debug-console", "/dev/cu.usbserial-140", "/dev/cu.usbmodem1101"]
+    ref []PortSeen ps = nil
+    for m in mac:
+        i32 v = vid_of(ids, m)
+        i32 p = pid_of(ids, m)
+        if m == "/dev/cu.usbmodem1101":
+            // some other USB device (a microcontroller board)
+            v = 0x2E8A
+            p = 0x000A
+        ps = #append(ps, port_seen(m, v, p))
+    ports_set(ps)
+    ok = #expect(eq_s(g_ports[0].path) == "/dev/cu.usbserial-140" && g_ports[0].kind == PK_CABLE && !g_ports[0].guessed, "the CH340 comes first, a known cable") && ok
+    ok = #expect(chip_name(g_ports[0]) == "CH340 cable", "badge: ", chip_name(g_ports[0])) && ok
+    ok = #expect(eq_s(g_ports[1].path) == "/dev/cu.usbmodem1101" && g_ports[1].kind == PK_USB, "a USB serial adapter next") && ok
+    i64 others = 0
+    for i in 2..<#len(g_ports):
+        if g_ports[i].kind == PK_OTHER:
+            others += 1
+    ok = #expect(others == 3 && ports_count(PK_OTHER) == 3, "Bluetooth, JLab and the debug console are Other ports") && ok
+    ok = #expect(best_port() == "/dev/cu.usbserial-140", "the one cable is the active port: ", best_port()) && ok
+    ok = #expect(port_is_cable(best_port()), "and the presence probe watches it") && ok
+    // the chip lookup failed (no IDs): cu.usbserial-* is still the likely cable
+    [3]string8 mac2 = ["/dev/cu.debug-console", "/dev/cu.usbserial-140", "/dev/cu.Bluetooth-Incoming-Port"]
+    ref []PortSeen ps2 = nil
+    for m in mac2:
+        ps2 = #append(ps2, port_seen(m, -1, -1))
+    ports_set(ps2)
+    ok = #expect(eq_s(g_ports[0].path) == "/dev/cu.usbserial-140" && g_ports[0].kind == PK_CABLE && g_ports[0].guessed, "no IDs: cu.usbserial-* is the likely cable") && ok
+    ok = #expect(chip_name(g_ports[0]) == "likely programming cable", "badge: ", chip_name(g_ports[0])) && ok
+    ok = #expect(best_port() == "/dev/cu.usbserial-140", "and still the active port") && ok
+    // other names
+    ok = #expect(port_kind("/dev/cu.wchusbserial1410", -1, -1) == PK_CABLE, "cu.wchusbserial*: likely cable") && ok
+    ok = #expect(port_kind("/dev/cu.SLAB_USBtoUART", -1, -1) == PK_USB, "SLAB_USBtoUART: USB serial") && ok
+    ok = #expect(port_kind("/dev/cu.SLAB_USBtoUART", 0x10C4, 0xEA60) == PK_CABLE, "CP210x IDs: cable") && ok
+    ok = #expect(port_kind("/dev/ttyUSB0", 0x1A86, 0x7523) == PK_CABLE && port_kind("/dev/ttyACM0", -1, -1) == PK_USB && port_kind("/dev/ttyS0", -1, -1) == PK_OTHER, "Linux names") && ok
+    ok = #expect(port_kind("COM3", 0x067B, 0x2303) == PK_CABLE && port_kind("COM1", -1, -1) == PK_OTHER, "Windows COM ports") && ok
+    // two cables: no automatic choice until the user picks one
+    ref []PortSeen ps3 = nil
+    ps3 = #append(ps3, port_seen("/dev/cu.usbserial-140", 0x1A86, 0x7523))
+    ps3 = #append(ps3, port_seen("/dev/cu.usbserial-150", 0x1A86, 0x7523))
+    ports_set(ps3)
+    ok = #expect(best_port() == "", "two cables: none picked by itself") && ok
+    g_port_pick = strings.clone("/dev/cu.usbserial-150")
+    ok = #expect(best_port() == "/dev/cu.usbserial-150", "the user's pick") && ok
+    return 0 if ok else 1

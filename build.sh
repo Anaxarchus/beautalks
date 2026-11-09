@@ -5,6 +5,8 @@
 # The one build script (docs/RELEASING.md has the whole story).
 #
 #   ./build.sh [PKG] [-o OUT]          dev build of PKG (default: the GUI) for this machine
+#   ./build.sh test [PKG...]           dado test PKG (default: radio cli driverhost updater ui),
+#                                      with the Apple-silicon MAX_ALIGN workaround when needed
 #   ./build.sh --target linux|windows [PKG] [-o OUT]
 #                                      cross-build PKG with Dado's pinned zig (release tier)
 #   ./build.sh --release [VERSION]     build every platform, package, tag, push and publish
@@ -147,6 +149,145 @@ version_define() {
     [ -z "$v" ] || printf '%s' "-D updater.APP_VERSION=$v"
 }
 
+# ── the Apple-silicon alignment workaround (Dado rc.9) ────────────────────────
+# core:mem says `const u64 MAX_ALIGN = 16`, but the C runtime's root allocator
+# (#heap, dado_rt__heap) refuses any alignment above DADO_MAX_ALIGN, the
+# offsetof of a {long double, void*, long long} probe: 8 on Apple arm64, where
+# long double is a double. So every #heap request at mem.MAX_ALIGN fails there
+# (core:script's VM and handle table: "no memory for a VM"). On an Apple arm64
+# host, builds and tests for the host run against a patched copy of the
+# collections (DADO_COLLECTIONS) whose MAX_ALIGN is 8 when the target is
+# Darwin on AArch64 and 16 otherwise. A 10-line probe decides whether the bug is
+# there, so a fixed Dado gets the stock collections automatically.
+# Cross builds (Windows, Linux) always use the stock collections.
+# docs/DADO_NOTES.md and docs/RELEASING.md say how to remove this.
+HOST_COLLECTIONS=""      # set by host_collections_setup when the patch applies
+HOST_COLLECTIONS_DONE=0
+
+# The collections root `dado where` reports.
+stock_collections() { dado where 2>/dev/null | sed -n 's/^collections=//p' | head -1; }
+
+# Build and run the probe with the stock collections. 0: the heap grants an
+# allocation at mem.MAX_ALIGN; 1: it refuses (the bug); 2: the probe did not build.
+align_probe() {
+    local dir="$ROOT/build/.dado-align-probe"
+    mkdir -p "$dir/probe"
+    cat > "$dir/probe/main.dado" <<'PROBE'
+package main
+
+import "core:fmt"
+import "core:mem"
+
+// 0 when the runtime heap grants an allocation at mem.MAX_ALIGN, 1 when it refuses one.
+i32 main():
+    (rawptr(rawptr, mem.AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) a = #heap
+    rawptr p = a.proc(a.data, mem.AllocatorMode.Alloc, 64, mem.MAX_ALIGN, nil, 0)
+    if p == nil:
+        fmt.println("refused ", mem.MAX_ALIGN)
+        return 1
+    fmt.println("granted ", mem.MAX_ALIGN)
+    return 0
+PROBE
+    (cd "$dir" && env -u DADO_COLLECTIONS -u DADO_TARGET -u ZIG_TARGET -u DADO_CFLAGS -u DADO_LDFLAGS \
+        dado build probe -o "$dir/probe-bin") >"$dir/build.log" 2>&1 || return 2
+    "$dir/probe-bin" >"$dir/run.log" 2>&1 && return 0
+    return 1
+}
+
+# Decide once per run; print one line. Sets HOST_COLLECTIONS.
+host_collections_setup() {
+    [ "$HOST_COLLECTIONS_DONE" = 0 ] || return 0
+    HOST_COLLECTIONS_DONE=1
+    local force="${BEAUTALKS_FORCE_ALIGN_PATCH:-}"
+    if [ -z "$force" ] && { [ "$HOST" != Darwin ] || [ "$(native_mac_arch)" != arm64 ]; }; then
+        return 0
+    fi
+    local rc=0
+    if [ -z "$force" ]; then
+        align_probe || rc=$?
+        if [ "$rc" = 0 ]; then
+            info "MAX_ALIGN probe: #heap grants mem.MAX_ALIGN here: stock collections (no patch needed)"
+            return 0
+        elif [ "$rc" = 2 ]; then
+            warn "the MAX_ALIGN probe did not build ($ROOT/build/.dado-align-probe/build.log): patching anyway"
+        fi
+    fi
+    local src mem ver hash dest tmp
+    src="$(stock_collections)"
+    mem="$src/core/mem/mem.dado"
+    [ -f "$mem" ] || die "cannot find the collections (dado where says '$src')"
+    ver="$(dado --version 2>/dev/null | sed -n 's/^dadoc //p' | head -1 | tr -c 'A-Za-z0-9.\n-' _)"
+    hash="$(sha256_of "$mem" | cut -c1-12)"
+    dest="$ROOT/build/.dado-collections-patched/${ver:-unknown}-$hash"
+    if [ ! -f "$dest/.beautalks-patched" ]; then
+        tmp="$dest.tmp.$$"
+        rm -rf "$tmp"; mkdir -p "$(dirname "$dest")"
+        cp -R "$src" "$tmp"
+        "$PY" - "$tmp/core/mem/mem.dado" <<'PATCH' || { rm -rf "$tmp"; die "could not patch core/mem/mem.dado (has Dado changed it?)"; }
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "const u64 MAX_ALIGN = 16\n"
+if s.count(old) != 1:
+    sys.exit("MAX_ALIGN line not found")
+s = s.replace(old, """// beautalks build.sh patch (Dado rc.9): the C runtime's #heap refuses an
+// alignment above DADO_MAX_ALIGN, which is 8 on Apple arm64 (long double is a
+// double there), so 16 made every #heap request at MAX_ALIGN fail.
+when #OS == #DARWIN && #ARCH == #AARCH64:
+    const u64 MAX_ALIGN = 8
+else:
+    const u64 MAX_ALIGN = 16
+""")
+open(p, "w").write(s)
+PATCH
+        printf 'patched from %s\n' "$src" > "$tmp/.beautalks-patched"
+        rm -rf "$dest"; mv "$tmp" "$dest"
+    fi
+    HOST_COLLECTIONS="$dest"
+    if [ -n "$force" ]; then info "MAX_ALIGN patch forced (BEAUTALKS_FORCE_ALIGN_PATCH): DADO_COLLECTIONS=$dest"
+    else info "MAX_ALIGN probe: #heap refuses mem.MAX_ALIGN (Dado rc.9 bug on Apple arm64): patch applied, DADO_COLLECTIONS=$dest"; fi
+}
+
+# Run CMD with the host collections (patched when needed).
+host_dado() {
+    host_collections_setup
+    if [ -n "$HOST_COLLECTIONS" ]; then env DADO_COLLECTIONS="$HOST_COLLECTIONS" "$@"; else "$@"; fi
+}
+
+# Packages that reach sokol_app/sokol_gfx (Objective-C on macOS).
+uses_sokol() { case "$1" in ui|app|gallery) return 0;; *) return 1;; esac; }
+
+# `dado test PKG` on this host. On macOS, sokol packages need the same
+# workaround as dev builds: Apple clang and `-x none -ObjC` (Dado rc.9 repeats
+# sokol's `-x objective-c` on the link line, so the linker would read the .o
+# files as Objective-C source).
+host_test() { # PKG
+    if [ "$(uname -s)" = Darwin ] && uses_sokol "$1"; then
+        DADO_CFLAGS="-x none -ObjC ${DADO_CFLAGS:-}" host_dado dado test "$1" --cc clang
+    else
+        host_dado dado test "$1"
+    fi
+}
+
+# `dado test` for each package, with the host collections. LOGDIR: one log per
+# package there (quiet); empty: output straight to the terminal.
+run_tests() { # LOGDIR PKG...
+    local logdir=$1 p failed=""; shift
+    host_collections_setup
+    for p in "$@"; do
+        p="${p%/}"
+        if [ -n "$logdir" ]; then
+            info "dado test $p"
+            run "$logdir/test-$p.log" host_test "$p" || failed="$failed $p"
+        else
+            step "dado test $p"
+            host_test "$p" || failed="$failed $p"
+        fi
+    done
+    if [ -n "$failed" ]; then printf '\nFAILED:%s\n' "$failed" >&2; return 1; fi
+    return 0
+}
+
 # check_version LABEL CMD...: CMD must print "beautalks <BUILD_VERSION>".
 check_version() {
     local label=$1 got; shift
@@ -167,7 +308,7 @@ build_mac() { # PKG OUT LOG ARCH
     if [ "$arch" != "$(native_mac_arch)" ]; then
         cflags="$cflags -arch $arch"; ldflags="-arch $arch"; tgt="$arch-apple-darwin"
     fi
-    run "$log" env -u ZIG_TARGET MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" \
+    run "$log" host_dado env -u ZIG_TARGET MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" \
         DADO_CFLAGS="$cflags" DADO_LDFLAGS="$ldflags" ${tgt:+DADO_TARGET=$tgt} \
         dado build "$pkg" --release --cc clang $MAC_DADO_FLAGS $(version_define) -o "$out"
 }
@@ -234,10 +375,12 @@ dev_build() {
             mkdir -p "$(dirname "$out")"
             if [ "$HOST" = Darwin ]; then
                 step "dev build of $pkg for macOS (Apple clang)"
-                DADO_CFLAGS="-x none -ObjC ${DADO_CFLAGS:-}" exec dado build "$pkg" --cc clang $(version_define) -o "$out"
+                DADO_CFLAGS="-x none -ObjC ${DADO_CFLAGS:-}" host_dado dado build "$pkg" --cc clang $(version_define) -o "$out"
+                exit $?
             fi
             step "dev build of $pkg for this machine"
-            exec dado build "$pkg" $(version_define) -o "$out"
+            host_dado dado build "$pkg" $(version_define) -o "$out"
+            exit $?
             ;;
         linux|windows)
             local shims="$ROOT/build/.release-shims" log
@@ -337,6 +480,7 @@ release() {
     export SOURCE_DATE_EPOCH; SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
     local dado_ver; dado_ver="$(dado --version 2>/dev/null | sed -n 's/^dadoc //p' | head -1)"
     info "dado: ${dado_ver:-unknown}   zig: $(find_zig)   commit: $commit"
+    host_collections_setup
 
     local DIST="$ROOT/dist/$version"
     local B="$DIST/build" STAGE="$DIST/stage" OUT="$DIST/assets" LOGS="$DIST/logs" SHIMS="$DIST/.shims"
@@ -351,11 +495,7 @@ release() {
         warn "tests were skipped"
     else
         step "tests: dado test $TEST_PKGS"
-        local p
-        for p in $TEST_PKGS; do
-            info "dado test $p"
-            run "$LOGS/test-$p.log" dado test "$p" || die "dado test $p failed (log: $LOGS/test-$p.log)"
-        done
+        run_tests "$LOGS" $TEST_PKGS || die "tests failed (logs: $LOGS/test-*.log)"
     fi
 
     # ── 3. driver bundle (the same release carries it: docs/DRIVERS.md)
@@ -583,7 +723,16 @@ finish() {
 }
 
 # ${1+"$@"}: bash 3.2 under set -u calls an empty "$@" unbound.
+test_cmd() {
+    need dado "Install Dado (see docs/RELEASING.md)."
+    local pkgs="$*"
+    [ -n "$pkgs" ] || pkgs="$TEST_PKGS"
+    run_tests "" $pkgs || exit 1
+    printf '\nall passed: %s\n' "$pkgs"
+}
+
 case "${1:-}" in
     --release) shift; release ${1+"$@"};;
+    test) shift; test_cmd ${1+"$@"};;
     *) dev_build ${1+"$@"};;
 esac

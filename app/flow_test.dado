@@ -20,6 +20,7 @@ import "core:fmt"
 import "core:os/fs"
 import "core:os/proc"
 import "core:strings"
+import "core:threads"
 import "core:time"
 import btui "../ui"
 import "../radio"
@@ -106,6 +107,114 @@ private bool models_with_untested(string8 dst, string8 file):
             return false
     return true
 
+// Frames until `done()` or `secs` of real time pass (jobs run inline, so a
+// detection try blocks a frame for as long as it takes).
+private bool frames_until(f64 secs, bool() done):
+    i64 t0 = time.unix()
+    for f64(time.unix() - t0) < secs:
+        step()
+        if done():
+            return true
+    return false
+
+private bool found_on_port():
+    string8 p = g_probe_target_test
+    return eq_s(g_probe_ok) == p
+
+private ref []char8 g_probe_target_test
+private i64 g_probe_mark
+
+private bool probed_again():
+    return g_probe_attempts >= g_probe_mark
+
+// The presence probe (probe.dado): a cable plugged in from the start, the
+// radio switched on later -> found with no click and no checklist; never
+// while a job or a flow owns the port; a port that can't be opened -> quiet
+// retries, slower after a minute.
+private bool probe_tests():
+    bool ok = true
+    g_probe_on = true
+    g_doc.open = false
+    g_radio.known = false
+    btui.dialog_close()
+    // nothing left over from the flows above: no verification holding a
+    // port, no radio marked found (pty names are reused)
+    verify_flow_close()
+    job_drop_verification()
+    write_flow_close()
+    // ── radio switched on 45 s after the app started (longer than one detection try) ──
+    Emu e
+    if fs.exists("build/appflow.port"):
+        try fs.remove_file("build/appflow.port") else:
+            return false
+    [10]string8 argv = ("python3", "tools/emu_late.py", "--on-after", "45", "--model", "models/uv-5rm.ini", "--image", "testdata/uv5rm.img", "--port-file", "build/appflow.port")
+    try e.d = proc.duplex(argv[:]) else:
+        return #expect(false, "late emulator did not start")
+    for _ in 0..<100:
+        if fs.exists("build/appflow.port"):
+            break
+        time.sleep(time.milliseconds(50))
+    try e.port = fs.read_file("build/appflow.port") else:
+        return #expect(false, "late emulator port")
+    string8 p = e.port
+    using app_keep():
+        g_probe_target_test = strings.clone(p)
+    ports_set_one(p, true)
+    probe_lost(p)
+    i64 before = g_probe_attempts
+    bool found = frames_until(180.0, found_on_port)
+    ok = #expect(found && g_radio.known && g_models[g_radio.mi].id == "uv-5rm", "radio switched on later: found by the probe (", g_probe_attempts - before, " tries)") && ok
+    ok = #expect(g_probe_attempts - before >= 2, "the first try (radio off) failed quietly, a later one found it") && ok
+    ok = #expect(!btui.any_dialog_open(), "no checklist for background tries") && ok
+    // identified: no more tries on that port
+    i64 n0 = g_probe_attempts
+    for _ in 0..<200:
+        step()
+    ok = #expect(g_probe_attempts == n0, "no probing once the radio is identified") && ok
+    // a read that loses the radio -> watching again
+    probe_lost(p)
+    ok = #expect(probe_waiting(), "watching again after the radio stopped answering") && ok
+    // ── busy: a job running, or a write/verify flow open: never probed ──
+    g_probe_next = 0.0
+    i32 st = job_state()
+    threads.atomic_store(&g_job.state, JS_RUNNING)
+    n0 = g_probe_attempts
+    for _ in 0..<20:
+        btui.headless_frame(0.05)
+    threads.atomic_store(&g_job.state, st)
+    ok = #expect(g_probe_attempts == n0, "no probe while a job owns the port") && ok
+    verify_flow_open(false)
+    for _ in 0..<20:
+        step()
+    ok = #expect(g_probe_attempts == n0, "no probe while a verification is open") && ok
+    verify_flow_close()
+    stop_emu(&e)
+    // ── a cable port that cannot be opened (another program has it) ──
+    using app_keep():
+        #delete(g_probe_target_test)
+        g_probe_target_test = strings.clone("/dev/beautalks-no-such-port")
+    ports_set_one("/dev/beautalks-no-such-port", true)
+    g_probe_mark = g_probe_attempts + 2
+    bool again = frames_until(60.0, probed_again)
+    step()
+    ok = #expect(again && !btui.any_dialog_open(), "an unopenable port: quiet retries, no checklist") && ok
+    f64 gap = g_probe_next - btui.now()
+    ok = #expect(gap > 2.5 && gap < 3.5, "retry about every 3 s (", gap, ")") && ok
+    g_probe_since = btui.now() - 61.0
+    g_probe_next = 0.0
+    g_probe_mark = g_probe_attempts + 1
+    _ = frames_until(30.0, probed_again)
+    step()
+    gap = g_probe_next - btui.now()
+    ok = #expect(gap > 9.5 && gap < 10.5, "after a minute, about every 10 s (", gap, ")") && ok
+    // the user's Detect on it does show the checklist
+    g_probe_on = false
+    start_detect("/dev/beautalks-no-such-port")
+    settle()
+    ok = #expect(btui.any_dialog_open(), "a Detect the user pressed shows the checklist") && ok
+    btui.dialog_close()
+    return ok
+
 i32 test():
     bool ok = true
     for d in ["build/appflow_data", "build/appflow_lib"]:
@@ -119,6 +228,8 @@ i32 test():
         g_arg_library = strings.clone("build/appflow_lib")
     g_headless_test = true
     g_watch = false
+    // the presence probe is tested on its own at the end
+    g_probe_on = false
     g_theme_forced = true
     btui.set_dark(false)
     ok = #expect(btui.headless_up(1440.0, 900.0, 1.0, app_frame), "headless up") && ok
@@ -331,6 +442,7 @@ i32 test():
         stop_emu(&e3)
     else:
         ok = #expect(false, "emulator 3 did not start") && ok
+    ok = probe_tests() && ok
     // every page draws (headless) without trouble
     for pg in 0..<6:
         g_page = i32(pg)

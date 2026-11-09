@@ -34,6 +34,7 @@ import "core:cfg"
 import "core:fmt"
 import "core:mem/arena"
 import "core:os/fs"
+import "core:mem/libc"
 import "core:threads"
 import "core:time"
 
@@ -316,7 +317,11 @@ private void keep_error(string8 text):
 
 // As load, the model given as a flat map.
 !Driver load_with(string8 engine, {string8: string8} model):
-    try VM vm = #script_vm(#heap) else:
+    // Not #heap: Dado rc.9's #heap refuses alignments above the platform's
+    // max_align_t (8 on Apple silicon), and the engine asks for mem.MAX_ALIGN
+    // (16), so every VM failed with "no memory" on macOS arm64. C's heap via
+    // core:mem/libc checks against mem.MAX_ALIGN and macOS malloc aligns to 16.
+    try VM vm = #script_vm(libc.allocator()) else:
         keep_error("no memory for a script VM")
         fail E_LOAD
     Armed w = arm(vm)

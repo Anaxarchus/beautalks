@@ -17,11 +17,65 @@ import "core:time"
 import btui "../ui"
 import "../radio"
 
+// How a port is shown and treated (presentation, from the library's USB IDs
+// and the port's name):
+//   PK_CABLE  a known programming-cable chip (radio.known_cable_chip), or on
+//             macOS a cu.usbserial-* / cu.wchusbserial-* whose IDs could not be
+//             read (likely the cable): listed first, detected by itself
+//   PK_USB    another USB serial adapter: listed next, "Detect?" only
+//   PK_OTHER  everything else (Bluetooth, debug console, built-in UARTs):
+//             under "Other ports (N)", closed by default; never probed
+const i32 PK_CABLE = 0
+const i32 PK_USB = 1
+const i32 PK_OTHER = 2
+
 type PortSeen:
     ref []char8 path
     i32 vid
     i32 pid
     bool cable
+    i32 kind
+    // a likely cable by name only (its USB IDs were not available)
+    bool guessed
+
+i32 port_kind(string8 path, i32 vid, i32 pid):
+    if radio.known_cable_chip(vid, pid):
+        return PK_CABLE
+    string8 b = path
+    bool usb_name = strings.contains(b, "usbserial") || strings.contains(b, "wchusbserial") || strings.contains(b, "SLAB_USBtoUART") || strings.contains(b, "usbmodem") || strings.contains(b, "/dev/ttyUSB") || strings.contains(b, "/dev/ttyACM")
+    if vid < 0 && (strings.starts_with(b, "/dev/cu.usbserial-") || strings.starts_with(b, "/dev/cu.wchusbserial")):
+        // macOS, chip lookup failed: treat as the likely cable
+        return PK_CABLE
+    if vid >= 0 || usb_name:
+        return PK_USB
+    return PK_OTHER
+
+// Sorted for people: cables, then USB serial, then the rest; by name inside.
+void ports_sort(ref []PortSeen ps):
+    for i in 1..<#len(ps):
+        PortSeen v = ps[i]
+        i64 j = i - 1
+        for j >= 0 && (ps[j].kind > v.kind || (ps[j].kind == v.kind && strings.compare(ps[j].path, v.path) > 0)):
+            ps[j + 1] = ps[j]
+            j -= 1
+        ps[j + 1] = v
+
+PortSeen port_seen(string8 path, i32 vid, i32 pid):
+    PortSeen s
+    s.path = strings.clone(path)
+    s.vid = vid
+    s.pid = pid
+    s.kind = port_kind(path, vid, pid)
+    s.cable = s.kind == PK_CABLE
+    s.guessed = s.cable && !radio.known_cable_chip(vid, pid)
+    return s
+
+i64 ports_count(i32 kind):
+    i64 n = 0
+    for p in g_ports:
+        if p.kind == kind:
+            n += 1
+    return n
 
 private threads.Mutex g_watch_mx
 private ref []PortSeen g_watch_snap
@@ -37,12 +91,8 @@ private ref []PortSeen list_now():
     defer pl.destroy()
     for i in 0..<#len(pl.ports):
         radio.PortInfo p = pl.ports[i]
-        PortSeen s
-        s.path = strings.clone(pl.path_of(i64(i)))
-        s.vid = p.vid
-        s.pid = p.pid
-        s.cable = radio.known_cable_chip(p.vid, p.pid)
-        out = #append(out, s)
+        out = #append(out, port_seen(pl.path_of(i64(i)), p.vid, p.pid))
+    ports_sort(out)
     return out
 
 private void free_ports(ref []PortSeen ps):
@@ -94,9 +144,20 @@ void watch_start():
                 seen = true
         if !seen && !first && #len(newp) == 0:
             newp = p.path
-            auto = p.cable
+            auto = p.kind == PK_CABLE
+    bool changed = #len(fresh) != #len(g_ports) || #len(newp) > 0
+    if !changed:
+        for p in g_ports:
+            bool still = false
+            for q in fresh:
+                if eq_s(q.path) == eq_s(p.path):
+                    still = true
+            if !still:
+                changed = true
     free_ports(g_ports)
     g_ports = fresh
+    if changed:
+        g_ports_gen += 1
     btui.request_frame()
     return (newp, auto)
 
@@ -105,29 +166,51 @@ void ports_set_one(string8 path, bool cable):
     using app_keep():
         free_ports(g_ports)
         g_ports = nil
-        PortSeen s
-        s.path = strings.clone(path)
-        s.vid = -1
-        s.pid = -1
+        PortSeen s = port_seen(path, -1, -1)
         s.cable = cable
+        s.kind = PK_CABLE if cable else s.kind
         g_ports = #append(g_ports, s)
+    g_ports_gen += 1
 
-// The port to use: the chosen one, else the one cable, else the only port.
+// Replace the port list (tests and the screenshot tool simulate a Mac).
+void ports_set(ref []PortSeen ps):
+    using app_keep():
+        free_ports(g_ports)
+        g_ports = ps
+        ports_sort(g_ports)
+    g_ports_gen += 1
+
+// Bumped whenever the port list changes (the presence probe starts over).
+i64 g_ports_gen
+
+// The port the user picked on the Radio page ("" = automatic).
+ref []char8 g_port_pick
+
+// The port to use: --port, else the user's pick (while it exists), else the
+// one programming cable, else the only port, else the one USB serial port.
 string8 best_port():
     if #len(g_port_override) > 0:
         return g_port_override
-    i64 cables = 0
-    string8 pick = ""
-    for p in g_ports:
-        if p.cable:
-            cables += 1
-            pick = p.path
-    if cables == 1:
-        return pick
+    if #len(g_port_pick) > 0:
+        for p in g_ports:
+            if eq_s(p.path) == eq_s(g_port_pick):
+                return p.path
+    if ports_count(PK_CABLE) == 1:
+        for p in g_ports:
+            if p.kind == PK_CABLE:
+                return p.path
     if #len(g_ports) == 1:
         return g_ports[0].path
-    for p in g_ports:
-        string8 s = p.path
-        if strings.contains(s, "usbserial") || strings.contains(s, "ttyUSB") || strings.contains(s, "wchusbserial"):
-            return s
+    if ports_count(PK_CABLE) == 0 && ports_count(PK_USB) == 1:
+        for p in g_ports:
+            if p.kind == PK_USB:
+                return p.path
     return ""
+
+// Whether `path` is a programming cable (the presence probe watches those).
+bool port_is_cable(string8 path):
+    for p in g_ports:
+        if eq_s(p.path) == path:
+            return p.kind == PK_CABLE
+    // --port with no listing: trust it (tests, the emulator)
+    return #len(g_port_override) > 0 && eq_s(g_port_override) == path

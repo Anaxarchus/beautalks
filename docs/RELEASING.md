@@ -12,6 +12,7 @@ including the driver bundle that **Update drivers** reads.
 ```
 ./build.sh                         dev build of the app for this machine  -> build/beautalks-app
 ./build.sh cli                     dev build of the CLI                  -> build/beautalks
+./build.sh test [PKG...]           dado test (default: radio cli driverhost updater ui)
 ./build.sh --target linux          cross-build the app for Linux x86_64   -> build/linux-x64/beautalks-app
 ./build.sh --target windows cli    cross-build a package for Windows      -> build/windows-x64/beautalks.exe
 ./build.sh --release --dry-run     build + package everything into dist/<version>/, publish nothing
@@ -58,7 +59,8 @@ output goes to `dist/<version>/logs/`, with its tail printed if it fails):
    disagrees with it, if the GUI package is not `app/`, if there is no `LICENSE`, if tracked files have uncommitted changes, if tag `v<version>`
    exists locally or on `origin`, if a release with that tag exists, or if `gh` is not logged in.
    `--dry-run` turns these into warnings and never needs `gh`.
-2. **Tests.** `dado test` for `radio cli driverhost updater ui`; any failure stops the release.
+2. **Tests.** `./build.sh test` for `radio cli driverhost updater ui` (with the Apple-silicon
+   workaround of section 7 when needed); any failure stops the release.
    `--skip-tests` skips them (the notes are not changed by that, so do not publish untested).
 3. **Driver bundle.** `drivers/release.py --release v<version> --no-repo-manifest` compiles the
    engines with `dadoc` and writes `drivers-manifest.json` plus one asset per file. If the freshly
@@ -125,6 +127,7 @@ Run once after the first `./build.sh --release --dry-run` on the Mac, before the
 release. `V` is the version.
 
 ```sh
+./build.sh test driverhost   # first line says whether the MAX_ALIGN patch applied; must pass 4/4
 V=$(cat VERSION); D=dist/$V
 lipo -archs $D/stage/mac/beautalks.app/Contents/MacOS/beautalks       # arm64 x86_64 (or arm64)
 lipo -archs $D/stage/mac/beautalks.app/Contents/MacOS/beautalks-cli
@@ -228,6 +231,27 @@ the Win32 serial backend, `LICENSE`, `.gitignore` for `/dist/`. Nothing else is 
 release tooling.
 
 ## 7. Dado issues worked around here (worth reporting upstream)
+
+* **Apple silicon: `#heap` refuses `mem.MAX_ALIGN`.** `core:mem` declares `MAX_ALIGN = 16`, but
+  the C runtime's `#heap` refuses alignments above `DADO_MAX_ALIGN`, which is 8 on Apple arm64
+  (`long double` is a `double` there). Every `#heap` request at `MAX_ALIGN` returns NULL, which
+  breaks core:script (`dado test driverhost` fails 0/4 on the Mac). On an Apple arm64 host,
+  `build.sh` compiles and runs a 10-line probe (in `build/.dado-align-probe/`) at the start of
+  each dev build, `./build.sh test` and release. If the heap refuses, it copies the collections
+  (`dado where`) once to `build/.dado-collections-patched/<dado version>-<hash of mem.dado>/`,
+  replaces the `MAX_ALIGN` line with
+  `when #OS == #DARWIN && #ARCH == #AARCH64: const u64 MAX_ALIGN = 8` / `else: ... = 16`, and
+  sets `DADO_COLLECTIONS` to it for the host builds and tests only (the macOS release build,
+  both slices, as the `when` gives the Intel slice 16). Windows and Linux cross builds keep the
+  stock collections. It prints one line saying which way it went. Use `./build.sh test`, not
+  bare `dado test`, on the Mac. Checked here: core:mem, core:script, core:mem/{arena,slab,bump,gc,libc},
+  core:runtime and app/cli/driverhost/radio/updater/ui all `dado check` with the patch for
+  `aarch64-apple-darwin` and for Linux; the emitted C asks for 8 on `aarch64-apple-darwin` and
+  16 on every other target; `dado test driverhost` passes against the patched tree.
+  `BEAUTALKS_FORCE_ALIGN_PATCH=1` forces the patch on any host (for testing). **Removing it:**
+  when a Dado release fixes the runtime, the probe passes and nothing is patched; then delete
+  the block "the Apple-silicon alignment workaround" (and `host_dado`/`run_tests`' use of it)
+  from `build.sh` and `rm -rf build/.dado-collections-patched build/.dado-align-probe`.
 
 * macOS: `-x objective-c` from sokol's `flags` clause is repeated on the link line before the
   objects; worked around with `DADO_CFLAGS="-x none -ObjC"` and Apple clang.

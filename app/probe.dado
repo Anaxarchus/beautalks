@@ -1,0 +1,132 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The presence probe: while a programming cable is plugged in and no radio
+// has been identified on it, look for the radio quietly in the background,
+// so a cable that was already there when the app started, or a radio that
+// is switched on later, is found without a click.
+//
+//   - It is the library's detection (remembered radios first), run as an
+//     ordinary detect job marked `quiet`; the library owns every protocol
+//     timing (radio.session_info: the UV-5R's quiet time, the 5RM's ident
+//     retries). This file only decides WHEN to try.
+//   - Every ~3 s after the last try ended; after a minute without an answer
+//     every ~10 s. Starts over when the ports change or the user presses
+//     Detect.
+//   - Never while any job runs, a write or verification flow is open (it
+//     owns the port), or a dialog is up. Only programming-cable ports
+//     (PK_CABLE), never other ports.
+//   - Stops once a radio is identified on the port; starts again when a
+//     read or write says the radio stopped answering, or the cable is
+//     unplugged and plugged in again.
+//   - A quiet try that fails shows nothing: no error checklist. Pressing
+//     Detect while one runs turns it into a normal (user) detect.
+package main
+
+import "core:strings"
+import btui "../ui"
+
+// off in the screenshot tool and when there is no watcher (--no-watch)
+bool g_probe_on = true
+// the port a radio was identified on ("" = none)
+ref []char8 g_probe_ok
+f64 g_probe_next
+f64 g_probe_since = -1.0
+i64 g_probe_seen_gen = -1
+i64 g_probe_attempts
+i32 g_probe_last_err
+
+const f64 PROBE_EVERY = 3.0
+const f64 PROBE_SLOW_AFTER = 60.0
+const f64 PROBE_EVERY_SLOW = 10.0
+
+// The port the probe watches now, or "".
+string8 probe_target():
+    if !g_probe_on:
+        return ""
+    string8 p = best_port()
+    if #len(p) == 0 || !port_is_cable(p):
+        return ""
+    if eq_s(g_probe_ok) == p:
+        return ""
+    return p
+
+// Whether the Radio page should show "Waiting for the radio…".
+bool probe_waiting():
+    string8 t = probe_target()
+    return #len(t) > 0
+
+// Start over: try now, and count the minute from now.
+void probe_reset():
+    g_probe_next = btui.now()
+    g_probe_since = btui.now()
+
+private void probe_set_ok(string8 port):
+    using app_keep():
+        #delete(g_probe_ok)
+        g_probe_ok = strings.clone(port)
+
+// The radio on `port` stopped answering (a read or write said so): watch
+// for it again.
+void probe_lost(string8 port):
+    if eq_s(g_probe_ok) == port:
+        probe_set_ok("")
+    probe_reset()
+
+// Whether a job on the port may start now (nothing else owns it).
+private bool port_free():
+    return !job_busy() && !btui.any_dialog_open() && !write_flow_active() && !verify_flow_active() && !job().ver_open
+
+// Once per frame.
+void probe_step():
+    if !g_probe_on:
+        return
+    if g_ports_gen != g_probe_seen_gen:
+        g_probe_seen_gen = g_ports_gen
+        // unplugged: forget that a radio was found there
+        if #len(g_probe_ok) > 0 && !port_listed(g_probe_ok) && #len(g_port_override) == 0:
+            probe_set_ok("")
+        probe_reset()
+    string8 target = probe_target()
+    if #len(target) == 0:
+        return
+    // keep frames coming so the next try happens on time (and the spinner turns)
+    btui.animating()
+    if !port_free() || btui.now() < g_probe_next:
+        return
+    ^Job j = prep(JOB_DETECT, target)
+    j.quiet = true
+    g_probe_attempts += 1
+    job_start()
+
+private bool port_listed(string8 path):
+    for p in g_ports:
+        if eq_s(p.path) == path:
+            return true
+    return false
+
+// A quiet try ended without a radio: say nothing, try again later.
+void probe_failed(^Job j):
+    g_probe_last_err = j.err
+    f64 waited = btui.now() - g_probe_since
+    g_probe_next = btui.now() + (PROBE_EVERY if waited < PROBE_SLOW_AFTER else PROBE_EVERY_SLOW)
+
+// Any job that talked to a radio on `port` successfully.
+void probe_found(string8 port):
+    probe_set_ok(port)
+
+// The user pressed Detect: a running quiet try becomes theirs (its failure
+// shows the checklist); the schedule starts over.
+bool probe_promote():
+    probe_reset()
+    if job_busy() && job().quiet:
+        ^Job j = job()
+        j.quiet = false
+        g_page = PAGE_RADIO
+        return true
+    return false
+
+// A write or verification is starting: a quiet try must not hold the port.
+void probe_yield():
+    if job_busy() && job().quiet:
+        job_cancel()

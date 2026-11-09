@@ -40,6 +40,7 @@ void verify_flow_close():
     job_drop_verification()
 
 void verify_flow_open(bool from_write):
+    probe_yield()
     g_vf = VF_INTRO
     g_vf_from_write = from_write
     g_vf_consent = false

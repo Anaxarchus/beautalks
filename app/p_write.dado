@@ -57,6 +57,7 @@ bool doc_tested():
     return g_doc.status_by == i32(radio.TestedBy.LOCAL) || g_doc.status_by == i32(radio.TestedBy.SHIPPED)
 
 void write_flow_open():
+    probe_yield()
     using app_keep():
         #delete(g_wf_img)
         (ref []u8 img, i32 w, i32 s) = doc_build_image()
@@ -73,6 +74,7 @@ void write_flow_open():
 
 // Write a whole image as it is (restoring a backup).
 void write_flow_open_image(ref []u8 img):
+    probe_yield()
     using app_keep():
         #delete(g_wf_img)
         g_wf_img = radio.copy_image(img)

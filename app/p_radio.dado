@@ -6,6 +6,7 @@
 // the cable.
 package main
 
+import "core:strings"
 import btui "../ui"
 import "../radio"
 
@@ -83,9 +84,13 @@ void radio_page(btui.Rect sheet):
     btui.Rect body = btui.inset(sheet, 32.0)
     page_header(body, "Radio", "Connect a radio to read, edit and write its channels.")
     f32 y = body.y + 76.0
-    if job_busy() && g_last_kind_running() != JOB_UPDATE:
+    bool user_job = job_busy() && !job().quiet && g_last_kind_running() != JOB_UPDATE
+    if user_job:
         busy_card(btui.rect(body.x, y, body.w, 150.0))
         y = y + 174.0
+    else if probe_waiting():
+        waiting_card(btui.rect(body.x, y, body.w, 120.0))
+        y = y + 144.0
     else if g_radio.known:
         identity_card(btui.rect(body.x, y, body.w, 120.0), true)
         y = y + 144.0
@@ -94,8 +99,28 @@ void radio_page(btui.Rect sheet):
             if btui.button("Open channels", btui.rect(body.x, y, w, 40.0), btui.BTN_TONAL, "table_rows"):
                 g_page = PAGE_CHANNELS
             y = y + 64.0
-    if !g_radio.known || !job_busy():
-        plug_in_card(btui.rect(body.x, y, body.w, 300.0))
+    // the cable and the ports take the rest of the page (the list scrolls)
+    f32 h = btui.bottom(body) - y
+    if h < 260.0:
+        h = 260.0
+    plug_in_card(btui.rect(body.x, y, body.w, h))
+
+// A programming cable is plugged in and the radio hasn't answered yet: a
+// calm note while the presence probe keeps looking (probe.dado).
+private void waiting_card(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(r, btui.CARD_FILLED)
+    btui.Rect ib = btui.inset(r, 24.0)
+    btui.progress_circular(ib.x + 20.0, btui.cy(r), 28.0, -1.0, 3.0)
+    f32 x = ib.x + 56.0
+    _ = btui.text(btui.TITLE_LARGE, x, ib.y + 4.0, "Waiting for the radio…", t.on_surface)
+    string8 sub = #format("Switch the radio on and turn the volume up a little. beautalks is watching ", probe_target(), ".")
+    if g_probe_last_err == JERR_SESSION:
+        sub = "The radio seems to be in the middle of programming. Switch it off, wait two seconds, and on again."
+    _ = btui.text_wrap(btui.rect(x, ib.y + 38.0, ib.w - 56.0 - 140.0, 48.0), btui.BODY_MEDIUM, sub, t.on_surface_variant)
+    f32 dw = btui.button_width("Detect now", "refresh", btui.BTN_TONAL)
+    if btui.button("Detect now", btui.rect(btui.right(ib) - dw, btui.cy(r) - 20.0, dw, 40.0), btui.BTN_TONAL, "refresh", job_busy() && !job().quiet):
+        start_detect(probe_target())
 
 i32 g_last_kind_running():
     return job().kind
@@ -121,6 +146,9 @@ private void busy_card(btui.Rect r):
         job_cancel()
         btui.snackbar_show("Stopping at the next safe point…")
 
+btui.Scroll g_ports_scroll
+bool g_other_open
+
 private void plug_in_card(btui.Rect r):
     ^btui.Scheme t = btui.theme()
     _ = btui.card(r, btui.CARD_OUTLINED)
@@ -135,29 +163,76 @@ private void plug_in_card(btui.Rect r):
         btui.fill_circle(x + 12.0, sy + 12.0, 12.0, t.primary_container)
         btui.text_in(btui.rect(x, sy, 24.0, 24.0), btui.LABEL_MEDIUM, #format(i + 1), t.on_primary_container, btui.ALIGN_CENTER)
         _ = btui.text(btui.BODY_LARGE, x + 36.0, sy, steps[i], t.on_surface)
-    // the ports
     f32 py = ib.y + 150.0
     _ = btui.text(btui.TITLE_SMALL, x, py, "Ports", t.on_surface)
-    py = py + 28.0
+    btui.Rect lst = btui.rect(x - 8.0, py + 28.0, btui.right(ib) - x + 8.0, btui.bottom(ib) - py - 28.0)
     if #len(g_ports) == 0:
-        _ = btui.text(btui.BODY_MEDIUM, x, py, "No serial ports yet. Plug in the cable; on a Mac the CH340 cable may need its driver.", t.on_surface_variant)
-    i32 shown = 0
+        _ = btui.text(btui.BODY_MEDIUM, x, py + 32.0, "No serial ports yet. Plug in the cable; on a Mac the CH340 cable may need its driver.", t.on_surface_variant)
+        return
+    ports_list(lst)
+
+// The ports, grouped: programming cables, USB serial adapters, then "Other
+// ports (N)" (closed by default). The active port (best_port) is marked; a
+// click on the mark picks another.
+private void ports_list(btui.Rect lst):
+    ^btui.Scheme t = btui.theme()
+    f32 row_h = 44.0
+    f32 y = lst.y - g_ports_scroll.y
+    f32 total = 0.0
+    btui.push_clip(lst)
+    string8 active = best_port()
+    i32 last_kind = -1
+    i64 n_other = ports_count(PK_OTHER)
     for i in 0..<#len(g_ports):
-        if shown >= 3:
-            break
         PortSeen p = g_ports[i]
-        f32 rx = x
-        btui.icon("usb" if p.cable else "cable", rx, py + 2.0, 20.0, t.primary if p.cable else t.on_surface_variant)
-        f32 ex = btui.text(btui.BODY_LARGE, rx + 30.0, py, p.path, t.on_surface)
-        if p.cable:
-            _ = btui.status_chip(ex + 12.0, py, chip_name(p), btui.TONE_SUCCESS, "", true)
+        if p.kind != last_kind:
+            last_kind = p.kind
+            if p.kind == PK_OTHER:
+                // the disclosure row
+                btui.Rect dr = btui.rect(lst.x, y, lst.w - 12.0, row_h)
+                string8 dl = #format("Other ports (", n_other, ")")
+                if btui.list_item(dr, dl, "", "keyboard_arrow_up" if g_other_open else "keyboard_arrow_down", "Bluetooth, console and other serial ports" if !g_other_open else "", false, false, "otherports"):
+                    g_other_open = !g_other_open
+                y = y + row_h
+                total = total + row_h
+                if !g_other_open:
+                    break
+            else:
+                string8 head = "Programming cables" if p.kind == PK_CABLE else "USB serial adapters"
+                _ = btui.text(btui.LABEL_MEDIUM, lst.x + 8.0, y + 12.0, head, t.primary)
+                y = y + 36.0
+                total = total + 36.0
+        btui.Rect rr = btui.rect(lst.x, y, lst.w - 12.0, row_h)
+        bool is_active = eq_s(p.path) == active
+        string8 mark = "radio_button_checked" if is_active else "radio_button_unchecked"
+        if btui.icon_button(mark, btui.rect(rr.x, rr.y + 2.0, 40.0, 40.0), btui.ICON_STANDARD, is_active, false, "Use this port", #format("pick", i)):
+            using app_keep():
+                #delete(g_port_pick)
+                g_port_pick = strings.clone(p.path)
+            g_ports_gen += 1
+        string8 ic = "usb" if p.kind != PK_OTHER else "cable"
+        [4]u8 icc = t.primary if p.kind == PK_CABLE else t.on_surface_variant
+        btui.icon(ic, rr.x + 48.0, btui.cy(rr) - 10.0, 20.0, icc)
+        f32 ex = btui.text(btui.BODY_LARGE, rr.x + 78.0, btui.cy(rr) - 12.0, p.path, t.on_surface if p.kind != PK_OTHER else t.on_surface_variant)
+        if p.kind == PK_CABLE:
+            _ = btui.status_chip(ex + 12.0, btui.cy(rr) - 12.0, chip_name(p), btui.TONE_SUCCESS, "", true)
+        else if p.kind == PK_USB:
+            _ = btui.status_chip(ex + 12.0, btui.cy(rr) - 12.0, "USB serial", btui.TONE_NEUTRAL, "", true)
         f32 dw = btui.button_width("Detect", "", btui.BTN_TEXT)
-        if btui.button("Detect", btui.rect(btui.right(ib) - dw, py - 8.0, dw, 40.0), btui.BTN_TEXT, "", job_busy(), #format("detect", i)):
+        if btui.button("Detect", btui.rect(btui.right(rr) - dw, rr.y + 2.0, dw, 40.0), btui.BTN_TEXT, "", job_busy() && !job().quiet, #format("detect", i)):
+            using app_keep():
+                #delete(g_port_pick)
+                g_port_pick = strings.clone(p.path)
             start_detect(p.path)
-        py = py + 36.0
-        shown += 1
+        y = y + row_h
+        total = total + row_h
+    btui.pop_clip()
+    _ = btui.scroll_update(lst, &g_ports_scroll, total)
+    btui.scrollbar("ports", lst, &g_ports_scroll)
 
 string8 chip_name(PortSeen p):
+    if p.guessed:
+        return "likely programming cable"
     string8 n = radio.cable_chip_name(p.vid, p.pid)
     if #len(n) == 0:
         return "programming cable"

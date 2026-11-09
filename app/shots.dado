@@ -61,6 +61,24 @@ private void demo_edits():
     g_doc.rows[c].rx_hz = 30500000
     g_doc.rows[c].tx_hz = 30500000
 
+// A Mac's port list as the owner's machine shows it (simulated: these
+// devices don't exist here): the CH340 cable, a USB board, Bluetooth and
+// the console. The cable is the active port and the presence probe watches
+// it (it never answers here, so the page shows "Waiting for the radio").
+private void mac_ports():
+    #delete(g_port_override)
+    g_port_override = nil
+    ref []PortSeen ps = nil
+    using app_keep():
+        ps = #append(ps, port_seen("/dev/cu.Bluetooth-Incoming-Port", -1, -1))
+        ps = #append(ps, port_seen("/dev/cu.JLabRewind2", -1, -1))
+        ps = #append(ps, port_seen("/dev/cu.debug-console", -1, -1))
+        ps = #append(ps, port_seen("/dev/cu.usbserial-140", 0x1A86, 0x7523))
+        ps = #append(ps, port_seen("/dev/cu.usbmodem1101", 0x2E8A, 0x000A))
+        ps = #append(ps, port_seen("/dev/cu.wlan-debug", -1, -1))
+    ports_set(ps)
+    g_probe_on = true
+
 void shot_step():
     if #len(g_shot) == 0:
         return
@@ -71,6 +89,11 @@ void shot_step():
     shot_ready_check()
     if g_shot_stage == 0:
         g_shot_stage = 1
+        if shot("radio-mac") || shot("radio-mac-other"):
+            mac_ports()
+            if shot("radio-mac-other"):
+                g_other_open = true
+            return
         if shot("radio") || shot("radios") || shot("backups") || shot("settings"):
             if shot("radios"):
                 g_page = PAGE_RADIOS

@@ -72,6 +72,8 @@ type Job:
     // JOB_WRITE: the image to write
     ref []u8 img_in
     bool allow_untested
+    // a background presence probe: failures are not shown (probe.dado)
+    bool quiet
     // verify steps keep their state here between jobs
     radio.Verification ver
     bool ver_open

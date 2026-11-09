@@ -77,6 +77,7 @@ void app_frame():
     collect_job()
     shot_step()
     watch_step()
+    probe_step()
     btui.Rect area = vp
     btui.Rect rail = btui.cut_left(&area, 88.0)
     nav_rail(rail)
@@ -112,7 +113,7 @@ private void nav_rail(btui.Rect rail):
     _ = btui.image("appicon", rail.x + 24.0, 16.0, 40.0)
     f32 y = 84.0
     bool busy_flow = write_flow_active() || verify_flow_active()
-    if btui.rail_item("cell_tower", "Radio", rail.x + 4.0, y, g_page == PAGE_RADIO && !busy_flow, "", job_busy()):
+    if btui.rail_item("cell_tower", "Radio", rail.x + 4.0, y, g_page == PAGE_RADIO && !busy_flow, "", job_busy() && !job().quiet):
         leave_flows()
         g_page = PAGE_RADIO
     y = y + 72.0
@@ -169,9 +170,13 @@ private void watch_step():
         #delete(g_new_port)
         g_new_port = strings.clone(p)
     // never probe mid-transfer or under an open dialog
+    if auto && g_probe_on:
+        // the presence probe looks for the radio (quietly, until it answers)
+        probe_reset()
+        btui.snackbar_show(#format("Programming cable plugged in (", p, "). Looking for the radio…"))
+        return
     if auto && !job_busy() && !btui.any_dialog_open() && !write_flow_active() && !verify_flow_active():
         start_detect(p)
-        btui.snackbar_show(#format("Programming cable plugged in (", p, "). Looking for the radio…"))
         return
     g_new_port_prompt = true
 
@@ -192,6 +197,9 @@ private ^Job prep(i32 kind, string8 port):
     return j
 
 void start_detect(string8 port):
+    // a quiet presence probe running on it becomes this detect
+    if probe_promote():
+        return
     if job_busy() || #len(port) == 0:
         return
     _ = prep(JOB_DETECT, port)
@@ -263,10 +271,19 @@ private void collect_job():
     if j.err == JERR_AMBIGUOUS:
         which_radio_open(j)
         return
+    if j.quiet && j.err != JERR_NONE:
+        // a background presence probe: no checklist, just try again later
+        probe_failed(j)
+        return
     if j.err != JERR_NONE && j.err != JERR_BACKUP:
+        if j.err == JERR_NO_RADIO || j.err == JERR_SESSION || (j.err == JERR_LINK && (radio.LinkError(j.link_err) == radio.LinkError.NO_ANSWER || radio.LinkError(j.link_err) == radio.LinkError.IO)):
+            probe_lost(j.port)
         error_open(j.err, j.link_err, j.port)
         return
+    probe_found(j.port)
     radio_set(j.model_used, j.rid, j.nickname, j.port, j.how, j.seen, j.fast_path)
+    if j.quiet:
+        btui.snackbar_show(#format("Found ", model_label(j.model_used), " on ", j.port, "."))
     if j.kind == JOB_READ:
         write_flow_close()
         string8 title = #format(radio_title(), " · read ", now_text())
@@ -306,6 +323,9 @@ i32 main(i32 argc, ^rawptr argv):
                 g_theme_choice = 1
             else if a == "--no-watch":
                 g_watch = false
+                g_probe_on = false
+            else if a == "--no-probe":
+                g_probe_on = false
             else if a == "--builtin":
                 g_builtin = true
             else if a == "--models" && more:

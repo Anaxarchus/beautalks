@@ -1,0 +1,59 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Diagnostic: can this machine create a DadoScript VM, plainly and the way
+// driverhost does (inside an arena allocator scope)?
+package main
+
+import "core:fmt"
+import "core:mem/arena"
+import "core:mem/libc"
+
+class Probe:
+    int answer():
+        return 42
+
+i32 plain():
+    try VM vm = #script_vm(#heap) else:
+        fmt.println("1 plain #script_vm(#heap): FAILED (", #script_error(), ")")
+        return 1
+    fmt.println("1 plain #script_vm(#heap): ok")
+    try Probe p = #script_new(vm, Probe) else code:
+        fmt.println("2 #script_new: FAILED code ", code, " (", #script_error(), ")")
+        #delete(vm)
+        return 1
+    fmt.println("2 #script_new: ok")
+    #delete(p)
+    #delete(vm)
+    return 0
+
+i32 in_arena():
+    arena.Arena a = arena.over(#heap)
+    defer arena.destroy(&a)
+    using arena.allocator(&a):
+        try VM vm = #script_vm(#heap) else:
+            fmt.println("3 #script_vm(#heap) inside arena scope: FAILED (", #script_error(), ")")
+            return 1
+        fmt.println("3 #script_vm(#heap) inside arena scope: ok")
+        #delete(vm)
+    return 0
+
+i32 on_libc():
+    try VM vm = #script_vm(libc.allocator()) else:
+        fmt.println("4 #script_vm(libc.allocator()): FAILED (", #script_error(), ")")
+        return 1
+    try Probe p = #script_new(vm, Probe) else code:
+        fmt.println("4 #script_new on libc VM: FAILED code ", code)
+        #delete(vm)
+        return 1
+    fmt.println("4 #script_vm(libc.allocator()) + #script_new: ok")
+    #delete(p)
+    #delete(vm)
+    return 0
+
+i32 main():
+    i32 bad = plain()
+    bad += in_arena()
+    bad += on_libc()
+    fmt.println("done, ", bad, " failure(s)")
+    return bad

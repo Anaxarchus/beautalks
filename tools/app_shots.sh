@@ -49,6 +49,8 @@ shot() {
 rm -rf build/shots/data build/shots/lib
 start_emu models/uv-5rm.ini testdata/uv5rm.img
 shot 01-radio-plug-in.png radio 20
+shot 01b-radio-mac-waiting.png radio-mac 20
+shot 01c-radio-mac-other-ports.png radio-mac-other 20
 EMU_EXTRA="--reply-delay 600" shot 02-detecting.png detecting 30   # slowed: detection is quick now
 shot 03-identity.png identity 90
 shot 04-which-radio.png which 90
