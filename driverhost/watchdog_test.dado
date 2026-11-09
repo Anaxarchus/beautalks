@@ -1,0 +1,122 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The watchdog stops drivers that never return: a spin with no link activity
+// (idle limit), a spin that swallows the polite stop (forced), a driver that
+// keeps the link busy forever (whole-call cap), and top-level code that never
+// finishes loading. Run from the repo root: dado test driverhost
+package driverhost
+
+import "core:fmt"
+import "core:strings"
+import "core:time"
+
+type IdleWire using Wire:
+    i64 sent
+
+    !void send(^self, []u8 data):
+        self.sent += #len(data)
+
+    !i64 recv(^self, []u8 into, i32 timeout_ms):
+        return 0
+
+    void sleep_ms(^self, i32 ms):
+        time.sleep(time.milliseconds(ms))
+
+    void discard(^self):
+        return
+
+i32 g_bad = 0
+
+void verdict(bool ok, string8 what, i64 ms):
+    if ok:
+        fmt.println("ok: ", what, " (", ms, " ms: ", last_error(), ")")
+    else:
+        fmt.println("FAIL: ", what, " (", ms, " ms: ", last_error(), ")")
+        g_bad += 1
+
+i64 since(time.Instant t):
+    return time.as_milliseconds(time.elapsed(t))
+
+i32 test():
+    ref IdleWire w = #new(IdleWire)
+    {string8: string8} model = {}
+    set_limits(300, 1500)
+
+    try Driver d = load_with("driverhost/testdata/spin", model) else code:
+        fmt.println("FAIL: load spin ", code, ": ", last_error())
+        return 1
+
+    // identify: for (;;) {} -- no link activity, idle limit
+    time.Instant t = time.instant()
+    i32 got = 0
+    ref []char8 id = nil
+    try id = identify(&d, w) else code:
+        got = code
+    i64 ms = since(t)
+    verdict(got == E_TIMEOUT && ms < 1500 && strings.contains(last_error(), "did nothing on the link"), "idle spin stopped with E_TIMEOUT", ms)
+    #delete(id)
+
+    // the driver is dead now; a further call fails at once
+    t = time.instant()
+    got = 0
+    try id = identify(&d, w) else code:
+        got = code
+    verdict(got == E_TIMEOUT && since(t) < 100, "a stopped driver refuses further calls", since(t))
+    close(&d)
+
+    // download: swallows the polite stop; the force after the grace ends it
+    try d = load_with("driverhost/testdata/spin", model) else code:
+        fmt.println("FAIL: reload spin ", code)
+        return 1
+    t = time.instant()
+    got = 0
+    ref []u8 img = nil
+    try img = download(&d, w, no_progress()) else code:
+        got = code
+    ms = since(t)
+    verdict(got == E_TIMEOUT && ms < 2000, "a spin that catches the stop is forced", ms)
+    #delete(img)
+    close(&d)
+
+    // upload: sleeps 5 ms on the link forever; idle never trips, the 1.5 s cap does
+    try d = load_with("driverhost/testdata/spin", model) else code:
+        fmt.println("FAIL: reload spin ", code)
+        return 1
+    t = time.instant()
+    got = 0
+    []u8 image = [1, 2, 3]
+    try upload(&d, w, image[:], no_progress()) else code:
+        got = code
+    ms = since(t)
+    verdict(got == E_TIMEOUT && ms >= 1400 && ms < 3000 && strings.contains(last_error(), "ran past"), "a busy driver is stopped at the whole-call cap", ms)
+    close(&d)
+
+    // top-level code that never finishes: the load itself is stopped
+    t = time.instant()
+    got = 0
+    try d = load_with("driverhost/testdata/spin_at_load", model) else code:
+        got = code
+    ms = since(t)
+    if got == 0:
+        close(&d)
+    verdict(got == E_TIMEOUT && ms < 1500, "a module whose top level never ends is stopped while loading", ms)
+
+    // and a good driver still works after all that, under the same limits
+    set_limits(5000, 600000)
+    clear_error()
+    try d = load_with("driverhost/testdata/escapes", model) else code:
+        fmt.println("FAIL: load escapes ", code)
+        return 1
+    try id = identify(&d, w) else code:
+        fmt.println("FAIL: identify after stops ", code, ": ", last_error())
+        return 1
+    string8 ids = id
+    verdict(ids == "SAFE", "drivers load and run normally afterwards", 0)
+    #delete(id)
+    close(&d)
+    #delete(model)
+    #delete(w)
+    clear_error()
+    return g_bad

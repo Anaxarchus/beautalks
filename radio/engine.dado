@@ -1,0 +1,118 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Picking the protocol engine a model names, and the safe write sequence
+// every write goes through: back up the radio, write, read back, compare.
+package radio
+
+import "core:os/fs"
+
+bool engine_known(^const Model m):
+    return m^.engine == "uv17pro" || m^.engine == "uv5r"
+
+// Identifies the radio and downloads its image. The caller #deletes it.
+LinkError!ref []u8 download(^Link link, ^const Model m, Progress pr):
+    if m^.engine == "uv17pro":
+        return uv17_download(link, m, pr)
+    if m^.engine == "uv5r":
+        return uv5r_download(link, m, pr)
+    fail LinkError.BAD_MODEL
+
+// Identifies the radio and uploads `img`. Prefer safe_write, which also
+// backs up and verifies.
+LinkError!void upload(^Link link, ^const Model m, []u8 img, bool allow_untested, Progress pr):
+    if m^.engine == "uv17pro":
+        try uv17_upload(link, m, img, allow_untested, pr)
+        return
+    if m^.engine == "uv5r":
+        try uv5r_upload(link, m, img, allow_untested, pr)
+        return
+    fail LinkError.BAD_MODEL
+
+// The first offset where a read-back differs from what was written, or -1.
+// For uv5r only the ranges CHIRP's guarded upload writes are compared
+// (main 0x0008..0x1808 minus the two skipped holes); the rest of the image
+// is not written by default and may legitimately differ.
+i64 verify_mismatch(^const Model m, []u8 written, []u8 readback):
+    if #len(written) != #len(readback):
+        return 0
+    if m^.engine == "uv5r":
+        [3]Range main = (Range(0x0008, 0x0CF8), Range(0x0D08, 0x0DF8), Range(0x0E08, 0x1808))
+        for r in main:
+            for i in r.lo..<r.hi:
+                if written[i] != readback[i]:
+                    return i
+        return -1
+    for i in 0..<#len(written):
+        if written[i] != readback[i]:
+            return i
+    return -1
+
+// Phases of safe_write, reported through `phase` before each starts.
+distinct enum i32 WritePhase:
+    BACKUP = 1,
+    WRITE = 2,
+    VERIFY = 3,
+
+type PhaseFn: void(rawptr, WritePhase)
+
+// What the safe write sequence needs from a protocol engine, whichever it
+// is: the built-in Dado engines (BuiltinEngine) or a scripted driver behind
+// an adapter. `upload` is only ever called by safe_write_with, after the
+// tested/override check and the backup.
+trait Engine:
+    LinkError!ref []u8 download(^self, ^const Model m, Progress pr)
+    LinkError!void upload(^self, ^const Model m, []u8 img, Progress pr)
+    void pause(^self, i32 ms)
+
+// The built-in engines over a Link.
+type BuiltinEngine using Engine:
+    Link link
+
+    LinkError!ref []u8 download(^self, ^const Model m, Progress pr):
+        return download(&self.link, m, pr)
+
+    LinkError!void upload(^self, ^const Model m, []u8 img, Progress pr):
+        // the gate already ran in safe_write_with; the engine re-checks it
+        try upload(&self.link, m, img, true, pr)
+
+    void pause(^self, i32 ms):
+        self.link.sleep_ms(ms)
+
+// The one way to write a radio: download its current image and save it to
+// `backup_path` (refuse to go on if that fails), upload `img`, download
+// again and compare. `allow_untested` is the user's explicit confirmation
+// for a model not marked tested = write; backup and verify always run and
+// cannot be skipped. `pause_ms` waits between the three sessions.
+LinkError!void safe_write_with(^Engine eng, ^const Model m, []u8 img, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    if m^.tested != Tested.WRITE && !allow_untested:
+        fail LinkError.UNTESTED
+    if #len(img) != m^.image_size:
+        fail LinkError.IMAGE_SIZE
+    if phase != nil:
+        phase(ctx, WritePhase.BACKUP)
+    try ref []u8 before = eng.download(m, pr)
+    try fs.write_bytes(backup_path, before) else:
+        #delete(before)
+        fail LinkError.BACKUP
+    #delete(before)
+    if !fs.exists(backup_path):
+        fail LinkError.BACKUP
+    eng.pause(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.WRITE)
+    try eng.upload(m, img, pr)
+    eng.pause(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.VERIFY)
+    try ref []u8 after = eng.download(m, pr)
+    i64 bad = verify_mismatch(m, img, after)
+    #delete(after)
+    if bad >= 0:
+        fail LinkError.VERIFY
+
+// safe_write_with the built-in engine for the model.
+LinkError!void safe_write(^Link link, ^const Model m, []u8 img, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    BuiltinEngine eng
+    eng.link = link
+    try safe_write_with(&eng, m, img, allow_untested, backup_path, pause_ms, phase, ctx, pr)

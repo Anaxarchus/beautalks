@@ -1,0 +1,505 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Runs protocol drivers that are DadoScript mods: JavaScript files written by
+// `dadoc --emit=mod` from `drivers/engines/<name>.dados`, loaded at run time by
+// path (so they can be updated without rebuilding the app).
+//
+// A driver sees only two things: a `Link` (link.dados: write/read bytes,
+// sleep, discard, log, progress) and the model's INI as a map
+// {"section.key": value}. A mod imports nothing, and `harden.js` removes the
+// engine's string-to-code doors before any mod loads (see docs/DRIVERS.md,
+// "Sandbox"). The Dado functions below named `dh_*` are therefore the whole
+// surface a driver can reach: keep them to the link and nothing else — no
+// paths, no files, no processes. Any Dado function a compiled-in script calls
+// is reachable by a hostile mod that escapes the resolver, so no script in
+// this program may call a Dado function that touches files, network or
+// processes.
+//
+// Every call into a driver (and its load) runs under a watchdog thread that
+// stops the VM when the driver goes quiet on the link or overruns the call
+// (set_limits); see "the watchdog" below. choose_engine picks a model's
+// engine: the updated set, then the shipped set, then the built-in engine.
+//
+// Driver API 1 (what a mod's class must have):
+//   void init(any link, {string: string} model)
+//   int api()                answers DRIVER_API
+//   string identify()        handshake; answers the radio's replies as text
+//   []byte download()        the whole image (does its own handshake)
+//   void upload([]byte img)  writes the image (does its own handshake)
+// A driver fails with radio.LinkError's numbers (2 NO_ANSWER, 3 BAD_REPLY, ...).
+package driverhost
+
+import "core:cfg"
+import "core:fmt"
+import "core:mem/arena"
+import "core:os/fs"
+import "core:threads"
+import "core:time"
+
+// The driver API this host speaks. A mod answering another from api() is refused.
+const i64 DRIVER_API = 1
+
+// Failure codes besides the driver's own (radio.LinkError numbers 1..8).
+const i32 E_IO = 1
+const i32 E_NO_ANSWER = 2
+const i32 E_BAD_REPLY = 3
+// the mod's api() is not DRIVER_API
+const i32 E_API = 20
+// the mod could not be loaded (missing, does not compile, imports, init threw)
+const i32 E_LOAD = 21
+// no link is bound (a driver called the link outside a host call)
+const i32 E_UNBOUND = 22
+// the watchdog stopped the driver (no link activity for too long, or the
+// whole call ran past its cap); the Driver is dead afterwards
+const i32 E_TIMEOUT = 23
+// no engine of that name loads, and the app has no built-in one
+const i32 E_NO_ENGINE = 24
+
+// The byte pipe a driver drives. The same methods as radio.Link, declared
+// here so driver hosting does not depend on the radio core; the app adapts
+// its radio.Link to it (see docs/DRIVERS.md).
+trait Wire:
+    // writes every byte of `data`
+    !void send(^self, []u8 data)
+    // reads into `into` until full or `timeout_ms` passes; answers the count
+    !i64 recv(^self, []u8 into, i32 timeout_ms)
+    void sleep_ms(^self, i32 ms)
+    // throws away anything received and not yet read
+    void discard(^self)
+
+// Called as a transfer goes, with the caller's context. May be nil.
+type ProgressFn: void(rawptr, i64, i64)
+
+type Progress:
+    ProgressFn fn
+    rawptr ctx
+
+Progress no_progress():
+    return Progress(fn: nil, ctx: nil)
+
+// The link and progress of the call in flight; bound only while Dado is
+// inside identify/download/upload.
+private Wire g_link
+private Progress g_progress
+private bool g_bound = false
+private bool g_verbose = false
+
+// The longest a driver may wait in one read or sleep.
+const i64 MAX_WAIT_MS = 10000
+
+// Print the drivers' log lines (off by default).
+void set_verbose(bool on):
+    g_verbose = on
+
+// ---- the Link's backing: the only Dado a driver reaches ----
+
+!void dh_write([]u8 data):
+    try awake()
+    if !g_bound:
+        fail E_UNBOUND
+    feed(0)
+    try g_link.send(data) else:
+        fail E_IO
+
+// Up to n bytes: what arrived before timeout_ms (possibly none).
+!ref []u8 dh_read(i64 n, i64 timeout_ms):
+    try awake()
+    if !g_bound:
+        fail E_UNBOUND
+    if n < 0 || n > 65536:
+        fail E_IO
+    i64 wait = timeout_ms if timeout_ms >= 0 && timeout_ms <= MAX_WAIT_MS else MAX_WAIT_MS
+    feed(wait)
+    ref []u8 buf = #make([]u8, n)
+    try i64 got = g_link.recv(buf, i32(wait)) else:
+        #delete(buf)
+        fail E_IO
+    feed(0)
+    if got < n:
+        ref []u8 short = #make([]u8, got)
+        for i in 0..<got:
+            short[i] = buf[i]
+        #delete(buf)
+        return short
+    return buf
+
+!void dh_sleep(i64 ms):
+    try awake()
+    if !g_bound:
+        fail E_UNBOUND
+    if ms > 0 && ms <= MAX_WAIT_MS:
+        feed(ms)
+        g_link.sleep_ms(i32(ms))
+        feed(0)
+
+!void dh_discard():
+    try awake()
+    if !g_bound:
+        fail E_UNBOUND
+    g_link.discard()
+
+void dh_log(string8 msg):
+    if g_verbose:
+        fmt.println("[driver] ", msg)
+
+void dh_progress(i64 done, i64 total):
+    feed(0)
+    if g_bound && g_progress.fn != nil:
+        g_progress.fn(g_progress.ctx, done, total)
+
+// ---- the watchdog ----
+//
+// Every driver call (and the load itself, which runs the module's top-level
+// code and init) runs under a watchdog thread. It stops the driver's VM with
+// #script_stop when either
+//   * the driver has not touched the link for `idle_ms` (each write, read,
+//     sleep or progress report resets it; a read or sleep adds its own wait), or
+//   * the whole call has run `call_ms`.
+// A stop is polite first (the script meets an Error at its next loop or call,
+// its `finally` runs) and forced after STOP_GRACE_MS. The call then fails
+// E_TIMEOUT and the Driver is dead: close it and load again.
+
+type Limits:
+    i64 idle_ms
+    i64 call_ms
+
+private Limits g_limits = Limits(5000, 600000)
+private const i32 STOP_GRACE_MS = 200
+
+// idle 5 s, whole call 10 min (a 33 KB download at 9600 baud is ~1 min).
+void set_limits(i64 idle_ms, i64 call_ms):
+    g_limits = Limits(idle_ms: idle_ms, call_ms: call_ms)
+
+Limits limits():
+    return g_limits
+
+private type Watch:
+    VM vm
+    // monotonic ns; written by the driver's thread, read by the watchdog
+    i64 deadline
+    i64 cap
+    i32 done
+    i32 tripped
+    // 1 idle, 2 whole-call cap
+    i32 why
+
+private ^Watch g_watch = nil
+
+private i64 now_ns():
+    return i64(time.instant())
+
+// Fails E_TIMEOUT once the watchdog has tripped, so a driver looping on the
+// link stops at its next link call: the engine's own interrupt check runs
+// only every so many operations, and a loop that mostly waits in Dado
+// reaches it slowly.
+private !void awake():
+    ^Watch w = g_watch
+    if w != nil && threads.atomic_load(&w^.tripped) != 0:
+        fail E_TIMEOUT
+
+// Push the idle deadline out: now + idle + extra_ms.
+private void feed(i64 extra_ms):
+    ^Watch w = g_watch
+    if w != nil:
+        threads.atomic_store(&w^.deadline, now_ns() + (g_limits.idle_ms + extra_ms) * 1000000)
+
+private rawptr watchdog(rawptr arg):
+    ^Watch w = ^Watch(arg)
+    for threads.atomic_load(&w^.done) == 0:
+        i64 now = now_ns()
+        i32 why = 0
+        if now > threads.atomic_load(&w^.deadline):
+            why = 1
+        else if now > w^.cap:
+            why = 2
+        if why != 0:
+            w^.why = why
+            threads.atomic_store(&w^.tripped, 1)
+            #script_stop(w^.vm, STOP_GRACE_MS)
+            return nil
+        time.sleep(time.milliseconds(5))
+    return nil
+
+private type Armed:
+    ref Watch w
+    threads.Thread t
+
+private Armed arm(VM vm):
+    ref Watch w = nil
+    using #heap:
+        w = #new(Watch)
+    w^.vm = vm
+    i64 now = now_ns()
+    w^.deadline = now + g_limits.idle_ms * 1000000
+    w^.cap = now + g_limits.call_ms * 1000000
+    g_watch = w
+    threads.Thread t = threads.spawn(watchdog, rawptr(&w^))
+    return Armed(w: w, t: t)
+
+// Ends the watch; answers whether it stopped the driver.
+private bool disarm(Armed a):
+    g_watch = nil
+    threads.atomic_store(&a.w^.done, 1)
+    _ = threads.join(a.t)
+    bool tripped = threads.atomic_load(&a.w^.tripped) != 0
+    if tripped:
+        if a.w^.why == 2:
+            ref []char8 said = #format("the driver ran past ", g_limits.call_ms, " ms and was stopped")
+            keep_error(said)
+            #delete(said)
+        else:
+            ref []char8 said = #format("the driver did nothing on the link for ", g_limits.idle_ms, " ms and was stopped")
+            keep_error(said)
+            #delete(said)
+    using #heap:
+        #delete(a.w)
+    return tripped
+
+// ---- loading and calling drivers ----
+
+// A loaded driver: its own VM (so stopping or deleting one ends only it).
+type Driver:
+    VM vm
+    Loader loader
+    bool live
+    // the watchdog stopped it: every call fails E_TIMEOUT
+    bool stopped
+
+// The text of the last driver failure (the script's Error and trace), kept
+// until the next failure. Empty when none.
+private ref []char8 g_last_error
+
+string8 last_error():
+    string8 s = g_last_error
+    return s
+
+// Free the kept failure text (at exit, or to forget it).
+void clear_error():
+    #delete(g_last_error)
+    g_last_error = nil
+
+// Always on the heap: callers may be inside an arena (load()).
+private void keep_error(string8 text):
+    ref []char8 copy = nil
+    using #heap:
+        copy = #format(text)
+        #delete(g_last_error)
+    g_last_error = copy
+
+// The model INI flattened to {"section.key": value}, as a driver takes it.
+{string8: string8} flatten(cfg.Config c):
+    {string8: string8} m = {}
+    for sec, keys in c:
+        for k, v in keys:
+            string8 vv = v
+            m[#format(sec, ".", k)] = #format(vv)
+    return m
+
+// Load `<engine>.js` (path without the extension, absolute or relative to the
+// working directory) with the model INI at `model_ini`. Fails E_LOAD, E_API
+// or E_TIMEOUT.
+!Driver load(string8 engine, string8 model_ini):
+    arena.Arena a = arena.over(#heap)
+    defer arena.destroy(&a)
+    using arena.allocator(&a):
+        (cfg.Config c, bool ok, i32 _) = cfg.load(model_ini)
+        if !ok:
+            ref []char8 said = #format("cannot read ", model_ini)
+            keep_error(said)
+            #delete(said)
+            fail E_LOAD
+        {string8: string8} model = flatten(c)
+        try Driver d = load_with(engine, model) else code:
+            fail code
+        return d
+
+// As load, the model given as a flat map.
+!Driver load_with(string8 engine, {string8: string8} model):
+    try VM vm = #script_vm(#heap) else:
+        keep_error("no memory for a script VM")
+        fail E_LOAD
+    Armed w = arm(vm)
+    i32 failed = 0
+    Loader l
+    try l = #script_new(vm, Loader, engine, model) using err: fmt.discard() else code:
+        failed = code
+        keep_error(#script_error())
+    if disarm(w):
+        if failed == 0:
+            #delete(l)
+        #delete(vm)
+        fail E_TIMEOUT
+    if failed != 0:
+        #delete(vm)
+        fail E_LOAD
+    if l.api_version != DRIVER_API:
+        ref []char8 said = #format("the driver speaks driver API ", l.api_version, "; this app speaks ", DRIVER_API)
+        keep_error(said)
+        #delete(said)
+        #delete(l)
+        #delete(vm)
+        fail E_API
+    return Driver(vm: vm, loader: l, live: true, stopped: false)
+
+void close(^Driver d):
+    if d^.live:
+        #delete(d^.loader)
+        #delete(d^.vm)
+        d^.live = false
+
+private void bind(^Wire link, Progress p):
+    g_link = link
+    g_progress = p
+    g_bound = true
+
+private void unbind():
+    g_bound = false
+    Wire none
+    g_link = none
+
+// After a call fails with `code`: E_TIMEOUT when the watchdog stopped it.
+private i32 settle(^Driver d, Armed w, i32 code, bool failed):
+    if disarm(w):
+        d^.stopped = true
+        return E_TIMEOUT
+    if failed:
+        return code
+    return 0
+
+private !void usable(^Driver d):
+    if !d^.live:
+        keep_error("the driver is closed")
+        fail E_LOAD
+    if d^.stopped:
+        keep_error("the driver was stopped by the watchdog; load it again")
+        fail E_TIMEOUT
+
+// The driver's handshake replies, as text. Fails with the driver's code, or
+// E_TIMEOUT.
+!ref []char8 identify(^Driver d, ^Wire link):
+    try usable(d)
+    bind(link, no_progress())
+    defer unbind()
+    Armed w = arm(d^.vm)
+    ref []char8 r = nil
+    i32 code = 0
+    try r = d^.loader.identify() using err: fmt.discard() else why:
+        code = why
+        keep_error(#script_error())
+    i32 out = settle(d, w, code, code != 0)
+    if out != 0:
+        #delete(r)
+        fail out
+    return r
+
+!ref []u8 download(^Driver d, ^Wire link, Progress p):
+    try usable(d)
+    bind(link, p)
+    defer unbind()
+    Armed w = arm(d^.vm)
+    ref []u8 img = nil
+    i32 code = 0
+    try img = d^.loader.download() using err: fmt.discard() else why:
+        code = why
+        keep_error(#script_error())
+    i32 out = settle(d, w, code, code != 0)
+    if out != 0:
+        #delete(img)
+        fail out
+    return img
+
+!void upload(^Driver d, ^Wire link, []u8 image, Progress p):
+    try usable(d)
+    bind(link, p)
+    defer unbind()
+    Armed w = arm(d^.vm)
+    i32 code = 0
+    try d^.loader.upload(image) using err: fmt.discard() else why:
+        code = why
+        keep_error(#script_error())
+    i32 out = settle(d, w, code, code != 0)
+    if out != 0:
+        fail out
+
+// ---- choosing an engine for a model ----
+//
+// Owner decision: an engine in the updated driver set overrides the app's
+// built-in engine of the same name, but a downloaded engine must never brick
+// a model. So: try <dir>/engines/<engine>.js in each directory given (the
+// active updated set first, then the set shipped inside the app), and take
+// the first that loads and speaks DRIVER_API. If none does, fall back to the
+// built-in compiled engine when the app has one, saying why in `why`.
+
+enum i32 Source: (SCRIPTED, BUILTIN)
+
+type Choice:
+    Source source
+    // when SCRIPTED: the loaded driver (close it)
+    Driver driver
+    // when SCRIPTED: the file loaded, without ".js"
+    ref []char8 path
+    // every scripted engine passed over, and why, one per line ("" when none)
+    ref []char8 why
+
+    void destroy(^self):
+        if self.source == Source.SCRIPTED:
+            close(&self.driver)
+        #delete(self.path)
+        #delete(self.why)
+        self.path = nil
+        self.why = nil
+
+// Letters, digits, '_', '-' (an engine name becomes a file name).
+bool engine_name_ok(string8 s):
+    if #len(s) == 0 || #len(s) > 64:
+        return false
+    for i in 0..<#len(s):
+        char8 c = s[i]
+        if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'):
+            return false
+    return true
+
+!Choice choose_engine([]string8 dirs, string8 engine, string8 model_ini, bool has_builtin):
+    ref []char8 why = #format("")
+    if !engine_name_ok(engine):
+        #delete(why)
+        ref []char8 said = #format("bad engine name '", engine, "'")
+        keep_error(said)
+        #delete(said)
+        fail E_NO_ENGINE
+    for dir in dirs:
+        if #len(dir) == 0:
+            continue
+        ref []char8 base = #format(dir, "/engines/", engine)
+        ref []char8 file = #format(base, ".js")
+        bool there = fs.is_file(file)
+        #delete(file)
+        if !there:
+            #delete(base)
+            continue
+        try Driver d = load(base, model_ini) else code:
+            ref []char8 more = #format(why, base, ".js: code ", code, ": ", first_line(last_error()), "\n")
+            #delete(why)
+            why = more
+            if g_verbose:
+                fmt.println("[driverhost] passing over ", base, ".js (code ", code, ")")
+            #delete(base)
+            continue
+        return Choice(source: Source.SCRIPTED, driver: d, path: base, why: why)
+    if has_builtin:
+        if g_verbose && #len(why) > 0:
+            fmt.println("[driverhost] using the built-in ", engine, " engine:\n", why)
+        Driver none
+        return Choice(source: Source.BUILTIN, driver: none, path: nil, why: why)
+    ref []char8 said = #format("no usable engine '", engine, "':\n", why)
+    keep_error(said)
+    #delete(said)
+    #delete(why)
+    fail E_NO_ENGINE
+
+private string8 first_line(string8 s):
+    for i in 0..<#len(s):
+        if s[i] == '\n':
+            return s[0..<i]
+    return s

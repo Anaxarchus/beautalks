@@ -1,0 +1,88 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The sandbox around driver mods: dynamic import() from a mod's own source,
+// top-level code, and the other escape routes QuickJS has. Run from the repo
+// root: dado test driverhost
+package driverhost
+
+import "core:fmt"
+import "core:os/fs"
+import "core:strings"
+
+// A link to nowhere: the fixtures never need the radio.
+type DeadWire using Wire:
+    i64 sent
+
+    !void send(^self, []u8 data):
+        self.sent += #len(data)
+
+    !i64 recv(^self, []u8 into, i32 timeout_ms):
+        return 0
+
+    void sleep_ms(^self, i32 ms):
+        return
+
+    void discard(^self):
+        return
+
+i32 g_fails = 0
+
+void must(bool ok, string8 what, string8 detail):
+    if ok:
+        fmt.println("ok: ", what)
+    else:
+        fmt.println("FAIL: ", what, "\n", detail)
+        g_fails += 1
+
+i32 test():
+    ref DeadWire w = #new(DeadWire)
+    try ref []char8 cwd = fs.current_dir() else:
+        return 1
+    ref []char8 abs = #format(cwd, "/driverhost/testdata/target.js")
+    {string8: string8} model = {}
+    model["test.abs"] = abs
+
+    // 1. dynamic import() from the mod's own source
+    try Driver d = load_with("driverhost/testdata/imports", model) else code:
+        fmt.println("FAIL: load imports fixture ", code, ": ", last_error())
+        return 1
+    try ref []char8 first = identify(&d, w) else code:
+        fmt.println("FAIL: identify #1 ", code, ": ", last_error())
+        return 1
+    string8 f1 = first
+    must(f1 == "started", "imports fixture started its imports", f1)
+    try ref []char8 report = identify(&d, w) else code:
+        fmt.println("FAIL: identify #2 ", code, ": ", last_error())
+        return 1
+    string8 r = report
+    fmt.println(r)
+    must(strings.contains(r, "jobs=1\n"), "the job queue ran between the calls (plain promise job)", r)
+    must(strings.contains(r, "dados:runtime=resolved"), "control: import(\"dados:runtime\") resolved, so import() jobs ran", r)
+    must(!strings.contains(r, "=pending"), "no import is left pending", r)
+    must(strings.count(r, "=resolved") == 1, "every other import() was rejected (dado:driverhost, dado:main, dados:host, dados:mods, ./target.js, absolute path, package scripts, js:, mod:)", r)
+    must(strings.contains(r, "atLoad=eval:undefined Function:undefined ctor:undefined"), "lockdown ran before the module's top-level code", r)
+    must(!strings.contains(r, "topCallsites=FUNCTIONS"), "top-level code reaches no host function through Error.prepareStackTrace", r)
+    close(&d)
+
+    // 2. the other doors
+    try Driver e = load_with("driverhost/testdata/escapes", model) else code:
+        fmt.println("FAIL: load escapes fixture ", code, ": ", last_error())
+        return 1
+    try ref []char8 verdict = identify(&e, w) else code:
+        fmt.println("FAIL: escapes identify ", code, ": ", last_error())
+        return 1
+    string8 v = verdict
+    must(v == "SAFE", "escape probes (timers, Worker, realms, std/os, import.meta, symbols, prepareStackTrace, undoing the lockdown)", v)
+    close(&e)
+
+    #delete(first)
+    #delete(report)
+    #delete(verdict)
+    #delete(abs)
+    #delete(cwd)
+    #delete(model)
+    #delete(w)
+    clear_error()
+    return g_fails

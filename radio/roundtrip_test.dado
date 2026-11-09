@@ -1,0 +1,87 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// decode every channel -> encode into a copy -> the bytes are identical; and
+// image -> CSV -> image through the channel list keeps the bytes too.
+package radio
+
+import "core:fmt"
+
+bool roundtrip(^const Model m, string8 file):
+    try ref []u8 img = load_image(file) else:
+        fmt.println("cannot read ", file)
+        return false
+    defer #delete(img)
+    ref []u8 copy = copy_image(img)
+    defer #delete(copy)
+    // scribble the copy's channel area first so encode has to do the work
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        Channel e = empty_channel(number)
+        try encode_channel(m, copy, &e) else:
+            return false
+    bool erased_differs = !images_equal(img, copy)
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        try Channel c = decode_channel(m, img, number) else:
+            return false
+        try encode_channel(m, copy, &c) else:
+            return false
+    // erasing then re-adding loses what the blank template does not carry,
+    // so the strict byte check is decode -> encode over the original bytes
+    ref []u8 same = copy_image(img)
+    defer #delete(same)
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        try Channel c = decode_channel(m, img, number) else:
+            return false
+        try encode_channel(m, same, &c) else:
+            return false
+    i64 diff = -1
+    for i in 0..<#len(img):
+        if img[i] != same[i] && diff < 0:
+            diff = i
+    bool ok = #expect(erased_differs, file, ": erasing changed the copy")
+    ok = #expect(images_equal(img, same), file, ": decode/encode is byte-identical; first diff at ", diff, " ", img[diff if diff >= 0 else 0], " vs ", same[diff if diff >= 0 else 0]) && ok
+    // re-added channels decode the same as the originals
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        try Channel a = decode_channel(m, img, number) else:
+            return false
+        try Channel b = decode_channel(m, copy, number) else:
+            return false
+        bool eq = a.empty == b.empty && a.rx_hz == b.rx_hz && a.tx_hz == b.tx_hz && tone_equal(a.rx_tone, b.rx_tone) && tone_equal(a.tx_tone, b.tx_tone) && a.power == b.power && a.mode == b.mode && a.scan == b.scan && a.bcl == b.bcl && channel_name(&a) == channel_name(&b)
+        ok = #expect(eq, file, ": channel ", number, " survives erase + re-add") && ok
+    // CSV round trip through the channel list, slots kept
+    ChannelList l = extract(m, img)
+    defer l.destroy()
+    ref []char8 csv = list_to_csv(&l)
+    defer #delete(csv)
+    ref []CsvProblem problems = nil
+    defer #delete(problems)
+    ChannelList back = list_from_csv(csv, &problems)
+    defer back.destroy()
+    ok = #expect(#len(problems) == 0, file, ": csv problems ", #len(problems)) && ok
+    ok = #expect(#len(back.entries) == #len(l.entries), file, ": csv entries ", #len(back.entries)) && ok
+    ref []u8 via = copy_image(img)
+    defer #delete(via)
+    ApplyOptions opt = default_apply()
+    opt.keep_slots = true
+    Report rep
+    defer rep.destroy()
+    apply(&back, m, via, opt, &rep)
+    ok = #expect(rep.skipped == 0 && rep.changed == 0, file, ": csv apply skipped ", rep.skipped, " changed ", rep.changed) && ok
+    ok = #expect(images_equal(img, via), file, ": image -> csv -> image is byte-identical") && ok
+    return ok
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    i64 a = find_model(models, "UV-5RM")
+    i64 b = find_model(models, "UV-5R")
+    if a < 0 || b < 0:
+        return 1
+    bool ok = roundtrip(&models[a], "testdata/uv5rm_backup.img")
+    ok = roundtrip(&models[b], "testdata/uv5re_backup.img") && ok
+    return 0 if ok else 1

@@ -1,0 +1,172 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// A raw serial port for radio programming cables (macOS and Linux).
+//
+// The port is opened raw, 8 data bits, no parity, 1 stop bit, no flow control,
+// with DTR and RTS raised (several cables power their level shifter from them).
+// Reads take a timeout in milliseconds and answer however many bytes arrived.
+package serial
+
+import "core:time"
+
+private @c_body("""
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <poll.h>
+    #include <string.h>
+    #include <sys/ioctl.h>
+    #include <termios.h>
+    #include <time.h>
+    #include <unistd.h>
+
+    __attribute__((unused)) static speed_t bt_speed(int baud) {
+        switch (baud) {
+            case 1200: return B1200;
+            case 2400: return B2400;
+            case 4800: return B4800;
+            case 9600: return B9600;
+            case 19200: return B19200;
+            case 38400: return B38400;
+            case 57600: return B57600;
+            case 115200: return B115200;
+            default: return 0;
+        }
+    }
+
+    __attribute__((unused)) static int bt_serial_open(const char *path, int baud) {
+        speed_t sp = bt_speed(baud);
+        if (sp == 0) return -2;
+        int fd = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK);
+        if (fd < 0) return -1;
+        struct termios t;
+        if (tcgetattr(fd, &t) != 0) { close(fd); return -1; }
+        cfmakeraw(&t);
+        t.c_cflag &= ~(tcflag_t)(CSIZE | PARENB | CSTOPB | CRTSCTS);
+        t.c_cflag |= CS8 | CREAD | CLOCAL;
+        t.c_iflag &= ~(tcflag_t)(IXON | IXOFF | IXANY);
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 0;
+        cfsetispeed(&t, sp);
+        cfsetospeed(&t, sp);
+        if (tcsetattr(fd, TCSANOW, &t) != 0) { close(fd); return -1; }
+        int fl = fcntl(fd, F_GETFL);
+        fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        int bits = TIOCM_DTR | TIOCM_RTS;
+        ioctl(fd, TIOCMBIS, &bits);
+        tcflush(fd, TCIOFLUSH);
+        return fd;
+    }
+
+    __attribute__((unused)) static int bt_serial_set_lines(int fd, int dtr, int rts) {
+        int on = (dtr ? TIOCM_DTR : 0) | (rts ? TIOCM_RTS : 0);
+        int off = (dtr ? 0 : TIOCM_DTR) | (rts ? 0 : TIOCM_RTS);
+        if (on && ioctl(fd, TIOCMBIS, &on) != 0) return -1;
+        if (off && ioctl(fd, TIOCMBIC, &off) != 0) return -1;
+        return 0;
+    }
+
+    __attribute__((unused)) static long bt_serial_write(int fd, const unsigned char *buf, long n) {
+        long done = 0;
+        while (done < n) {
+            ssize_t w = write(fd, buf + done, (size_t)(n - done));
+            if (w < 0) { if (errno == EINTR || errno == EAGAIN) continue; return -1; }
+            done += w;
+        }
+        tcdrain(fd);
+        return done;
+    }
+
+    static long long bt_now_ms(void) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    }
+
+    // Reads until `n` bytes arrived or `timeout_ms` passed; answers the count.
+    __attribute__((unused)) static long bt_serial_read(int fd, unsigned char *buf, long n, int timeout_ms) {
+        long got = 0;
+        long long deadline = bt_now_ms() + timeout_ms;
+        while (got < n) {
+            long long left = deadline - bt_now_ms();
+            if (left <= 0) break;
+            struct pollfd p = { fd, POLLIN, 0 };
+            int r = poll(&p, 1, (int)left);
+            if (r < 0) { if (errno == EINTR) continue; return -1; }
+            if (r == 0) break;
+            ssize_t k = read(fd, buf + got, (size_t)(n - got));
+            if (k < 0) { if (errno == EINTR || errno == EAGAIN) continue; return -1; }
+            if (k == 0) break;
+            got += k;
+        }
+        return got;
+    }
+
+    __attribute__((unused)) static int bt_serial_flush(int fd) { return tcflush(fd, TCIFLUSH); }
+    __attribute__((unused)) static int bt_serial_close(int fd) { return close(fd); }
+    """) i32 g_serial_shim = 0
+
+private foreign sx "termios.h" define "_DEFAULT_SOURCE=1" define "_DARWIN_C_SOURCE=1":
+    i32 bt_serial_open(cstring path, i32 baud)
+    i32 bt_serial_set_lines(i32 fd, i32 dtr, i32 rts)
+    #c.long bt_serial_write(i32 fd, ^const u8 buf, #c.long n)
+    #c.long bt_serial_read(i32 fd, ^u8 buf, #c.long n, i32 timeout_ms)
+    i32 bt_serial_flush(i32 fd)
+    i32 bt_serial_close(i32 fd)
+
+// Why an operation on the port failed.
+distinct enum i32 Error:
+    // the device could not be opened or configured
+    OPEN = 1,
+    // a baud rate the port does not offer
+    BAUD = 2,
+    // a read or write failed (cable pulled?)
+    IO = 3,
+
+// An open serial port.
+type Port:
+    i32 fd
+    i32 baud
+
+// Opens `path` (e.g. /dev/cu.usbserial-140) raw at `baud`, 8N1, DTR+RTS up.
+Error!Port open(cstring path, i32 baud):
+    i32 fd = sx.bt_serial_open(path, baud)
+    if fd == -2:
+        fail Error.BAUD
+    if fd < 0:
+        fail Error.OPEN
+    return Port(fd: fd, baud: baud)
+
+void close(^Port p):
+    if p^.fd >= 0:
+        _ = sx.bt_serial_close(p^.fd)
+        p^.fd = -1
+
+// Raises or drops the DTR and RTS control lines.
+Error!void set_lines(Port p, bool dtr, bool rts):
+    if sx.bt_serial_set_lines(p.fd, 1 if dtr else 0, 1 if rts else 0) != 0:
+        fail Error.IO
+
+// Writes every byte of `data`.
+Error!void write(Port p, []const u8 data):
+    if #len(data) == 0:
+        return
+    if i64(sx.bt_serial_write(p.fd, &data[0], #c.long(#len(data)))) != #len(data):
+        fail Error.IO
+
+// Reads into `into` until it is full or `timeout_ms` passes; answers the count.
+Error!i64 read_into(Port p, []u8 into, i32 timeout_ms):
+    if #len(into) == 0:
+        return 0
+    #c.long n = sx.bt_serial_read(p.fd, &into[0], #c.long(#len(into)), timeout_ms)
+    if n < 0:
+        fail Error.IO
+    return i64(n)
+
+// Throws away anything the radio sent that nobody read yet.
+void discard_input(Port p):
+    _ = sx.bt_serial_flush(p.fd)
+
+// Waits `ms` milliseconds.
+void pause(i32 ms):
+    time.sleep(time.milliseconds(ms))

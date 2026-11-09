@@ -1,0 +1,144 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Text forms of frequencies and tones, exact (no floating point): MHz with up
+// to six decimals, tones as `69.3`, `D023N`, `D023I` or empty.
+package radio
+
+import "core:strings"
+
+// "462.5625" -> 462562500 Hz; -1 when the text is not a frequency.
+i64 parse_mhz(string8 text):
+    string8 s = strings.trim(text)
+    if #len(s) == 0:
+        return -1
+    i64 whole = 0
+    i64 frac = 0
+    i64 places = 0
+    bool dot = false
+    i64 digits = 0
+    for i in 0..<#len(s):
+        char8 ch = s[i]
+        if ch == '.':
+            if dot:
+                return -1
+            dot = true
+            continue
+        if ch < '0' || ch > '9':
+            return -1
+        i64 d = i64(ch - '0')
+        digits += 1
+        if dot:
+            if places < 6:
+                frac = frac * 10 + d
+                places += 1
+            else if d != 0:
+                return -1
+        else:
+            whole = whole * 10 + d
+            if whole > 100000:
+                return -1
+    if digits == 0:
+        return -1
+    for places < 6:
+        frac *= 10
+        places += 1
+    return whole * 1000000 + frac
+
+void append_int(^strings.Builder b, i64 v):
+    if v < 0:
+        strings.append_char(b, '-')
+        append_int(b, -v)
+        return
+    [24]char8 tmp
+    i64 n = 0
+    i64 x = v
+    if x == 0:
+        tmp[0] = '0'
+        n = 1
+    for x > 0:
+        tmp[n] = char8(i64('0') + x % 10)
+        x /= 10
+        n += 1
+    for i in 0..<n:
+        strings.append_char(b, tmp[n - 1 - i])
+
+// Appends `width` digits of `v`, zero padded.
+void append_padded(^strings.Builder b, i64 v, i64 width):
+    [24]char8 tmp
+    i64 x = v
+    for i in 0..<width:
+        tmp[width - 1 - i] = char8(i64('0') + x % 10)
+        x /= 10
+    for i in 0..<width:
+        strings.append_char(b, tmp[i])
+
+// 462562500 -> "462.562500"
+void append_mhz(^strings.Builder b, i64 hz):
+    append_int(b, hz / 1000000)
+    strings.append_char(b, '.')
+    append_padded(b, hz % 1000000, 6)
+
+void append_tone(^strings.Builder b, Tone t):
+    if t.kind == ToneKind.CTCSS:
+        append_int(b, i64(t.value / 10))
+        strings.append_char(b, '.')
+        append_int(b, i64(t.value % 10))
+    else if t.kind == ToneKind.DCS:
+        strings.append_char(b, 'D')
+        append_padded(b, i64(t.value), 3)
+        strings.append_char(b, 'I' if t.inverted else 'N')
+
+// "" or "off" -> off; "69.3" -> CTCSS; "D023N"/"D023I"/"D023" -> DCS.
+// Answers false when the text is no tone.
+bool parse_tone(string8 text, ^Tone out):
+    string8 s = strings.trim(text)
+    out^ = Tone(kind: ToneKind.OFF, value: 0, inverted: false)
+    if #len(s) == 0 || strings.equal_fold(s, "off") || strings.equal_fold(s, "none"):
+        return true
+    if s[0] == 'D' || s[0] == 'd':
+        i64 end = #len(s)
+        bool inv = false
+        char8 last = s[end - 1]
+        if last == 'N' || last == 'n':
+            end -= 1
+        else if last == 'I' || last == 'i' || last == 'R' || last == 'r':
+            end -= 1
+            inv = true
+        i64 code = 0
+        if end <= 1:
+            return false
+        for i in 1..<end:
+            char8 ch = s[i]
+            if ch < '0' || ch > '7':
+                return false
+            code = code * 10 + i64(ch - '0')
+        out^ = Tone(kind: ToneKind.DCS, value: i32(code), inverted: inv)
+        return true
+    i64 hz = parse_mhz(s)
+    if hz < 0:
+        return false
+    // parse_mhz gives millionths; tenths of a hertz is hz / 100000
+    if hz % 100000 != 0:
+        return false
+    out^ = Tone(kind: ToneKind.CTCSS, value: i32(hz / 100000), inverted: false)
+    return true
+
+// The model's power level `i` (a name), or "" when it has none.
+bool parse_yes(string8 text):
+    string8 s = strings.trim(text)
+    return strings.equal_fold(s, "yes") || strings.equal_fold(s, "y") || strings.equal_fold(s, "true") || s == "1" || strings.equal_fold(s, "on")
+
+// "FM", "NFM", "AM" (also "WFM"/"Wide"/"Narrow"); false when unknown.
+bool parse_mode(string8 text, ^Mode out):
+    string8 s = strings.trim(text)
+    if strings.equal_fold(s, "FM") || strings.equal_fold(s, "wide") || strings.equal_fold(s, "WFM") || #len(s) == 0:
+        out^ = Mode.FM
+        return true
+    if strings.equal_fold(s, "NFM") || strings.equal_fold(s, "narrow"):
+        out^ = Mode.NFM
+        return true
+    if strings.equal_fold(s, "AM"):
+        out^ = Mode.AM
+        return true
+    return false

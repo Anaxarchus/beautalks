@@ -1,0 +1,40 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The object a driver mod is handed (driver API 1). Bytes are []byte.
+class Link
+
+void write([]byte data):
+    dh_write(data)
+
+// Up to n bytes, whatever arrived within timeout_ms; empty on timeout.
+[]byte read(int n, int timeout_ms):
+    return dh_read(n, timeout_ms)
+
+// Exactly n bytes, or fails 2 (nothing came) / 3 (too few came).
+[]byte read_exact(int n, int timeout_ms):
+    []byte got = dh_read(n, timeout_ms)
+    if got.len() == 0:
+        fail Error("the radio did not answer", 2)
+    if got.len() != n:
+        fail Error("short reply: " + string(got.len()) + " of " + string(n) + " bytes", 3)
+    return got
+
+// One byte, or -1 on timeout.
+int read_byte(int timeout_ms):
+    []byte got = dh_read(1, timeout_ms)
+    if got.len() == 0:
+        return -1
+    return got[0]
+
+void sleep(int ms):
+    dh_sleep(ms)
+
+void discard():
+    dh_discard()
+
+void log(string msg):
+    dh_log(msg)
+
+void progress(int done, int total):
+    dh_progress(done, total)

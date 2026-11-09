@@ -1,0 +1,302 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Known radios: one record per physical radio seen (as far as its replies
+// tell radios apart: two identical radios share a record and its count),
+// kept in <app data dir>/radios.ini so detection can try the radios seen
+// most recently first, with exactly the handshake that worked last time.
+//
+//   [radio uv-5rm-1a2b3c4d]
+//   model = uv-5rm          engine = uv17pro      handshake = PROGRAMBFNORMALU
+//   ident =                 f_reply = hex:...     m_reply = hex:...
+//   firmware =              nickname =            seen = 3
+//   first_seen = 1793...    last_seen = 1793...   port = /dev/cu.usbserial-140
+//   usb = 1A86:7523         usb_serial =          image_sha256 = ...  backup = ...
+package radio
+
+import "core:cfg"
+import "core:hash"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:time"
+
+const string8 SECTION_PREFIX = "radio "
+
+type Registry:
+    cfg.Config c
+    ref []char8 dir
+    ref []char8 file
+
+    void destroy(^self):
+        cfg.destroy(&self.c)
+        #delete(self.dir)
+        #delete(self.file)
+
+// The app data directory: $BEAUTALKS_HOME when set, else the system's
+// config directory + "beautalks" (macOS ~/Library/Application Support,
+// Linux $XDG_CONFIG_HOME or ~/.config). The caller #deletes it.
+ref []char8 app_data_dir():
+    ref []char8 env = nil
+    try env = os.get_env("BEAUTALKS_HOME") else:
+        env = nil
+    if #len(env) != 0:
+        return env
+    #delete(env)
+    try ref []char8 base = os.config_dir() else:
+        return strings.clone(".beautalks")
+    ref []char8 out = path.join(base, "beautalks")
+    #delete(base)
+    return out
+
+// Opens (or starts) the registry in `dir`. Nothing is written until save.
+Registry open_registry(string8 dir):
+    Registry r
+    r.dir = strings.clone(dir)
+    r.file = path.join(dir, "radios.ini")
+    if fs.exists(r.file):
+        (cfg.Config c, bool ok, i32 _) = cfg.load(r.file)
+        if ok:
+            r.c = c
+            return r
+    r.c = cfg.empty()
+    return r
+
+bool save_registry(^Registry r):
+    try fs.make_dirs(r^.dir) else:
+        return false
+    return cfg.save(r^.c, r^.file)
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+void append_hex(^strings.Builder b, []u8 data):
+    string8 digits = "0123456789ABCDEF"
+    for i in 0..<#len(data):
+        strings.append_char(b, digits[i64(data[i] >> 4)])
+        strings.append_char(b, digits[i64(data[i] & 0xF)])
+
+private ref []char8 hex_spec([]u8 data):
+    strings.Builder b = strings.builder(2 * #len(data) + 4)
+    if #len(data) != 0:
+        strings.append(&b, "hex:")
+        append_hex(&b, data)
+    return strings.finish(&b)
+
+private ref []char8 section_of(string8 id):
+    return strings.concat(SECTION_PREFIX, id)
+
+// A stable id for a radio: model id + a hash of what identifies it.
+ref []char8 radio_id(string8 model_id, string8 engine, []u8 ident, []u8 f_reply, []u8 m_reply):
+    u32 h = hash.fnv1a32_text(engine)
+    h = hash.fnv1a32_update(h, ident)
+    h = hash.fnv1a32_update(h, f_reply)
+    h = hash.fnv1a32_update(h, m_reply)
+    strings.Builder b = strings.builder(32)
+    strings.append(&b, model_id)
+    strings.append_char(&b, '-')
+    [4]u8 hb = (u8((h >> 24) & 0xFF), u8((h >> 16) & 0xFF), u8((h >> 8) & 0xFF), u8(h & 0xFF))
+    append_hex(&b, hb[:])
+    ref []char8 out = strings.to_lower(strings.text(b))
+    #delete(b)
+    return out
+
+// What a sighting knows about the cable.
+type CableInfo:
+    i32 vid
+    i32 pid
+
+CableInfo cable_for_port(string8 port):
+    PortList pl = list_ports()
+    defer pl.destroy()
+    for i in 0..<#len(pl.ports):
+        if pl.path_of(i) == port:
+            return CableInfo(vid: pl.ports[i].vid, pid: pl.ports[i].pid)
+    return CableInfo(vid: -1, pid: -1)
+
+// Records a sighting; answers the record's id (the caller #deletes it).
+// `handshake` is the magic (uv5r) or ident (uv17pro) word that worked.
+ref []char8 remember(^Registry r, string8 model_id, string8 engine, string8 handshake, []u8 ident, []u8 f_reply, []u8 m_reply, string8 port, CableInfo cable):
+    ref []char8 id = radio_id(model_id, engine, ident, f_reply, m_reply)
+    ref []char8 sec = section_of(id)
+    defer #delete(sec)
+    i64 now = time.unix()
+    bool fresh = cfg.get_i64(r^.c, sec, "first_seen", 0) == 0
+    if fresh:
+        cfg.set_i64(&r^.c, sec, "first_seen", now)
+        cfg.set_string(&r^.c, sec, "nickname", "")
+    cfg.set_i64(&r^.c, sec, "last_seen", now)
+    cfg.set_i64(&r^.c, sec, "seen", cfg.get_i64(r^.c, sec, "seen", 0) + 1)
+    cfg.set_string(&r^.c, sec, "model", model_id)
+    cfg.set_string(&r^.c, sec, "engine", engine)
+    if #len(handshake) != 0:
+        cfg.set_string(&r^.c, sec, "handshake", handshake)
+    ref []char8 ih = hex_spec(ident)
+    ref []char8 fh = hex_spec(f_reply)
+    ref []char8 mh = hex_spec(m_reply)
+    cfg.set_string(&r^.c, sec, "ident", ih)
+    cfg.set_string(&r^.c, sec, "f_reply", fh)
+    cfg.set_string(&r^.c, sec, "m_reply", mh)
+    #delete(ih)
+    #delete(fh)
+    #delete(mh)
+    if #len(port) != 0:
+        cfg.set_string(&r^.c, sec, "port", port)
+    if cable.vid >= 0:
+        strings.Builder b = strings.builder(16)
+        [4]u8 v = (u8((cable.vid >> 8) & 0xFF), u8(cable.vid & 0xFF), u8((cable.pid >> 8) & 0xFF), u8(cable.pid & 0xFF))
+        append_hex(&b, v[0..<2])
+        strings.append_char(&b, ':')
+        append_hex(&b, v[2..<4])
+        cfg.set_string(&r^.c, sec, "usb", strings.text(b))
+        #delete(b)
+    return id
+
+// Records a sighting from a detection with the chosen model.
+ref []char8 remember_detection(^Registry r, ^Detection d, ^const Model m, string8 port):
+    CableInfo cable = cable_for_port(port)
+    if d^.engine == "uv5r":
+        return remember(r, m^.id, d^.engine, detection_handshake(d), d^.ident[:], nil, nil, port, cable)
+    return remember(r, m^.id, d^.engine, detection_handshake(d), nil, d^.hello.f_reply[0..<d^.hello.f_len], d^.hello.m_reply[0..<d^.hello.m_len], port, cable)
+
+// The firmware tag an image carries, when the family has one (uv5r:
+// image 0x1838..0x1846, 0xFF padding dropped). A view of `img`.
+string8 image_firmware(^const Model m, []u8 img):
+    if m^.engine != "uv5r" || #len(img) < 0x1846:
+        return ""
+    i64 n = 0
+    for n < 14 && img[0x1838 + n] != 0xFF && img[0x1838 + n] >= 0x20 && img[0x1838 + n] < 0x7F:
+        n += 1
+    return string8(img[0x1838..<0x1838 + n])
+
+// Records an image read from (or written to) radio `id`, and its backup.
+void remember_image(^Registry r, string8 id, ^const Model m, []u8 img, string8 backup_path):
+    ref []char8 sec = section_of(id)
+    defer #delete(sec)
+    hash.Sha256Digest dg = hash.sha256(img)
+    ref []char8 hx = hash.hex(dg)
+    cfg.set_string(&r^.c, sec, "image_sha256", hx)
+    #delete(hx)
+    string8 fw = image_firmware(m, img)
+    if #len(fw) != 0:
+        cfg.set_string(&r^.c, sec, "firmware", fw)
+    if #len(backup_path) != 0:
+        cfg.set_string(&r^.c, sec, "backup", backup_path)
+    cfg.set_i64(&r^.c, sec, "last_seen", time.unix())
+
+// After a read or write with an explicit model (no detection): the record
+// of that model last seen on `port` (else the most recent of that model),
+// or a new one from what the image tells (uv5r: its ident). Caller #deletes.
+ref []char8 remember_model_use(^Registry r, ^const Model m, []u8 img, string8 port):
+    KnownList k = list_known(r)
+    defer k.destroy()
+    i64 pick = -1
+    for i in 0..<#len(k.radios):
+        if k.text(k.radios[i].model) != m^.id:
+            continue
+        if pick < 0 || k.text(k.radios[i].port) == port:
+            pick = i
+            if k.text(k.radios[i].port) == port:
+                break
+    if pick >= 0:
+        ref []char8 id = strings.clone(k.text(k.radios[pick].id))
+        ref []char8 sec = section_of(id)
+        cfg.set_i64(&r^.c, sec, "last_seen", time.unix())
+        cfg.set_i64(&r^.c, sec, "seen", cfg.get_i64(r^.c, sec, "seen", 0) + 1)
+        if #len(port) != 0:
+            cfg.set_string(&r^.c, sec, "port", port)
+        #delete(sec)
+        return id
+    []u8 ident = nil
+    if m^.engine == "uv5r" && #len(img) >= 8:
+        ident = img[0..<8]
+    string8 hs = word_at(m^.magics, 0) if m^.engine == "uv5r" else word_at(m^.ident, 0)
+    return remember(r, m^.id, m^.engine, hs, ident, nil, nil, port, cable_for_port(port))
+
+bool rename_radio(^Registry r, string8 id, string8 nickname):
+    ref []char8 sec = section_of(id)
+    defer #delete(sec)
+    if cfg.get_i64(r^.c, sec, "first_seen", 0) == 0:
+        return false
+    cfg.set_string(&r^.c, sec, "nickname", nickname)
+    return true
+
+bool forget_radio(^Registry r, string8 id):
+    ref []char8 sec = section_of(id)
+    defer #delete(sec)
+    return cfg.remove_section(&r^.c, sec)
+
+// ── listing ──────────────────────────────────────────────────────────────────
+
+type KnownRadio:
+    Span id
+    Span model
+    Span engine
+    Span handshake
+    Span ident
+    Span f_reply
+    Span m_reply
+    Span firmware
+    Span nickname
+    Span port
+    Span usb
+    Span image_sha256
+    Span backup
+    i64 first_seen
+    i64 last_seen
+    i64 seen
+
+type KnownList:
+    ref []KnownRadio radios
+    ref []char8 pool
+
+    Span keep(^self, string8 s):
+        i64 at = #len(self.pool)
+        for i in 0..<#len(s):
+            self.pool = #append(self.pool, s[i])
+        return Span(at: at, len: #len(s))
+
+    string8 text(^self, Span s):
+        if s.len == 0:
+            return ""
+        return string8(self.pool[s.at..<s.at + s.len])
+
+    void destroy(^self):
+        #delete(self.radios)
+        #delete(self.pool)
+        self.radios = nil
+        self.pool = nil
+
+// Every known radio, most recently seen first.
+KnownList list_known(^Registry r):
+    KnownList k
+    for sec, keys in r^.c:
+        if !strings.starts_with(sec, SECTION_PREFIX):
+            continue
+        KnownRadio x
+        x.id = k.keep(sec[#len(SECTION_PREFIX)..<#len(sec)])
+        x.model = k.keep(cfg.get_string(r^.c, sec, "model", ""))
+        x.engine = k.keep(cfg.get_string(r^.c, sec, "engine", ""))
+        x.handshake = k.keep(cfg.get_string(r^.c, sec, "handshake", ""))
+        x.ident = k.keep(cfg.get_string(r^.c, sec, "ident", ""))
+        x.f_reply = k.keep(cfg.get_string(r^.c, sec, "f_reply", ""))
+        x.m_reply = k.keep(cfg.get_string(r^.c, sec, "m_reply", ""))
+        x.firmware = k.keep(cfg.get_string(r^.c, sec, "firmware", ""))
+        x.nickname = k.keep(cfg.get_string(r^.c, sec, "nickname", ""))
+        x.port = k.keep(cfg.get_string(r^.c, sec, "port", ""))
+        x.usb = k.keep(cfg.get_string(r^.c, sec, "usb", ""))
+        x.image_sha256 = k.keep(cfg.get_string(r^.c, sec, "image_sha256", ""))
+        x.backup = k.keep(cfg.get_string(r^.c, sec, "backup", ""))
+        x.first_seen = cfg.get_i64(r^.c, sec, "first_seen", 0)
+        x.last_seen = cfg.get_i64(r^.c, sec, "last_seen", 0)
+        x.seen = cfg.get_i64(r^.c, sec, "seen", 0)
+        k.radios = #append(k.radios, x)
+    // newest first (insertion sort; the list is short)
+    for i in 1..<#len(k.radios):
+        i64 j = i
+        for j > 0 && k.radios[j].last_seen > k.radios[j - 1].last_seen:
+            KnownRadio t = k.radios[j]
+            k.radios[j] = k.radios[j - 1]
+            k.radios[j - 1] = t
+            j -= 1
+    return k

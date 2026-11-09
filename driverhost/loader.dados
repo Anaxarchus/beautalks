@@ -1,0 +1,27 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Compiled into the app: locks the engine down, loads one driver mod by path
+// and forwards the host's calls to it.
+class Loader
+
+foreign "harden.js":
+    int lockdown()
+
+any drv = 0
+int api_version = 0
+
+void init(string path, {string: string} model):
+    lockdown()
+    drv = Script.load(path, Link(), model)
+    api_version = int(drv.api())
+
+string identify():
+    return string(drv.identify())
+
+[]byte download():
+    []byte image = drv.download()
+    return image
+
+void upload([]byte image):
+    drv.upload(image)

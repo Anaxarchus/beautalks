@@ -1,0 +1,633 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The beautalks command line. Every radio operation lives in the `radio`
+// package; this file only parses words, prints, and asks.
+package main
+
+import "core:fmt"
+import "core:io"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:time"
+import "../radio"
+
+const string8 USAGE = """
+    usage: beautalks [--models DIR] <command> ...
+
+      ports                                   list serial ports (USB IDs, cable chip)
+      models                                  list the model definitions
+      detect [--port P]                       identify the radio on the cable
+      read [--port P] [--model M] -o FILE.img download the radio's memory
+      channels FILE.img [--model M]           list the channels of an image
+      export FILE.img -o FILE.csv [--model M] channels to CSV
+      import FILE.img FILE.csv -o OUT.img [--model M]
+                                              CSV channels into an image (slots kept)
+      write FILE.img [--port P] [--model M] [--allow-untested]
+                                              back up the radio, write, read back, compare
+      profile extract FILE.img -o LIST.csv [--model M]
+                                              a model-independent channel list
+      profile apply LIST.csv --model M [--into FILE.img] (-o OUT.img | --check)
+              [--start N] [--keep-slots] [--fill-empty] [--info]
+                                              place a channel list on a model, with diagnostics
+
+    Model definitions come from --models DIR, else $BEAUTALKS_MODELS, else ./models,
+    else <program dir>/../models.
+    """
+
+// ── words ────────────────────────────────────────────────────────────────────
+
+type Args:
+    ref []string8 pos
+    {string8: string8} opts
+
+    string8 opt(^self, string8 name):
+        try string8 v = self.opts[name] else:
+            return ""
+        return v
+
+    bool has(^self, string8 name):
+        return name in self.opts
+
+    void destroy(^self):
+        #delete(self.pos)
+        #delete(self.opts)
+
+bool is_switch(string8 a):
+    return a == "--check" || a == "--keep-slots" || a == "--fill-empty" || a == "--allow-untested" || a == "--info" || a == "-h" || a == "--help"
+
+// Splits words into positionals and options; answers false (and says why)
+// when an option lacks its value.
+bool parse_args([]string8 words, ^Args out):
+    i64 i = 0
+    for i < #len(words):
+        string8 w = words[i]
+        if strings.starts_with(w, "-") && #len(w) > 1:
+            if is_switch(w):
+                out^.opts[w] = "yes"
+                i += 1
+                continue
+            (string8 head, string8 val, bool found) = strings.split_first(w, "=")
+            if found && strings.starts_with(w, "--"):
+                out^.opts[head] = val
+                i += 1
+                continue
+            if i + 1 >= #len(words):
+                fmt.eprintln("beautalks: ", w, " needs a value")
+                return false
+            out^.opts[w] = words[i + 1]
+            i += 2
+            continue
+        out^.pos = #append(out^.pos, w)
+        i += 1
+    return true
+
+// ── shared helpers ───────────────────────────────────────────────────────────
+
+ref []char8 models_dir(^Args a, string8 program):
+    string8 given = a^.opt("--models")
+    if #len(given) != 0:
+        return strings.clone(given)
+    ref []char8 env = nil
+    try env = os.get_env("BEAUTALKS_MODELS") else:
+        env = nil
+    if #len(env) != 0:
+        return env
+    #delete(env)
+    if fs.is_dir("models"):
+        return strings.clone("models")
+    try string8 exe = os.executable_path() else:
+        return strings.clone("models")
+    ref []char8 d = path.dir(exe)
+    ref []char8 out = path.join(d, "..", "models")
+    #delete(d)
+    return out
+
+void print_model_line(^const radio.Model m):
+    string8 t = "untested"
+    if m^.tested == radio.Tested.WRITE:
+        t = "write"
+    else if m^.tested == radio.Tested.READ:
+        t = "read"
+    fmt.println("  ", m^.id, "  ", m^.vendor, " ", m^.name, "  [", m^.engine, ", tested=", t, "]")
+
+// Asks the user to pick one of `cands` (indices into models); -1 when no
+// one can answer.
+i64 ask_choice([]radio.Model models, []i64 cands, string8 why):
+    fmt.eprintln(why)
+    for i in 0..<#len(cands):
+        fmt.eprint("  ", i + 1, ") ")
+        ^const radio.Model m = &models[cands[i]]
+        fmt.eprintln(m^.vendor, " ", m^.name, " (", m^.id, ")")
+    if !os.is_terminal(0):
+        fmt.eprintln("pass --model to choose")
+        return -1
+    fmt.eprint("choose 1-", #len(cands), ": ")
+    try ref []char8 line = io.read_line(io.stdin()) else:
+        return -1
+    defer #delete(line)
+    i64 k = radio.parse_num(line, -1)
+    if k < 1 || k > #len(cands):
+        return -1
+    return cands[k - 1]
+
+// The model for an image file: --model, else by image size and contents
+// (one tested match is taken; several are asked about).
+i64 model_for_image(^Args a, []radio.Model models, []u8 img):
+    string8 want = a^.opt("--model")
+    if #len(want) != 0:
+        i64 i = radio.find_model(models, want)
+        if i < 0:
+            fmt.eprintln("beautalks: no model definition answers to \"", want, "\" (see `beautalks models`)")
+        return i
+    ref []i64 cands = radio.models_for_image(models, img, nil)
+    defer #delete(cands)
+    if #len(cands) == 0:
+        fmt.eprintln("beautalks: no model definition has images of ", #len(img), " bytes; pass --model")
+        return -1
+    if #len(cands) == 1:
+        return cands[0]
+    // the best is taken when it is tested and nothing else scores as well
+    i32 best = radio.image_match_score(&models[cands[0]], img)
+    i32 second = radio.image_match_score(&models[cands[1]], img)
+    if models[cands[0]].tested != radio.Tested.UNTESTED && best < second:
+        ^const radio.Model m = &models[cands[0]]
+        fmt.eprintln("(taking this image as ", m^.vendor, " ", m^.name, "; --model chooses another)")
+        return cands[0]
+    return ask_choice(models, cands, "several models have images like this one:")
+
+ref []u8 load_or_say(string8 file):
+    try ref []u8 img = radio.load_image(file) else:
+        fmt.eprintln("beautalks: cannot read ", file)
+        return nil
+    return img
+
+bool save_or_say(string8 file, []u8 img):
+    try radio.save_image(file, img) else:
+        fmt.eprintln("beautalks: cannot write ", file)
+        return false
+    return true
+
+bool write_text(string8 file, string8 text):
+    try fs.write_file(file, text) else:
+        fmt.eprintln("beautalks: cannot write ", file)
+        return false
+    return true
+
+// The port to use: --port, else the one port that looks like a cable.
+ref []char8 choose_port(^Args a):
+    string8 given = a^.opt("--port")
+    if #len(given) != 0:
+        return strings.clone(given)
+    radio.PortList pl = radio.list_ports()
+    defer pl.destroy()
+    i64 pick = -1
+    i64 known = 0
+    for i in 0..<#len(pl.ports):
+        if radio.known_cable_chip(pl.ports[i].vid, pl.ports[i].pid):
+            known += 1
+            pick = i
+    if known == 1:
+        return strings.clone(pl.path_of(pick))
+    i64 usbish = 0
+    for i in 0..<#len(pl.ports):
+        string8 p = pl.path_of(i)
+        if strings.contains(p, "usbserial") || strings.contains(p, "ttyUSB") || strings.contains(p, "wchusbserial"):
+            usbish += 1
+            pick = i
+    if usbish == 1:
+        return strings.clone(pl.path_of(pick))
+    fmt.eprintln("beautalks: pass --port (see `beautalks ports`)")
+    return nil
+
+private i64 g_last_pct = -1
+
+void on_progress(rawptr ctx, i64 done, i64 total):
+    if total <= 0:
+        return
+    i64 pct = done * 100 / total
+    if pct == g_last_pct && done < total:
+        return
+    g_last_pct = pct
+    if !os.is_terminal(2) && pct % 25 != 0:
+        return
+    fmt.eprint("\r  ", pct, "% (", done, "/", total, ")   ")
+    if done >= total:
+        fmt.eprintln("")
+        g_last_pct = -1
+
+radio.Progress progress():
+    return radio.Progress(fn: on_progress, ctx: nil)
+
+ref []char8 timestamp():
+    time.DateTime t = time.utc(time.unix_nanos())
+    strings.Builder b = strings.builder(32)
+    radio.append_padded(&b, t.year, 4)
+    radio.append_padded(&b, i64(t.month), 2)
+    radio.append_padded(&b, i64(t.day), 2)
+    strings.append_char(&b, '-')
+    radio.append_padded(&b, i64(t.hour), 2)
+    radio.append_padded(&b, i64(t.minute), 2)
+    radio.append_padded(&b, i64(t.second), 2)
+    return strings.finish(&b)
+
+// ── commands ─────────────────────────────────────────────────────────────────
+
+i32 cmd_ports():
+    radio.PortList pl = radio.list_ports()
+    defer pl.destroy()
+    if #len(pl.ports) == 0:
+        fmt.println("no serial ports found")
+    for i in 0..<#len(pl.ports):
+        radio.PortInfo p = pl.ports[i]
+        fmt.print(pl.path_of(i))
+        if p.vid >= 0:
+            strings.Builder b = strings.builder(16)
+            fmt.print("  usb ")
+            fmt.put_hex(u32(p.vid), 4, true, false, io.stdout_sink())
+            fmt.print(":")
+            fmt.put_hex(u32(p.pid), 4, true, false, io.stdout_sink())
+            string8 chip = radio.cable_chip_name(p.vid, p.pid)
+            if #len(chip) != 0:
+                fmt.print("  ", chip)
+            if radio.known_cable_chip(p.vid, p.pid):
+                fmt.print("  (programming cable)")
+            #delete(b)
+        fmt.println("")
+    return 0
+
+i32 cmd_models([]radio.Model models):
+    for i in 0..<#len(models):
+        print_model_line(&models[i])
+    return 0
+
+i32 cmd_detect(^Args a, []radio.Model models):
+    ref []char8 port = choose_port(a)
+    defer #delete(port)
+    if port == nil:
+        return 2
+    fmt.eprintln("probing ", port, " (UV-5R family at 9600, then UV-17Pro family at 115200) ...")
+    try radio.Detection d = radio.detect(port, models, progress()) else why:
+        fmt.eprintln("")
+        fmt.eprintln("beautalks: ", radio.link_error_message(why))
+        return 1
+    defer radio.close_detection(&d)
+    fmt.eprintln("")
+    if !d.found:
+        fmt.println("no radio answered")
+        return 1
+    print_detection(&d, models)
+    return 0
+
+void print_detection(^radio.Detection d, []radio.Model models):
+    fmt.print("radio answered at ", d^.baud, " baud (", d^.engine, " protocol)")
+    if d^.engine == "uv5r":
+        fmt.print("; ident ")
+        for k in 0..<8:
+            fmt.put_hex(d^.ident[k], 2, true, false, io.stdout_sink())
+    else:
+        fmt.print("; model reply \"", string8(d^.hello.m_reply[0..<d^.hello.m_len]), "\"")
+    fmt.println("")
+    fmt.println("candidates, best first:")
+    for c in d^.candidates:
+        print_model_line(&models[c])
+
+i32 cmd_read(^Args a, []radio.Model models):
+    string8 out = a^.opt("-o")
+    if #len(out) == 0:
+        fmt.eprintln("beautalks read: -o FILE.img is required")
+        return 2
+    ref []char8 port = choose_port(a)
+    defer #delete(port)
+    if port == nil:
+        return 2
+    string8 want = a^.opt("--model")
+    ref []u8 img = nil
+    defer #delete(img)
+    if #len(want) != 0:
+        i64 mi = radio.find_model(models, want)
+        if mi < 0:
+            fmt.eprintln("beautalks: no model definition answers to \"", want, "\"")
+            return 2
+        ^const radio.Model m = &models[mi]
+        try radio.SerialLink l = radio.open_serial(port, m^.baud) else why:
+            fmt.eprintln("beautalks: cannot open ", port, ": ", radio.link_error_message(why))
+            return 1
+        fmt.eprintln("reading ", m^.vendor, " ", m^.name, " on ", port, " ...")
+        try img = radio.download(&l, m, progress()) else why:
+            radio.close_serial(&l)
+            fmt.eprintln("")
+            fmt.eprintln("beautalks: ", radio.link_error_message(why))
+            return 1
+        radio.close_serial(&l)
+    else:
+        fmt.eprintln("no --model: detecting ...")
+        try radio.Detection d = radio.detect(port, models, progress()) else why:
+            fmt.eprintln("beautalks: ", radio.link_error_message(why))
+            return 1
+        defer radio.close_detection(&d)
+        fmt.eprintln("")
+        if !d.found || #len(d.candidates) == 0:
+            fmt.eprintln("beautalks: no known radio answered")
+            return 1
+        print_detection(&d, models)
+        i64 mi = d.candidates[0]
+        ^const radio.Model m = &models[mi]
+        fmt.eprintln("reading as ", m^.vendor, " ", m^.name, " ...")
+        try img = radio.download_detected(&d, m, progress()) else why:
+            fmt.eprintln("")
+            fmt.eprintln("beautalks: ", radio.link_error_message(why))
+            return 1
+    if !save_or_say(out, img):
+        return 1
+    fmt.println("saved ", #len(img), " bytes to ", out)
+    return 0
+
+i32 cmd_channels(^Args a, []radio.Model models):
+    if #len(a^.pos) < 2:
+        fmt.eprintln("beautalks channels: FILE.img is required")
+        return 2
+    ref []u8 img = load_or_say(a^.pos[1])
+    defer #delete(img)
+    if img == nil:
+        return 1
+    i64 mi = model_for_image(a, models, img)
+    if mi < 0:
+        return 2
+    ^const radio.Model m = &models[mi]
+    fmt.println(m^.vendor, " ", m^.name, ": ", radio.used_count(m, img), " of ", m^.layout.count, " channels used")
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        try radio.Channel c = radio.decode_channel(m, img, number) else:
+            fmt.eprintln("beautalks: the image does not fit the model")
+            return 1
+        if c.empty:
+            continue
+        strings.Builder b = strings.builder(96)
+        radio.append_padded(&b, i64(number), 4)
+        strings.append(&b, "  ")
+        string8 nm = radio.channel_name(&c)
+        strings.append(&b, nm)
+        for _ in #len(nm)..<13:
+            strings.append_char(&b, ' ')
+        radio.append_mhz(&b, c.rx_hz)
+        strings.append(&b, "  ")
+        if c.tx_hz < 0:
+            strings.append(&b, "TX off    ")
+        else:
+            radio.append_mhz(&b, c.tx_hz)
+        strings.append(&b, "  rx:")
+        radio.append_tone(&b, c.rx_tone)
+        strings.append(&b, " tx:")
+        radio.append_tone(&b, c.tx_tone)
+        strings.append(&b, "  ")
+        strings.append(&b, radio.power_name(m, i64(c.power)))
+        strings.append(&b, " ")
+        strings.append(&b, radio.mode_name(c.mode))
+        if !c.scan:
+            strings.append(&b, " noscan")
+        if c.bcl:
+            strings.append(&b, " bcl")
+        fmt.println(strings.text(b))
+        #delete(b)
+    return 0
+
+i32 cmd_export(^Args a, []radio.Model models, bool profile_form):
+    i64 at = 2 if profile_form else 1
+    string8 o = a^.opt("-o")
+    if #len(a^.pos) <= at || #len(o) == 0:
+        fmt.eprintln("beautalks: FILE.img and -o FILE.csv are required")
+        return 2
+    ref []u8 img = load_or_say(a^.pos[at])
+    defer #delete(img)
+    if img == nil:
+        return 1
+    i64 mi = model_for_image(a, models, img)
+    if mi < 0:
+        return 2
+    ^const radio.Model m = &models[mi]
+    radio.ChannelList l = radio.extract(m, img)
+    defer l.destroy()
+    if profile_form:
+        strings.Builder t = strings.builder(64)
+        strings.append(&t, "from ")
+        strings.append(&t, m^.vendor)
+        strings.append(&t, " ")
+        strings.append(&t, m^.name)
+        strings.append(&t, " image ")
+        strings.append(&t, path.base(a^.pos[at]))
+        l.title = l.add_text(strings.text(t))
+        #delete(t)
+    ref []char8 csv = radio.list_to_csv(&l)
+    defer #delete(csv)
+    if !write_text(a^.opt("-o"), csv):
+        return 1
+    fmt.println(#len(l.entries), " channels written to ", a^.opt("-o"))
+    return 0
+
+bool read_list(string8 file, ^radio.ChannelList out):
+    try ref []char8 text = fs.read_file(file) else:
+        fmt.eprintln("beautalks: cannot read ", file)
+        return false
+    defer #delete(text)
+    ref []radio.CsvProblem problems = nil
+    defer #delete(problems)
+    out^ = radio.list_from_csv(text, &problems)
+    for p in problems:
+        fmt.eprintln(file, ":", p.line, ": ", out^.text(p.what), " (line skipped)")
+    return true
+
+i32 cmd_import(^Args a, []radio.Model models):
+    string8 o = a^.opt("-o")
+    if #len(a^.pos) < 3 || #len(o) == 0:
+        fmt.eprintln("beautalks import: FILE.img FILE.csv -o OUT.img")
+        return 2
+    ref []u8 img = load_or_say(a^.pos[1])
+    defer #delete(img)
+    if img == nil:
+        return 1
+    i64 mi = model_for_image(a, models, img)
+    if mi < 0:
+        return 2
+    radio.ChannelList l
+    if !read_list(a^.pos[2], &l):
+        return 1
+    defer l.destroy()
+    radio.ApplyOptions opt = radio.default_apply()
+    opt.keep_slots = true
+    radio.Report rep
+    defer rep.destroy()
+    radio.apply(&l, &models[mi], img, opt, &rep)
+    ref []char8 txt = radio.report_text(&l, &rep, a^.has("--info"))
+    defer #delete(txt)
+    fmt.print(txt)
+    if !save_or_say(a^.opt("-o"), img):
+        return 1
+    return 0 if rep.skipped == 0 else 3
+
+i32 cmd_profile_apply(^Args a, []radio.Model models):
+    if #len(a^.pos) < 3:
+        fmt.eprintln("beautalks profile apply: LIST.csv --model M [--into FILE.img] (-o OUT.img | --check)")
+        return 2
+    string8 want = a^.opt("--model")
+    if #len(want) == 0:
+        fmt.eprintln("beautalks profile apply: --model is required")
+        return 2
+    i64 mi = radio.find_model(models, want)
+    if mi < 0:
+        fmt.eprintln("beautalks: no model definition answers to \"", want, "\"")
+        return 2
+    ^const radio.Model m = &models[mi]
+    bool check = a^.has("--check")
+    string8 o = a^.opt("-o")
+    if !check && #len(o) == 0:
+        fmt.eprintln("beautalks profile apply: -o OUT.img or --check is required")
+        return 2
+    radio.ChannelList l
+    if !read_list(a^.pos[2], &l):
+        return 1
+    defer l.destroy()
+    ref []u8 img = nil
+    defer #delete(img)
+    string8 into = a^.opt("--into")
+    if #len(into) != 0:
+        img = load_or_say(into)
+        if img == nil:
+            return 1
+        if #len(img) != m^.image_size:
+            fmt.eprintln("beautalks: ", into, " is ", #len(img), " bytes; a ", m^.name, " image is ", m^.image_size)
+            return 2
+    else:
+        img = #make([]u8, m^.image_size)
+        radio.fill(img, 0, m^.image_size, 0xFF)
+        if !check:
+            fmt.eprintln("note: no --into image: the result holds channels only (settings blank);")
+            fmt.eprintln("      download the radio first and pass it as --into before writing it to a radio")
+    radio.ApplyOptions opt = radio.default_apply()
+    opt.keep_slots = a^.has("--keep-slots")
+    opt.fill_empty = a^.has("--fill-empty")
+    if a^.has("--start"):
+        opt.start = i32(radio.parse_num(a^.opt("--start"), -1))
+    radio.Report rep
+    defer rep.destroy()
+    radio.apply(&l, m, img, opt, &rep)
+    ref []char8 txt = radio.report_text(&l, &rep, a^.has("--info"))
+    defer #delete(txt)
+    fmt.print(txt)
+    if check:
+        return 0 if rep.skipped == 0 else 3
+    if !save_or_say(a^.opt("-o"), img):
+        return 1
+    fmt.println("saved ", a^.opt("-o"))
+    return 0 if rep.skipped == 0 else 3
+
+void on_phase(rawptr ctx, radio.WritePhase p):
+    if p == radio.WritePhase.BACKUP:
+        fmt.eprintln("1/3 backing up the radio's current memory ...")
+    else if p == radio.WritePhase.WRITE:
+        fmt.eprintln("2/3 writing ...")
+    else if p == radio.WritePhase.VERIFY:
+        fmt.eprintln("3/3 reading back to verify ...")
+
+i32 cmd_write(^Args a, []radio.Model models):
+    if #len(a^.pos) < 2:
+        fmt.eprintln("beautalks write: FILE.img is required")
+        return 2
+    ref []u8 img = load_or_say(a^.pos[1])
+    defer #delete(img)
+    if img == nil:
+        return 1
+    i64 mi = model_for_image(a, models, img)
+    if mi < 0:
+        return 2
+    ^const radio.Model m = &models[mi]
+    bool allow = a^.has("--allow-untested")
+    if m^.tested != radio.Tested.WRITE:
+        if !allow:
+            fmt.eprintln("beautalks: writing to the ", m^.vendor, " ", m^.name, " is not tested; refused.")
+            fmt.eprintln("  --allow-untested writes anyway (the radio is backed up first and verified after).")
+            return 4
+        fmt.eprintln("WARNING: writing to the ", m^.vendor, " ", m^.name, " has NOT been tested with beautalks.")
+        fmt.eprintln("WARNING: a wrong write can leave the radio misconfigured; the backup lets you restore it.")
+    if #len(img) != m^.image_size:
+        fmt.eprintln("beautalks: the image is ", #len(img), " bytes; a ", m^.name, " image is ", m^.image_size)
+        return 2
+    ref []char8 port = choose_port(a)
+    defer #delete(port)
+    if port == nil:
+        return 2
+    try fs.make_dirs("backups") else:
+        fmt.eprintln("beautalks: cannot create backups/; nothing written")
+        return 1
+    ref []char8 ts = timestamp()
+    defer #delete(ts)
+    strings.Builder bp = strings.builder(64)
+    strings.append(&bp, "backups/")
+    strings.append(&bp, m^.id)
+    strings.append(&bp, "-")
+    strings.append(&bp, ts)
+    strings.append(&bp, ".img")
+    ref []char8 backup = strings.finish(&bp)
+    defer #delete(backup)
+    try radio.SerialLink l = radio.open_serial(port, m^.baud) else why:
+        fmt.eprintln("beautalks: cannot open ", port, ": ", radio.link_error_message(why))
+        return 1
+    defer radio.close_serial(&l)
+    try radio.safe_write(&l, m, img, allow, backup, 1000, on_phase, nil, progress()) else why:
+        fmt.eprintln("")
+        fmt.eprintln("beautalks: ", radio.link_error_message(why))
+        if fs.exists(backup):
+            fmt.eprintln("the radio's memory before this attempt is in ", backup)
+        return 1
+    fmt.println("written and verified; the radio's previous memory is in ", backup)
+    return 0
+
+i32 run([]string8 args):
+    Args a
+    defer a.destroy()
+    if !parse_args(args[1..<#len(args)], &a):
+        return 2
+    if #len(a.pos) == 0 || a.has("-h") || a.has("--help"):
+        fmt.println(USAGE)
+        return 0 if #len(a.pos) == 0 && (a.has("-h") || a.has("--help")) else 2
+    string8 cmd = a.pos[0]
+    if cmd == "ports":
+        return cmd_ports()
+    ref []char8 dir = models_dir(&a, args[0])
+    defer #delete(dir)
+    ref []radio.Model models = radio.load_models(dir)
+    defer #delete(models)
+    if #len(models) == 0:
+        fmt.eprintln("beautalks: no model definitions found in ", dir, " (pass --models DIR)")
+        return 2
+    if cmd == "models":
+        return cmd_models(models)
+    if cmd == "detect":
+        return cmd_detect(&a, models)
+    if cmd == "read":
+        return cmd_read(&a, models)
+    if cmd == "channels":
+        return cmd_channels(&a, models)
+    if cmd == "export":
+        return cmd_export(&a, models, false)
+    if cmd == "import":
+        return cmd_import(&a, models)
+    if cmd == "write":
+        return cmd_write(&a, models)
+    if cmd == "profile":
+        string8 sub = a.pos[1] if #len(a.pos) > 1 else ""
+        if sub == "extract":
+            return cmd_export(&a, models, true)
+        if sub == "apply":
+            return cmd_profile_apply(&a, models)
+        fmt.eprintln("beautalks profile: extract or apply")
+        return 2
+    fmt.eprintln("beautalks: unknown command ", cmd)
+    fmt.println(USAGE)
+    return 2
+
+i32 main(i32 argc, ^rawptr argv):
+    []string8 args = os.args(argc, argv)
+    return run(args)

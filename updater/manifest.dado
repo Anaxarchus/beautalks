@@ -1,0 +1,170 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The driver bundle's manifest: reading it, and refusing anything outside the
+// narrow shape the updater installs. Nothing a manifest says is trusted until
+// it passes here: names become paths and URLs only after these checks.
+package updater
+
+import "core:json"
+import "core:strings"
+import "core:strings/parse"
+
+const i64 MAX_FILES = 1000
+
+type FileEntry:
+    // where it is installed inside the set: engines/x.js, models/y.ini, ...
+    string8 path
+    // the release asset name (flat: no '/')
+    string8 asset
+    // lowercase hex SHA-256 of the file
+    string8 sha256
+    i64 size
+
+type Manifest:
+    i64 format
+    i64 driver_api
+    string8 min_app
+    // the release tag the files are fetched from
+    string8 release
+    // increases with every bundle; refuses replays of older bundles
+    i64 serial
+    ref []FileEntry files
+
+// Letters, digits, '.', '_', '-'; not empty, not starting with '.', at most 100.
+bool safe_name(string8 s):
+    if #len(s) == 0 || #len(s) > 100 || s[0] == '.':
+        return false
+    for i in 0..<#len(s):
+        char8 c = s[i]
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'
+        if !ok:
+            return false
+    return true
+
+// engines/<name>.js|.dados, models/<name>.ini, or README.md/LICENSE at the top.
+bool safe_path(string8 p):
+    (string8 dir, string8 rest, bool found) = strings.split_first(p, "/")
+    if !found:
+        return p == "README.md" || p == "LICENSE"
+    if !safe_name(rest) || strings.contains(rest, ".."):
+        return false
+    if dir == "engines":
+        return strings.ends_with(rest, ".js") || strings.ends_with(rest, ".dados")
+    if dir == "models":
+        return strings.ends_with(rest, ".ini")
+    return false
+
+bool lower_hex64(string8 s):
+    if #len(s) != 64:
+        return false
+    for i in 0..<64:
+        char8 c = s[i]
+        if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')):
+            return false
+    return true
+
+// "1.2.3" (a "-suffix" ignored) -> comparable number; -1 when malformed.
+i64 version_number(string8 v):
+    (string8 core, string8 _, bool _) = strings.split_first(v, "-")
+    i64 n = 0
+    i64 parts = 0
+    string8 rest = core
+    for parts < 3:
+        (string8 head, string8 tail, bool more) = strings.split_first(rest, ".")
+        try i64 x = parse.to_i64(head) else:
+            return 0 - 1
+        if x < 0 || x > 9999:
+            return 0 - 1
+        n = n * 10000 + x
+        parts += 1
+        rest = tail
+        if !more:
+            break
+    for parts < 3:
+        n = n * 10000
+        parts += 1
+    return n
+
+private !string8 text_of(json.Value o, string8 key):
+    try json.Value v = o.get(key) else:
+        fail 1
+    try string8 s = v.text() else:
+        fail 1
+    return s
+
+private !i64 int_of(json.Value o, string8 key):
+    try json.Value v = o.get(key) else:
+        fail 1
+    try i64 n = v.int() else:
+        fail 1
+    return n
+
+// Parses and checks `text`. On failure answers false and a reason in `why`.
+// The manifest's strings view `doc`, which the caller keeps alive.
+bool read_manifest(json.Value root, ^Manifest m, ^string8 why):
+    try m^.format = int_of(root, "format") else:
+        why^ = "manifest: missing format"
+        return false
+    if m^.format != MANIFEST_FORMAT:
+        why^ = "manifest: a format this app cannot read (update the app)"
+        return false
+    try m^.driver_api = int_of(root, "driver_api") else:
+        why^ = "manifest: missing driver_api"
+        return false
+    try m^.min_app = text_of(root, "min_app") else:
+        why^ = "manifest: missing min_app"
+        return false
+    try m^.release = text_of(root, "release") else:
+        why^ = "manifest: missing release"
+        return false
+    if !safe_name(m^.release):
+        why^ = "manifest: release tag has characters outside [A-Za-z0-9._-]"
+        return false
+    try m^.serial = int_of(root, "serial") else:
+        why^ = "manifest: missing serial"
+        return false
+    if m^.serial <= 0:
+        why^ = "manifest: serial must be positive"
+        return false
+    try json.Value files = root.get("files") else:
+        why^ = "manifest: missing files"
+        return false
+    if files.kind() != json.Kind.Array || files.len() == 0 || files.len() > MAX_FILES:
+        why^ = "manifest: files must be a non-empty array"
+        return false
+    for i in 0..<files.len():
+        try json.Value f = files.at(i) else:
+            why^ = "manifest: bad files entry"
+            return false
+        FileEntry e
+        try e.path = text_of(f, "path") else:
+            why^ = "manifest: a file without path"
+            return false
+        try e.asset = text_of(f, "asset") else:
+            why^ = "manifest: a file without asset"
+            return false
+        try e.sha256 = text_of(f, "sha256") else:
+            why^ = "manifest: a file without sha256"
+            return false
+        try e.size = int_of(f, "size") else:
+            why^ = "manifest: a file without size"
+            return false
+        if !safe_path(e.path):
+            why^ = "manifest: a file path outside engines/*.js|.dados, models/*.ini"
+            return false
+        if !safe_name(e.asset):
+            why^ = "manifest: an asset name with characters outside [A-Za-z0-9._-]"
+            return false
+        if !lower_hex64(e.sha256):
+            why^ = "manifest: a sha256 that is not 64 lowercase hex digits"
+            return false
+        if e.size < 0:
+            why^ = "manifest: a negative size"
+            return false
+        for other in m^.files:
+            if other.path == e.path || other.asset == e.asset:
+                why^ = "manifest: a path or asset listed twice"
+                return false
+        m^.files = #append(m^.files, e)
+    return true

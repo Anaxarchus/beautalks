@@ -1,0 +1,88 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// A small CSV reader and writer (RFC 4180 quoting: fields holding a comma, a
+// quote or a line break are quoted, and a quote inside is doubled).
+package radio
+
+import "core:strings"
+
+// One record's fields, viewing either the source text or `scratch` (for
+// fields that held doubled quotes).
+type CsvRow:
+    ref []string8 fields
+    ref []char8 scratch
+    void destroy(^self):
+        #delete(self.fields)
+        #delete(self.scratch)
+        self.fields = nil
+        self.scratch = nil
+
+// Reads the record starting at `at` in `text` into `row` (cleared first);
+// answers where the next record starts, or -1 at the end of the text.
+i64 csv_next(string8 text, i64 at, ^CsvRow row):
+    if at >= #len(text):
+        return -1
+    #delete(row^.fields)
+    row^.fields = nil
+    // first pass: unescape into scratch, remembering field bounds
+    #delete(row^.scratch)
+    row^.scratch = nil
+    ref []i64 bounds = #make([]i64, 0)
+    defer #delete(bounds)
+    i64 i = at
+    i64 n = #len(text)
+    bool done = false
+    for !done:
+        i64 start = #len(row^.scratch)
+        if i < n && text[i] == '"':
+            i += 1
+            for i < n:
+                if text[i] == '"':
+                    if i + 1 < n && text[i + 1] == '"':
+                        row^.scratch = #append(row^.scratch, '"')
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                row^.scratch = #append(row^.scratch, text[i])
+                i += 1
+            // skip anything up to the separator
+            for i < n && text[i] != ',' && text[i] != '\n':
+                i += 1
+        else:
+            for i < n && text[i] != ',' && text[i] != '\n':
+                if text[i] != '\r':
+                    row^.scratch = #append(row^.scratch, text[i])
+                i += 1
+        bounds = #append(bounds, start)
+        bounds = #append(bounds, #len(row^.scratch))
+        if i >= n:
+            done = true
+        else if text[i] == ',':
+            i += 1
+        else:
+            i += 1
+            done = true
+    for k in 0..<#len(bounds) / 2:
+        i64 a = bounds[2 * k]
+        i64 b = bounds[2 * k + 1]
+        row^.fields = #append(row^.fields, string8(row^.scratch[a..<b]))
+    return i
+
+// Appends `s` as one CSV field.
+void csv_field(^strings.Builder b, string8 s):
+    bool quote = false
+    for i in 0..<#len(s):
+        char8 ch = s[i]
+        if ch == ',' || ch == '"' || ch == '\n' || ch == '\r':
+            quote = true
+    if !quote:
+        strings.append(b, s)
+        return
+    strings.append_char(b, '"')
+    for i in 0..<#len(s):
+        if s[i] == '"':
+            strings.append_char(b, '"')
+        strings.append_char(b, s[i])
+    strings.append_char(b, '"')

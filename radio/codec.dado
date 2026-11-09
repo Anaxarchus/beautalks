@@ -1,0 +1,121 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Byte-level encodings found in radio memory images. Every function reads or
+// writes `img` at an absolute offset; the caller checks bounds once per field.
+package radio
+
+// Digital-coded squelch codes, in the order Baofeng radios index them
+// (CHIRP's DTCS_CODES with 645 added, sorted).
+const [105]i32 DCS_CODES = (
+    23,  25,  26,  31,  32,  36,  43,  47,  51,  53,  54,
+    65,  71,  72,  73,  74,  114, 115, 116, 122, 125, 131,
+    132, 134, 143, 145, 152, 155, 156, 162, 165, 172, 174,
+    205, 212, 223, 225, 226, 243, 244, 245, 246, 251, 252,
+    255, 261, 263, 265, 266, 271, 274, 306, 311, 315, 325,
+    331, 332, 343, 346, 351, 356, 364, 365, 371, 411, 412,
+    413, 423, 431, 432, 445, 446, 452, 454, 455, 462, 464,
+    465, 466, 503, 506, 516, 523, 526, 532, 546, 565, 606,
+    612, 624, 627, 631, 632, 645, 654, 662, 664, 703, 712,
+    723, 731, 732, 734, 743, 754)
+
+// Index of a DCS code in DCS_CODES, or -1.
+i32 dcs_index(i32 code):
+    for i in 0..<#len(DCS_CODES):
+        if DCS_CODES[i] == code:
+            return i32(i)
+    return -1
+
+u8 get_u8([]u8 img, i64 at):
+    return img[at]
+
+void put_u8([]u8 img, i64 at, u8 v):
+    img[at] = v
+
+i64 get_u16le([]u8 img, i64 at):
+    return i64(img[at]) | (i64(img[at + 1]) << 8)
+
+void put_u16le([]u8 img, i64 at, i64 v):
+    img[at] = u8(v & 0xFF)
+    img[at + 1] = u8((v >> 8) & 0xFF)
+
+// `n` bytes of little-endian BCD (lowest two digits first). Answers -1 when a
+// nibble is not a decimal digit (e.g. an all-0xFF "unset" field).
+i64 get_lbcd([]u8 img, i64 at, i64 n):
+    i64 v = 0
+    i64 i = n - 1
+    for i >= 0:
+        i64 b = i64(img[at + i])
+        i64 hi = b >> 4
+        i64 lo = b & 0xF
+        if hi > 9 || lo > 9:
+            return -1
+        v = v * 100 + hi * 10 + lo
+        i -= 1
+    return v
+
+void put_lbcd([]u8 img, i64 at, i64 n, i64 value):
+    i64 v = value
+    for i in 0..<n:
+        i64 two = v % 100
+        img[at + i] = u8(((two / 10) << 4) | (two % 10))
+        v = v / 100
+
+// Bits [bit, bit+width) of one byte, bit 0 being the least significant.
+i64 get_bits([]u8 img, i64 at, i32 bit, i32 width):
+    i64 mask = (i64(1) << width) - 1
+    return (i64(img[at]) >> bit) & mask
+
+void put_bits([]u8 img, i64 at, i32 bit, i32 width, i64 value):
+    i64 mask = ((i64(1) << width) - 1) << bit
+    i64 b = (i64(img[at]) & ~mask) | ((value << bit) & mask)
+    img[at] = u8(b & 0xFF)
+
+void fill([]u8 img, i64 at, i64 n, u8 v):
+    for i in 0..<n:
+        img[at + i] = v
+
+bool all_equal([]u8 img, i64 at, i64 n, u8 v):
+    for i in 0..<n:
+        if img[at + i] != v:
+            return false
+    return true
+
+// A squelch tone: off, CTCSS (value in tenths of a hertz), or DCS (value is
+// the octal-looking code, e.g. 23 for D023, `inverted` for its I polarity).
+distinct enum i32 ToneKind:
+    OFF = 0,
+    CTCSS = 1,
+    DCS = 2,
+
+type Tone:
+    ToneKind kind
+    i32 value
+    bool inverted
+
+// Baofeng's 16-bit tone word, shared by the UV-5R and UV-17Pro families:
+// 0 or 0xFFFF off; >= 0x258 CTCSS in tenths of Hz; 1..0x69 DCS index+1;
+// 0x6A.. inverted DCS index+0x6A.
+Tone decode_tone_bf(i64 word):
+    if word == 0 || word == 0xFFFF:
+        return Tone(kind: ToneKind.OFF, value: 0, inverted: false)
+    if word >= 0x258:
+        return Tone(kind: ToneKind.CTCSS, value: i32(word), inverted: false)
+    i64 idx = word - 1
+    bool inv = false
+    if word >= 0x6A:
+        idx = word - 0x6A
+        inv = true
+    if idx < 0 || idx >= #len(DCS_CODES):
+        return Tone(kind: ToneKind.OFF, value: 0, inverted: false)
+    return Tone(kind: ToneKind.DCS, value: DCS_CODES[idx], inverted: inv)
+
+i64 encode_tone_bf(Tone t):
+    if t.kind == ToneKind.CTCSS:
+        return i64(t.value)
+    if t.kind == ToneKind.DCS:
+        i32 idx = dcs_index(t.value)
+        if idx < 0:
+            return 0
+        return i64(idx) + (0x6A if t.inverted else 1)
+    return 0

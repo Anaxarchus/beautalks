@@ -1,0 +1,312 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Auto-detection: which model is on the cable?
+//
+// Fast path: the radios in the registry are tried first — those last seen on
+// this port, then the rest, most recent first — each with exactly the
+// handshake that worked last time; the first answer wins.
+//
+// Full scan (when no known radio answers): the UV-5R family at 9600 baud
+// with each distinct magic of the model definitions, then the UV-17Pro
+// family at 115200 with each distinct PROGRAM... ident followed by 'F' and
+// 'M', whose replies narrow the model down. This order worked on the
+// owner's UV-5RM.
+//
+// A UV-5R that missed a magic needs ~2 s before the next one; the wait is
+// only paid right before another UV-5R magic, so a UV-17Pro attempt in
+// between costs nothing extra. Several models share a handshake, so every
+// matching model is returned, best first (a remembered model first); the
+// port is left open in program mode so the caller can go straight on to
+// download with the chosen model.
+package radio
+
+import "core:strings"
+import "core:time"
+
+const i32 UV5R_RETRY_MS = 2000
+
+type Detection:
+    bool found
+    // "uv5r" or "uv17pro"
+    string8 engine
+    i32 baud
+    // indices into the models slice, best first
+    ref []i64 candidates
+    // uv5r: the ident the radio sent
+    [8]u8 ident
+    // uv17pro: the identification so far (F and M replies)
+    Uv17Hello hello
+    // the magic / ident word that worked
+    [96]char8 hs_buf
+    i64 hs_len
+    // open while found; close with close_detection
+    SerialLink link
+    bool link_open
+    // handshakes tried, and how long the whole detection took
+    i32 attempts
+    i64 elapsed_ms
+    // the answer came from a remembered radio
+    bool fast_path
+
+string8 detection_handshake(^Detection d):
+    return string8(d^.hs_buf[0..<d^.hs_len])
+
+void close_detection(^Detection d):
+    if d^.link_open:
+        close_serial(&d^.link)
+        d^.link_open = false
+    #delete(d^.candidates)
+    d^.candidates = nil
+
+private bool has_word(string8 list, string8 w):
+    for i in 0..<word_count(list):
+        if strings.equal_fold(word_at(list, i), w):
+            return true
+    return false
+
+private bool hex_prefix_matches(string8 spec, []u8 got):
+    [32]u8 want
+    i64 n = decode_bytes(spec, want[:])
+    if n <= 0 || n > #len(got):
+        return false
+    for i in 0..<n:
+        if want[i] != got[i]:
+            return false
+    return true
+
+private void add_ranked(^ref([]i64) ranked, ^ref([]i32) scores, i64 idx, i32 score):
+    i64 pos = #len(ranked^)
+    for i in 0..<#len(ranked^):
+        if score < scores^[i]:
+            pos = i
+            break
+    ranked^ = #append(ranked^, idx)
+    scores^ = #append(scores^, score)
+    i64 j = #len(ranked^) - 1
+    for j > pos:
+        ranked^[j] = ranked^[j - 1]
+        scores^[j] = scores^[j - 1]
+        j -= 1
+    ranked^[pos] = idx
+    scores^[pos] = score
+
+// One handshake to try.
+type Attempt:
+    bool uv5r
+    // the magic (uv5r) or ident (uv17pro) word
+    string8 word
+    // the remembered model's id, "" in the full scan
+    string8 model_id
+
+// The port at the baud an attempt needs, opened lazily.
+private type Opened:
+    SerialLink link
+    bool open
+    i32 baud
+
+private LinkError!void ensure_baud(^Opened o, string8 port, i32 baud):
+    if o^.open && o^.baud == baud:
+        return
+    if o^.open:
+        close_serial(&o^.link)
+        o^.open = false
+    try o^.link = open_serial(port, baud)
+    o^.open = true
+    o^.baud = baud
+
+// Tries one handshake; true when the radio answered (d filled in).
+private bool try_attempt(^Opened o, string8 port, Attempt a, ^Detection d, ^i64 uv5r_failed_at):
+    if a.uv5r:
+        try ensure_baud(o, port, 9600) else:
+            return false
+        [16]u8 mb
+        i64 n = decode_bytes(a.word, mb[:])
+        if n <= 0:
+            return false
+        // pay the UV-5R retry gap only now, right before another magic
+        if uv5r_failed_at^ >= 0:
+            i64 since = time.as_milliseconds(time.elapsed(time.Instant(uv5r_failed_at^)))
+            if since < UV5R_RETRY_MS:
+                o^.link.sleep_ms(i32(UV5R_RETRY_MS - since))
+        d^.attempts += 1
+        o^.link.discard()
+        try uv5r_try_magic(&o^.link, mb[0..<n], true, &d^.ident) else:
+            uv5r_failed_at^ = i64(time.instant())
+            return false
+        d^.engine = "uv5r"
+        d^.baud = 9600
+        return true
+    try ensure_baud(o, port, 115200) else:
+        return false
+    [32]u8 idb
+    i64 n = decode_bytes(a.word, idb[:])
+    if n <= 0:
+        return false
+    d^.attempts += 1
+    o^.link.discard()
+    try send_all(&o^.link, idb[0..<n]) else:
+        return false
+    if o^.link.recv_byte(1000) != 0x06:
+        return false
+    Uv17Hello h
+    // 'F' then 'M', as every model of the family starts its magics
+    [1]u8 f = [0x46]
+    try send_all(&o^.link, f[:]) else:
+        return false
+    try i64 fl = o^.link.recv(h.f_reply[0..<16], 1000) else:
+        return false
+    h.f_len = fl
+    [1]u8 mm = [0x4D]
+    try send_all(&o^.link, mm[:]) else:
+        return false
+    try i64 ml = o^.link.recv(h.m_reply[0..<32], 500) else:
+        return false
+    h.m_len = ml
+    h.magics_sent = 2
+    d^.hello = h
+    d^.engine = "uv17pro"
+    d^.baud = 115200
+    return true
+
+// Ranks every model that answers to the handshake that worked.
+private void rank(^Detection d, []Model models, Attempt a):
+    ref []i32 scores = nil
+    defer #delete(scores)
+    string8 reply = string8(d^.hello.m_reply[0..<d^.hello.m_len])
+    for mi in 0..<#len(models):
+        ^const Model m = &models[mi]
+        i32 score = 3
+        if a.uv5r:
+            if m^.engine != "uv5r" || !has_word(m^.magics, a.word):
+                continue
+            if #len(m^.ident_reply) != 0:
+                if !hex_prefix_matches(m^.ident_reply, d^.ident[:]):
+                    continue
+                score = 1
+            else if m^.tested != Tested.UNTESTED:
+                score = 2
+            else:
+                score = 3
+        else:
+            if m^.engine != "uv17pro" || !has_word(m^.ident, a.word):
+                continue
+            if #len(m^.model_reply) != 0:
+                score = 1 if strings.contains(reply, m^.model_reply) else 5
+            else if m^.tested != Tested.UNTESTED:
+                score = 2
+            else:
+                score = 4
+        // the radio that was seen with exactly this handshake comes first
+        if #len(a.model_id) != 0 && m^.id == a.model_id:
+            score = 0
+        add_ranked(&d^.candidates, &scores, mi, score)
+
+// The full-scan handshakes: distinct uv5r magics, then distinct uv17pro
+// idents, in model order (tested models first).
+private ref []Attempt full_scan([]Model models):
+    ref []Attempt out = nil
+    for fam in 0..<2:
+        for pass in 0..<2:
+            for mi in 0..<#len(models):
+                ^const Model m = &models[mi]
+                bool tested = m^.tested != Tested.UNTESTED
+                if (pass == 0) != tested:
+                    continue
+                bool uv5r = m^.engine == "uv5r"
+                if (fam == 0) != uv5r || !engine_known(m):
+                    continue
+                string8 list = m^.magics if uv5r else m^.ident
+                for k in 0..<word_count(list):
+                    string8 w = word_at(list, k)
+                    bool seen = false
+                    for x in out:
+                        if x.word == w:
+                            seen = true
+                    if !seen:
+                        out = #append(out, Attempt(uv5r: uv5r, word: w, model_id: ""))
+    return out
+
+// The fast-path handshakes from the registry: radios last seen on `port`
+// first, then the others, newest first; each once. `known` must outlive the
+// answer (the words view its text).
+ref []Attempt remembered_attempts(^KnownList known, []Model models, string8 port):
+    ref []Attempt out = nil
+    for pass in 0..<2:
+        for i in 0..<#len(known^.radios):
+            KnownRadio x = known^.radios[i]
+            bool here = known^.text(x.port) == port
+            if (pass == 0) != here:
+                continue
+            string8 eng = known^.text(x.engine)
+            string8 w = known^.text(x.handshake)
+            if #len(w) == 0 || find_model(models, known^.text(x.model)) < 0:
+                continue
+            bool seen = false
+            for a in out:
+                if a.word == w && a.model_id == known^.text(x.model):
+                    seen = true
+            if !seen:
+                out = #append(out, Attempt(uv5r: eng == "uv5r", word: w, model_id: known^.text(x.model)))
+    return out
+
+// Probes the radio on `port`: the remembered radios in `reg` first (nil for
+// none), then the full scan. `pr` counts attempts (done, planned).
+LinkError!Detection detect_with(string8 port, []Model models, ^Registry reg, Progress pr):
+    Detection d
+    time.Instant started = time.instant()
+    KnownList known
+    defer known.destroy()
+    ref []Attempt fast = nil
+    defer #delete(fast)
+    if reg != nil:
+        known = list_known(reg)
+        fast = remembered_attempts(&known, models, port)
+    ref []Attempt scan = full_scan(models)
+    defer #delete(scan)
+    Opened o
+    i64 failed_at = -1
+    i64 planned = #len(fast) + #len(scan)
+    i64 done = 0
+    for pass in 0..<2:
+        ref []Attempt list = fast if pass == 0 else scan
+        for a in list:
+            done += 1
+            report(pr, done, planned)
+            if !try_attempt(&o, port, a, &d, &failed_at):
+                continue
+            d.found = true
+            d.fast_path = pass == 0
+            i64 n = #len(a.word)
+            if n > #len(d.hs_buf):
+                n = #len(d.hs_buf)
+            for k in 0..<n:
+                d.hs_buf[k] = a.word[k]
+            d.hs_len = n
+            d.link = o.link
+            d.link_open = true
+            rank(&d, models, a)
+            d.elapsed_ms = time.as_milliseconds(time.elapsed(started))
+            return d
+    if o.open:
+        close_serial(&o.link)
+    d.elapsed_ms = time.as_milliseconds(time.elapsed(started))
+    return d
+
+// The full scan only (no registry).
+LinkError!Detection detect(string8 port, []Model models, Progress pr):
+    return detect_with(port, models, nil, pr)
+
+// Continues a successful detection with the chosen model: finishes the
+// identification and downloads. The caller #deletes the image.
+LinkError!ref []u8 download_detected(^Detection d, ^const Model m, Progress pr):
+    if !d^.found || !d^.link_open || m^.engine != d^.engine:
+        fail LinkError.BAD_MODEL
+    if m^.engine == "uv5r":
+        return uv5r_read(&d^.link, m, d^.ident, pr)
+    // the model's own magics after 'F' and 'M' (its SEND differs per model)
+    Uv17Hello h = d^.hello
+    if word_count(m^.magics) < 2:
+        h.magics_sent = word_count(m^.magics)
+    try uv17_more_magics(&d^.link, m, &h, -1)
+    return uv17_read(&d^.link, m, pr)

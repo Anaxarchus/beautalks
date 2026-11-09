@@ -1,0 +1,47 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// A Link over a serial port (the programming cable, or a pty in tests).
+package radio
+
+import "../serial"
+import "core:strings"
+
+type SerialLink using Link:
+    serial.Port port
+
+    !void send(^self, []u8 data):
+        try serial.write(self.port, data)
+
+    !i64 recv(^self, []u8 into, i32 timeout_ms):
+        try i64 n = serial.read_into(self.port, into, timeout_ms)
+        return n
+
+    i32 recv_byte(^self, i32 timeout_ms):
+        [1]u8 one
+        try i64 n = serial.read_into(self.port, one[:], timeout_ms) else:
+            return -1
+        if n != 1:
+            return -1
+        return i32(one[0])
+
+    void sleep_ms(^self, i32 ms):
+        serial.pause(ms)
+
+    void discard(^self):
+        // CHIRP _clean_buffer: read whatever is pending for a moment
+        [256]u8 junk
+        try i64 _ = serial.read_into(self.port, junk[:], 5) else:
+            return
+        serial.discard_input(self.port)
+
+// Opens `path` at `baud`.
+LinkError!SerialLink open_serial(string8 path, i32 baud):
+    ref []char8 c = strings.clone_to_cstring(path)
+    defer #delete(c)
+    try serial.Port p = serial.open(cstring(c), baud) else:
+        fail LinkError.IO
+    return SerialLink(p)
+
+void close_serial(^SerialLink l):
+    serial.close(&l^.port)

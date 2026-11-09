@@ -1,0 +1,90 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Driver updater: where drivers come from and where they go.
+//
+// Drivers come from tagged GitHub releases only. Every release of the repo
+// carries the driver bundle as release assets: `drivers-manifest.json` plus one
+// asset per file the manifest lists. The updater asks for
+//   <base>/latest/download/drivers-manifest.json       (or <base>/download/<tag>/...)
+// where <base> is https://github.com/<owner>/<repo>/releases, then fetches
+// every file from <base>/download/<manifest's release tag>/<asset>, pinned to
+// the tag the manifest names (so a release published mid-update cannot mix
+// two bundles). See docs/DRIVERS.md.
+package updater
+
+import "core:os"
+import "core:path"
+
+// The app's own version and the driver APIs it can run. A bundle whose
+// `driver_api` is outside [API_MIN, API_MAX], or whose `min_app` is newer than
+// APP_VERSION, is not installed.
+const string8 APP_VERSION = "0.1.0"
+const i64 API_MIN = 1
+const i64 API_MAX = 1
+
+// The manifest format this updater reads.
+const i64 MANIFEST_FORMAT = 1
+
+// The release asset holding the manifest.
+const string8 MANIFEST_ASSET = "drivers-manifest.json"
+
+type Config:
+    // GitHub coordinates (the owner can override them in settings)
+    string8 owner
+    string8 repo
+    // a release tag to pin to; empty = the latest release
+    string8 tag
+    // overrides https://github.com/<owner>/<repo>/releases (tests: file:// or http://127.0.0.1)
+    string8 base_url
+    // the app's data directory; drivers live in <data_dir>/drivers. Empty = the OS default
+    string8 data_dir
+    // the curl program (looked up on PATH)
+    string8 curl
+    // curl --proto and --proto-redir: "=https" in the app; tests override it
+    string8 proto
+    // seconds per transfer
+    i32 max_time_s
+    // the largest manifest and the largest file accepted
+    i64 max_manifest_bytes
+    i64 max_file_bytes
+    // the app version compared with a manifest's min_app
+    string8 app_version
+    // allow installing a bundle whose serial is lower than the active one's
+    bool allow_downgrade
+    // engines compiled into the app (space-separated): a model may name one
+    // of these instead of an engine the bundle carries
+    string8 builtin_engines
+
+Config default_config():
+    return Config(owner: "Anaxarchus", repo: "beautalks", tag: "", base_url: "", data_dir: "", curl: "curl", proto: "=https", max_time_s: 60, max_manifest_bytes: 262144, max_file_bytes: 4194304, app_version: APP_VERSION, allow_downgrade: false, builtin_engines: "uv17pro uv5r")
+
+// <config dir>/beautalks: ~/Library/Application Support/beautalks on macOS,
+// $XDG_CONFIG_HOME/beautalks or ~/.config/beautalks on Linux.
+!ref []char8 default_data_dir():
+    try ref []char8 base = os.config_dir() else:
+        fail 1
+    ref []char8 d = path.join(base, "beautalks")
+    #delete(base)
+    return d
+
+// <data_dir>/drivers: holds active -> sets/<release>, previous -> sets/<release>,
+// sets/ and staging/.
+!ref []char8 drivers_root(Config c):
+    if #len(c.data_dir) > 0:
+        return path.join(c.data_dir, "drivers")
+    try ref []char8 d = default_data_dir() else:
+        fail 1
+    ref []char8 r = path.join(d, "drivers")
+    #delete(d)
+    return r
+
+// The directory the app loads drivers from: <drivers_root>/active (a symlink
+// to the active set). The app falls back to the drivers it ships with when
+// this does not exist.
+!ref []char8 active_dir(Config c):
+    try ref []char8 root = drivers_root(c) else:
+        fail 1
+    ref []char8 a = path.join(root, "active")
+    #delete(root)
+    return a

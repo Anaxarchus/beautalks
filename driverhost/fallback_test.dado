@@ -1,0 +1,102 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// A bad downloaded engine never bricks a model: choose_engine passes over an
+// updated engines/<x>.js that does not load, speaks another driver API, or
+// hangs while loading, and falls back to the shipped set or the built-in
+// engine. Run from the repo root: dado test driverhost
+package driverhost
+
+import "core:fmt"
+import "core:os/fs"
+import "core:strings"
+
+const string8 MODEL_INI = "models/uv-5rm.ini"
+
+i32 g_wrong = 0
+
+void verify(bool ok, string8 what, string8 detail):
+    if ok:
+        fmt.println("ok: ", what)
+    else:
+        fmt.println("FAIL: ", what, "\n  ", detail)
+        g_wrong += 1
+
+// An "active" set whose engines/uv17pro.js is a copy of `fixture`.
+bool plant(string8 active, string8 fixture):
+    ref []char8 dir = #format(active, "/engines")
+    defer #delete(dir)
+    try fs.make_dirs(dir) else:
+        return false
+    ref []char8 dst = #format(active, "/engines/uv17pro.js")
+    defer #delete(dst)
+    try fs.copy_file(fixture, dst) else:
+        return false
+    return true
+
+i32 test():
+    set_limits(500, 5000)
+    try ref []char8 tmp = fs.make_temp_dir("beautalks-fallback") else:
+        return 1
+    ref []char8 active = #format(tmp, "/active")
+    string8 act = active
+    [2]string8 updated_then_shipped = [act, "drivers"]
+    [1]string8 updated_only = [act]
+
+    // the good engine in the updated set is used (it overrides the built-in)
+    if !plant(act, "drivers/engines/uv17pro.js"):
+        return 1
+    try Choice c = choose_engine(updated_only[:], "uv17pro", MODEL_INI, true) else code:
+        fmt.println("FAIL: choose good ", code, ": ", last_error())
+        return 1
+    string8 w0 = c.why
+    verify(c.source == Source.SCRIPTED && #len(c.why) == 0, "a good updated engine overrides the built-in", w0)
+    c.destroy()
+
+    // broken, wrong API, hangs at load: each falls back to the built-in, saying why
+    [3]string8 bad = ["driverhost/testdata/broken.js", "driverhost/testdata/wrong_api.js", "driverhost/testdata/spin_at_load.js"]
+    [3]string8 expect = ["code 21", "code 20", "code 23"]
+    for i in 0..<3:
+        if !plant(act, bad[i]):
+            return 1
+        try c = choose_engine(updated_only[:], "uv17pro", MODEL_INI, true) else code:
+            fmt.println("FAIL: choose with ", bad[i], " failed ", code, ": ", last_error())
+            return 1
+        string8 why = c.why
+        fmt.println("  passed over: ", why)
+        ref []char8 label = #format("fallback to built-in when the updated engine is ", bad[i])
+        verify(c.source == Source.BUILTIN && strings.contains(why, expect[i]), label, why)
+        #delete(label)
+        c.destroy()
+
+    // a bad updated engine, a good shipped one: the shipped one is used
+    try c = choose_engine(updated_then_shipped[:], "uv17pro", MODEL_INI, true) else code:
+        fmt.println("FAIL: choose shipped ", code, ": ", last_error())
+        return 1
+    string8 p = c.path
+    verify(c.source == Source.SCRIPTED && p == "drivers/engines/uv17pro", "a bad updated engine falls back to the shipped set first", p)
+    c.destroy()
+
+    // no built-in and nothing loads: E_NO_ENGINE with every reason
+    i32 got = 0
+    try c = choose_engine(updated_only[:], "uv17pro", MODEL_INI, false) else code:
+        got = code
+    if got == 0:
+        c.destroy()
+    verify(got == E_NO_ENGINE && strings.contains(last_error(), "no usable engine"), "no built-in and no loadable engine fails E_NO_ENGINE", last_error())
+
+    // an engine name that would be a path is refused
+    got = 0
+    try c = choose_engine(updated_only[:], "../evil", MODEL_INI, true) else code:
+        got = code
+    if got == 0:
+        c.destroy()
+    verify(got == E_NO_ENGINE, "an engine name with a path in it is refused", last_error())
+
+    try fs.remove_all(tmp) else:
+        fmt.println("note: could not remove ", tmp)
+    #delete(active)
+    #delete(tmp)
+    clear_error()
+    return g_wrong

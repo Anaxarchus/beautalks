@@ -1,0 +1,76 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Downloads through the system curl (core:http has no TLS). curl is run from
+// an argv array, never through a shell, and every value placed in a URL has
+// passed manifest.dado's checks first.
+package updater
+
+import "core:fmt"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+
+// <base>: the override, or https://github.com/<owner>/<repo>/releases.
+ref []char8 releases_base(Config c):
+    if #len(c.base_url) > 0:
+        return #format(c.base_url)
+    return #format("https://github.com/", c.owner, "/", c.repo, "/releases")
+
+// The manifest of the pinned tag, or of the latest release.
+ref []char8 manifest_url(Config c):
+    ref []char8 base = releases_base(c)
+    defer #delete(base)
+    if #len(c.tag) > 0:
+        return #format(base, "/download/", c.tag, "/", MANIFEST_ASSET)
+    return #format(base, "/latest/download/", MANIFEST_ASSET)
+
+// A file of the release the manifest names.
+ref []char8 asset_url(Config c, string8 release, string8 asset):
+    ref []char8 base = releases_base(c)
+    defer #delete(base)
+    return #format(base, "/download/", release, "/", asset)
+
+// Fetch `url` into `dest` (at most `max_bytes`). On failure answers false and
+// curl's own message (or why it could not run) in `why`, on the ambient
+// allocator.
+bool fetch(Config c, string8 url, string8 dest, i64 max_bytes, ^ref []char8 why):
+    ref []char8 errfile = #format(dest, ".curl-err")
+    defer #delete(errfile)
+    ref []char8 max_time = #format(c.max_time_s)
+    defer #delete(max_time)
+    ref []char8 max_size = #format(max_bytes)
+    defer #delete(max_size)
+    // -q first: ignore ~/.curlrc, so the user's curl config cannot weaken this.
+    string8 t = max_time
+    string8 m = max_size
+    string8 ef = errfile
+    []string8 argv = [c.curl, "-q", "--fail", "--silent", "--show-error", "--location", "--proto", c.proto, "--proto-redir", c.proto, "--max-time", t, "--max-filesize", m, "--retry", "2", "--user-agent", "beautalks-driver-updater", "--stderr", ef, "--output", dest, url]
+    try proc.Ended e = proc.exec(argv) else:
+        why^ = #format("cannot run ", c.curl, " (is curl installed?)")
+        return false
+    if !proc.ok(e):
+        ref []char8 said = nil
+        try said = fs.read_file(errfile) else:
+            said = #format("")
+        switch e:
+            case proc.Exited x:
+                why^ = #format("curl exit ", x.code, ": ", trim_text(said), " (", url, ")")
+            case proc.Signaled s:
+                why^ = #format("curl killed by signal ", s.signal, " (", url, ")")
+        #delete(said)
+        forget(errfile)
+        return false
+    forget(errfile)
+    return true
+
+// Remove a file if it is there.
+void forget(string8 file):
+    try fs.remove_file(file) else:
+        return
+
+private string8 trim_text(string8 s):
+    i64 n = #len(s)
+    for n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' '):
+        n -= 1
+    return s[0..<n]

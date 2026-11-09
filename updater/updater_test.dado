@@ -1,0 +1,212 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The updater against fake GitHub releases on disk (file://) and over a local
+// HTTP server (python3 -m http.server), built by drivers/release.py from the
+// repo's own engines and models. Run from the repo root: dado test updater
+package updater
+
+import "core:fmt"
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+import "core:time"
+
+i32 g_bad = 0
+
+void expect(bool ok, string8 what, Report r):
+    ref []char8 d = describe(r)
+    if ok:
+        fmt.println("ok: ", what, "   [", d, "]")
+    else:
+        fmt.println("FAIL: ", what, "   [", d, "]")
+        g_bad += 1
+    #delete(d)
+
+void expect_true(bool ok, string8 what):
+    if ok:
+        fmt.println("ok: ", what)
+    else:
+        fmt.println("FAIL: ", what)
+        g_bad += 1
+
+// drivers/release.py --release tag --serial n --out <work>/assets-<tag> --github-layout <work>/gh
+bool make_release(string8 work, string8 tag, string8 serial, string8 api):
+    ref []char8 out = #format(work, "/assets-", tag)
+    ref []char8 gh = #format(work, "/gh")
+    defer #delete(out)
+    defer #delete(gh)
+    string8 o = out
+    string8 g = gh
+    []string8 argv = ["python3", "-I", "drivers/release.py", "--release", tag, "--serial", serial, "--driver-api", api, "--no-compile", "--no-repo-manifest", "--out", o, "--github-layout", g]
+    try proc.Ended e = proc.exec(argv) else:
+        return false
+    return proc.ok(e)
+
+string8 active_release(Config c):
+    try ref []char8 root = drivers_root(c) else:
+        return ""
+    ref []char8 link = path.join(root, "active")
+    #delete(root)
+    try ref []char8 t = fs.link_target(link) else:
+        #delete(link)
+        return ""
+    #delete(link)
+    string8 b = path.base(t)
+    // leak a few bytes per call in a test: fine
+    return b
+
+void corrupt(string8 file):
+    try ref []u8 b = fs.read_bytes(file) else:
+        return
+    b[#len(b) / 2] = b[#len(b) / 2] ~ 0x01
+    try fs.write_bytes(file, b) else:
+        return
+    #delete(b)
+
+i32 test():
+    try ref []char8 work = fs.make_temp_dir("beautalks-updater-test") else:
+        fmt.println("no temp dir")
+        return 1
+    fmt.println("work dir ", work)
+    ref []char8 data = path.join(work, "data")
+    ref []char8 base = #format("file://", work, "/gh")
+    Config c = default_config()
+    c.data_dir = data
+    c.base_url = base
+    c.proto = "=file"
+    c.max_time_s = 20
+
+    // 1. fresh install of the latest release
+    expect_true(make_release(work, "v1.0.0", "100", "1"), "fixture v1.0.0")
+    Report r = update_drivers(c)
+    expect(r.status == Status.INSTALLED && active_release(c) == "v1.0.0", "fresh install of the latest release", r)
+    ref []char8 js = #format(data, "/drivers/active/engines/uv17pro.js")
+    expect_true(fs.is_file(js), "active/engines/uv17pro.js is in place")
+    r.destroy()
+
+    // 2. same again: up to date
+    r = update_drivers(c)
+    expect(r.status == Status.UP_TO_DATE, "second run is up to date", r)
+    r.destroy()
+
+    // 3. a tampered file in a newer release: refused, v1 stays active, no staging left
+    expect_true(make_release(work, "v1.1.0", "110", "1"), "fixture v1.1.0")
+    ref []char8 bad1 = #format(work, "/gh/latest/download/engines.uv17pro.js")
+    ref []char8 bad2 = #format(work, "/gh/download/v1.1.0/engines.uv17pro.js")
+    corrupt(bad1)
+    corrupt(bad2)
+    r = update_drivers(c)
+    expect(r.status == Status.FAILED && r.stage == Stage.VERIFY && active_release(c) == "v1.0.0", "tampered engine rejected, v1.0.0 still active", r)
+    r.destroy()
+    ref []char8 sets_v11 = #format(data, "/drivers/sets/v1.1.0")
+    expect_true(!fs.exists(sets_v11), "the tampered set was never installed")
+    ref []char8 staging = #format(data, "/drivers/staging")
+    try fs.Listing l = fs.read_dir(staging) else:
+        fmt.println("FAIL: no staging dir")
+        return 1
+    expect_true(#len(l.entries) == 0, "staging is empty after the rejection")
+    l.destroy()
+
+    // 4. a good newer release: installed, v1 kept as previous
+    expect_true(make_release(work, "v1.2.0", "120", "1"), "fixture v1.2.0")
+    r = update_drivers(c)
+    expect(r.status == Status.INSTALLED && active_release(c) == "v1.2.0", "newer release installed", r)
+    string8 prev = r.previous
+    expect_true(prev == "v1.0.0", "previous set is v1.0.0")
+    r.destroy()
+
+    // 5. rollback, and roll forward again
+    r = rollback(c)
+    expect(r.status == Status.ROLLED_BACK && active_release(c) == "v1.0.0", "rollback to v1.0.0", r)
+    r.destroy()
+    r = rollback(c)
+    expect(r.status == Status.ROLLED_BACK && active_release(c) == "v1.2.0", "roll forward to v1.2.0", r)
+    r.destroy()
+
+    // 6. a replayed older bundle (lower serial) is refused
+    expect_true(make_release(work, "v0.9.0", "90", "1"), "fixture v0.9.0")
+    r = update_drivers(c)
+    expect(r.status == Status.FAILED && r.stage == Stage.COMPATIBILITY && active_release(c) == "v1.2.0", "older serial refused", r)
+    r.destroy()
+
+    // 7. a bundle for a driver API this app does not run
+    expect_true(make_release(work, "v2.0.0", "200", "2"), "fixture v2.0.0 (driver API 2)")
+    r = update_drivers(c)
+    expect(r.status == Status.FAILED && r.stage == Stage.COMPATIBILITY && active_release(c) == "v1.2.0", "driver API 2 refused", r)
+    r.destroy()
+
+    // 8. a manifest with a path escaping the set
+    ref []char8 evil = #format(work, "/gh/latest/download/drivers-manifest.json")
+    string8 evil_text = "{\"format\":1,\"driver_api\":1,\"min_app\":\"0.1.0\",\"release\":\"v3\",\"serial\":300,\"files\":[{\"path\":\"engines/../../../.profile.js\",\"asset\":\"x.js\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"size\":1}]}"
+    try fs.write_file(evil, evil_text) else:
+        return 1
+    r = update_drivers(c)
+    expect(r.status == Status.FAILED && r.stage == Stage.MANIFEST, "path traversal in the manifest refused", r)
+    r.destroy()
+
+    // 9. a pinned tag that does not exist
+    c.tag = "v9.9.9"
+    r = update_drivers(c)
+    expect(r.status == Status.FAILED && r.stage == Stage.FETCH_MANIFEST, "missing release fails at the manifest", r)
+    r.destroy()
+
+    // 10. a pinned tag that does: v1.2.0 is active already
+    c.tag = "v1.2.0"
+    r = update_drivers(c)
+    expect(r.status == Status.UP_TO_DATE, "pinned tag v1.2.0 is up to date", r)
+    r.destroy()
+    c.tag = ""
+
+    // 11. --proto =https refuses a non-https URL (what the app runs with)
+    Config strict = c
+    strict.proto = "=https"
+    r = update_drivers(strict)
+    expect(r.status == Status.FAILED && r.stage == Stage.FETCH_MANIFEST, "proto =https refuses file://", r)
+    r.destroy()
+
+    // 12. over HTTP from a local server, into a fresh data dir
+    ref []char8 gh = #format(work, "/gh")
+    ref []char8 latest = #format(work, "/gh/latest/download/drivers-manifest.json")
+    ref []char8 good = #format(work, "/assets-v1.2.0/drivers-manifest.json")
+    try fs.copy_file(good, latest) else:
+        return 1
+    i64 port = 18000 + os.pid() % 1000
+    ref []char8 port_text = #format(port)
+    string8 pt = port_text
+    string8 ghs = gh
+    try os.set_env("NO_PROXY", "127.0.0.1,localhost") else:
+        return 1
+    try os.set_env("no_proxy", "127.0.0.1,localhost") else:
+        return 1
+    []string8 server = ["python3", "-I", "-m", "http.server", pt, "--bind", "127.0.0.1", "--directory", ghs]
+    try proc.Duplex d = proc.duplex(server, proc.Errors.Discard) else:
+        fmt.println("FAIL: cannot start python3 -m http.server")
+        return 1
+    time.sleep(time.milliseconds(800))
+    Config h = c
+    ref []char8 data2 = path.join(work, "data-http")
+    ref []char8 hbase = #format("http://127.0.0.1:", port)
+    h.data_dir = data2
+    h.base_url = hbase
+    h.proto = "=http"
+    r = update_drivers(h)
+    expect(r.status == Status.INSTALLED && active_release(h) == "v1.2.0" && r.files > 30, "install over HTTP from a local server", r)
+    r.destroy()
+    // tamper on the server side too
+    expect_true(make_release(work, "v1.3.0", "130", "1"), "fixture v1.3.0")
+    ref []char8 t1 = #format(work, "/gh/latest/download/models.uv-5rm.ini")
+    ref []char8 t2 = #format(work, "/gh/download/v1.3.0/models.uv-5rm.ini")
+    corrupt(t1)
+    corrupt(t2)
+    r = update_drivers(h)
+    expect(r.status == Status.FAILED && r.stage == Stage.VERIFY && active_release(h) == "v1.2.0", "tampered model over HTTP rejected", r)
+    r.destroy()
+    try proc.Ended _ = proc.stop(&d, 500) else:
+        fmt.println("note: server did not stop cleanly")
+
+    try fs.remove_all(work) else:
+        fmt.println("note: could not remove ", work)
+    return g_bad

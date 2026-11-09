@@ -1,0 +1,200 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Runs drivers/engines/uv17pro.js against an in-memory UV-5RM that serves the
+// owner's real backup image (scrambled, as the radio sends it), and checks the
+// sandbox with hostile fixtures. Run from the repo root: dado test driverhost
+package driverhost
+
+import "core:fmt"
+import "core:os/fs"
+
+const string8 ENGINE = "drivers/engines/uv17pro"
+const string8 MODEL = "models/uv-5rm.ini"
+const string8 IMAGE = "testdata/uv5rm_backup.img"
+
+// Radio address ranges of the UV-5RM (from its INI).
+const [4]i64 REG_START = [0x0000, 0x9000, 0xA000, 0xD000]
+const [4]i64 REG_LEN = [0x8040, 0x0040, 0x02C0, 0x0040]
+const [4]u8 KEY = [0x43, 0x4F, 0x20, 0x37]
+
+// The fake radio.
+type FakeRadio using Wire:
+    ref []u8 image
+    ref []u8 pending
+    i64 at
+    i64 writes_acked
+    bool mute
+
+    !void send(^self, []u8 data):
+        if self.mute:
+            return
+        if #len(data) == 16 && data[0] == u8('P'):
+            self.queue_byte(0x06)
+        else if #len(data) == 1 && data[0] == 0x46:
+            for i in 0..<16:
+                self.queue_byte(u8(i))
+        else if #len(data) == 1 && data[0] == 0x4D:
+            string8 m = "5RH     +L00000"
+            for i in 0..<#len(m):
+                self.queue_byte(u8(m[i]))
+        else if #len(data) > 4 && data[0] == 0x53:
+            self.queue_byte(0x06)
+        else if #len(data) == 4 && data[0] == 0x52:
+            i64 off = offset_of(i64(data[1]) * 256 + i64(data[2]))
+            for i in 0..<4:
+                self.queue_byte(data[i])
+            for i in 0..<i64(data[3]):
+                self.queue_byte(crypt_byte(self.image[off + i], i))
+        else if #len(data) == 4 + 0x40 && data[0] == 0x57:
+            i64 off = offset_of(i64(data[1]) * 256 + i64(data[2]))
+            for i in 0..<0x40:
+                self.image[off + i] = crypt_byte(data[4 + i], i)
+            self.writes_acked += 1
+            self.queue_byte(0x06)
+
+    !i64 recv(^self, []u8 into, i32 timeout_ms):
+        i64 n = 0
+        for n < #len(into) && self.at < #len(self.pending):
+            into[n] = self.pending[self.at]
+            n += 1
+            self.at += 1
+        return n
+
+    void sleep_ms(^self, i32 ms):
+        return
+
+    void discard(^self):
+        self.at = #len(self.pending)
+
+    void queue_byte(^self, u8 b):
+        self.pending = #append(self.pending, b)
+
+i64 offset_of(i64 addr):
+    i64 base = 0
+    for r in 0..<4:
+        if addr >= REG_START[r] && addr < REG_START[r] + REG_LEN[r]:
+            return base + addr - REG_START[r]
+        base += REG_LEN[r]
+    return 0
+
+u8 crypt_byte(u8 b, i64 i):
+    u8 k = KEY[i % 4]
+    if k != 0x20 && b != 0 && b != 0xFF && b != k && b != (k ~ 0xFF):
+        return b ~ k
+    return b
+
+i64 g_last_done = 0
+
+void on_progress(rawptr ctx, i64 done, i64 total):
+    g_last_done = done
+
+i32 check(bool ok, string8 what):
+    if !ok:
+        fmt.println("FAIL: ", what, "  ", last_error())
+        return 1
+    fmt.println("ok: ", what)
+    return 0
+
+i32 test():
+    i32 bad = 0
+    try ref []u8 real = fs.read_bytes(IMAGE) else:
+        fmt.println("cannot read ", IMAGE, " (run from the repo root)")
+        return 1
+    // A driver call keeps its wire in package storage for the call, so the
+    // wire must outlive the caller's frame: allocate it.
+    ref FakeRadio radio = #new(FakeRadio)
+    radio^.image = #make([]u8, #len(real))
+    for i in 0..<#len(real):
+        radio^.image[i] = real[i]
+
+    try Driver d = load(ENGINE, MODEL) else code:
+        fmt.println("FAIL: load ", ENGINE, " code ", code, ": ", last_error())
+        return 1
+    try ref []char8 id = identify(&d, radio) else code:
+        fmt.println("FAIL: identify code ", code, ": ", last_error())
+        return 1
+    string8 ids = id
+    fmt.println("identify answered: ", ids)
+    bad += check(ids == "46:16\nM:5RH     +L00000\n53454E4421050D010101041108050D0D01110F091209100400:1\n", "identify replies")
+
+    Progress p = Progress(fn: on_progress, ctx: nil)
+    try ref []u8 img = download(&d, radio, p) else code:
+        fmt.println("FAIL: download code ", code, ": ", last_error())
+        return 1
+    bool same = #len(img) == #len(real)
+    if same:
+        for i in 0..<#len(img):
+            if img[i] != real[i]:
+                same = false
+                break
+    bad += check(same, "download equals the real UV-5RM backup (33664 bytes)")
+    bad += check(g_last_done == #len(real), "progress reached the total")
+
+    // upload a changed image, then download it back
+    img[20] = u8('Z')
+    try upload(&d, radio, img, p) else code:
+        fmt.println("FAIL: upload code ", code, ": ", last_error())
+        return 1
+    bad += check(radio^.image[20] == u8('Z') && radio^.writes_acked == 0x8380 / 0x40, "upload writes every block")
+
+    i32 why = 0
+    // a short image is refused by the driver with IMAGE_SIZE (8)
+    try upload(&d, radio, img[0..<100], p) else code:
+        why = code
+    bad += check(why == 8, "short image refused with code 8")
+    // a silent radio: NO_ANSWER (2) comes back from the driver
+    radio^.mute = true
+    why = 0
+    ref []char8 none = nil
+    try none = identify(&d, radio) else code:
+        why = code
+    #delete(none)
+    bad += check(why == 2, "silent radio fails NO_ANSWER")
+    radio^.mute = false
+    close(&d)
+    #delete(id)
+    #delete(img)
+    #delete(real)
+
+    // sandbox
+    try Driver h = load("driverhost/testdata/hostile", MODEL) else code:
+        fmt.println("FAIL: load hostile ", code, ": ", last_error())
+        return 1
+    try ref []char8 verdict = identify(&h, radio) else code:
+        fmt.println("FAIL: hostile identify ", code)
+        return 1
+    string8 vs = verdict
+    ref []char8 what = #format("hostile mod finds every door shut (", vs, ")")
+    bad += check(vs == "SAFE", what)
+    #delete(what)
+    close(&h)
+    #delete(verdict)
+
+    why = 0
+    Driver s
+    try s = load("driverhost/testdata/static_import", MODEL) else code:
+        why = code
+    if why == 0:
+        close(&s)
+    bad += check(why == E_LOAD, "a mod importing Dado bindings does not load")
+    why = 0
+    Driver w
+    try w = load("driverhost/testdata/wrong_api", MODEL) else code:
+        why = code
+    if why == 0:
+        close(&w)
+    bad += check(why == E_API, "a mod of another driver API is refused")
+    why = 0
+    Driver m
+    try m = load("driverhost/testdata/missing", MODEL) else code:
+        why = code
+    if why == 0:
+        close(&m)
+    bad += check(why == E_LOAD, "a missing mod fails to load")
+    #delete(radio^.image)
+    #delete(radio^.pending)
+    #delete(radio)
+    clear_error()
+    return bad

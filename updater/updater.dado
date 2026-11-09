@@ -1,0 +1,406 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// "Update drivers": fetch the latest release's driver bundle, verify every
+// file, and swap it in atomically, keeping the previous set for rollback.
+//
+//   <data>/drivers/
+//     active   -> sets/<release>     the set the app loads (a symlink)
+//     previous -> sets/<release>     the set before it, for rollback
+//     sets/<release>/                manifest.json, engines/, models/
+//     staging/<release>.<pid>/       a download in progress
+//
+// Nothing in staging is ever loaded. A set reaches sets/ only after every
+// file's size and SHA-256 matched the manifest and the bundle passed the
+// compatibility checks; `active` then moves with one rename(2), so the app
+// sees the old set or the new one, never a mix.
+package updater
+
+import "core:cfg"
+import "core:fmt"
+import "core:hash"
+import "core:json"
+import "core:mem/arena"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+enum i32 Status: (UP_TO_DATE, INSTALLED, ROLLED_BACK, FAILED)
+
+// Where an update stopped (FAILED) or finished.
+enum i32 Stage: (SETUP, FETCH_MANIFEST, MANIFEST, COMPATIBILITY, FETCH_FILE, VERIFY, INSTALL, DONE)
+
+// What the GUI/CLI shows. Its strings are the caller's: Report.destroy.
+type Report:
+    Status status
+    Stage stage
+    ref []char8 message
+    // the release active now ("" when none)
+    ref []char8 release
+    // the release kept for rollback ("" when none)
+    ref []char8 previous
+    i64 files
+    i64 bytes
+
+    void destroy(^self):
+        #delete(self.message)
+        #delete(self.release)
+        #delete(self.previous)
+        self.message = nil
+        self.release = nil
+        self.previous = nil
+
+// Called as the update goes: step `done` of `total`, and what it is doing.
+type ProgressFn: void(rawptr, i64, i64, string8)
+
+type Progress:
+    ProgressFn fn
+    rawptr ctx
+
+Progress no_progress():
+    return Progress(fn: nil, ctx: nil)
+
+private void tell(Progress p, i64 done, i64 total, string8 what):
+    if p.fn != nil:
+        p.fn(p.ctx, done, total, what)
+
+// The work of one update, all on one arena.
+private type Work:
+    Config c
+    Progress p
+    string8 root
+    string8 message
+    string8 release
+    string8 previous
+    i64 files
+    i64 bytes
+
+private Report make_report(Status s, Stage st, ^Work w):
+    return Report(status: s, stage: st, message: #format(w^.message), release: #format(w^.release), previous: #format(w^.previous), files: w^.files, bytes: w^.bytes)
+
+// The release a link in the drivers root points at ("" when none): the
+// link's target is sets/<release>.
+private string8 release_of(string8 root, string8 link):
+    ref []char8 at = path.join(root, link)
+    try ref []char8 target = fs.link_target(at) else:
+        return ""
+    return path.base(target)
+
+// Point `link` (in root) at sets/<release>, atomically: a new symlink beside
+// it, renamed over it.
+private !void point(string8 root, string8 link, string8 release):
+    ref []char8 target = path.join("sets", release)
+    ref []char8 tmp = #format(root, "/", link, ".new")
+    ref []char8 dst = path.join(root, link)
+    forget(tmp)
+    try fs.make_symlink(target, tmp) else:
+        fail 1
+    try fs.rename(tmp, dst) else:
+        forget(tmp)
+        fail 1
+
+// Remove every set but the active and previous ones, and stale staging.
+private void prune(string8 root):
+    string8 active = release_of(root, "active")
+    string8 previous = release_of(root, "previous")
+    ref []char8 sets = path.join(root, "sets")
+    try fs.Listing l = fs.read_dir(sets) else:
+        return
+    for e in l.entries:
+        string8 name = path.base(e.path)
+        if name != active && name != previous:
+            try fs.remove_all(e.path) else:
+                continue
+    l.destroy()
+
+// The installed manifest's serial, or 0.
+private i64 active_serial(string8 root):
+    ref []char8 file = #format(root, "/active/manifest.json")
+    try ref []char8 text = fs.read_file(file) else:
+        return 0
+    try json.Document doc = json.parse_text(text) else:
+        return 0
+    json.Value r = doc.root()
+    try json.Value v = r.get("serial") else:
+        return 0
+    try i64 n = v.int() else:
+        return 0
+    return n
+
+// Every model in the set names an engine the set carries or the app has built in.
+private bool builtin(string8 list, string8 engine):
+    string8 rest = list
+    for #len(rest) > 0:
+        (string8 head, string8 tail, bool more) = strings.split_first(rest, " ")
+        if strings.trim(head) == engine:
+            return true
+        if !more:
+            break
+        rest = tail
+    return false
+
+private bool engines_present(Config c, ^Manifest m, string8 dir, ^string8 why):
+    for f in m^.files:
+        if strings.starts_with(f.path, "models/"):
+            ref []char8 file = path.join(dir, f.path)
+            try ref []char8 text = fs.read_file(file) else:
+                why^ = #format("cannot read ", f.path)
+                return false
+            (cfg.Config ini, i32 _) = cfg.parse(text)
+            string8 engine = cfg.get_string(ini, "model", "engine", "")
+            if #len(engine) == 0 || !safe_name(engine):
+                why^ = #format(f.path, " names no usable engine")
+                return false
+            ref []char8 wanted = #format("engines/", engine, ".js")
+            string8 want = wanted
+            bool found = builtin(c.builtin_engines, engine)
+            for g in m^.files:
+                if g.path == want:
+                    found = true
+            if !found:
+                why^ = #format(f.path, " needs engine ", engine, ", which neither the bundle nor this app has")
+                return false
+    return true
+
+// Fetch, verify and stage one file. False with a reason on any mismatch.
+private bool take_file(^Work w, ^Manifest m, FileEntry f, string8 staging, ^Stage stage):
+    ref []char8 dest = path.join(staging, f.path)
+    ref []char8 dir = path.dir(dest)
+    try fs.make_dirs(dir) else:
+        stage^ = Stage.INSTALL
+        w^.message = #format("cannot create ", dir)
+        return false
+    ref []char8 url = asset_url(w^.c, m^.release, f.asset)
+    ref []char8 why = nil
+    stage^ = Stage.FETCH_FILE
+    if !fetch(w^.c, url, dest, f.size, &why):
+        w^.message = why
+        return false
+    stage^ = Stage.VERIFY
+    try ref []u8 got = fs.read_bytes(dest) else:
+        w^.message = #format("cannot read back ", f.path)
+        return false
+    if #len(got) != f.size:
+        w^.message = #format(f.path, ": ", #len(got), " bytes, the manifest says ", f.size, "; nothing installed")
+        return false
+    hash.Sha256Digest d = hash.sha256(got)
+    if !hash.equal_hex(d, f.sha256):
+        ref []char8 actual = hash.hex(d)
+        w^.message = #format(f.path, ": SHA-256 ", actual, " does not match the manifest's ", f.sha256, "; nothing installed")
+        return false
+    w^.bytes += f.size
+    w^.files += 1
+    return true
+
+private Stage run_update(^Work w):
+    Config c = w^.c
+    ref []char8 sets = path.join(w^.root, "sets")
+    ref []char8 staging_root = path.join(w^.root, "staging")
+    try fs.make_dirs(sets) else:
+        w^.message = #format("cannot create ", sets)
+        return Stage.SETUP
+    try fs.make_dirs(staging_root) else:
+        w^.message = #format("cannot create ", staging_root)
+        return Stage.SETUP
+    w^.release = release_of(w^.root, "active")
+    w^.previous = release_of(w^.root, "previous")
+
+    // 1. the manifest
+    ref []char8 staging = #format(staging_root, "/incoming.", os.pid())
+    remove_quietly(staging)
+    try fs.make_dirs(staging) else:
+        w^.message = #format("cannot create ", staging)
+        return Stage.SETUP
+    ref []char8 mfile = path.join(staging, "manifest.json")
+    ref []char8 murl = manifest_url(c)
+    tell(w^.p, 0, 1, "fetching the release manifest")
+    ref []char8 why = nil
+    if !fetch(c, murl, mfile, c.max_manifest_bytes, &why):
+        w^.message = #format("could not fetch the driver manifest: ", why)
+        remove_quietly(staging)
+        return Stage.FETCH_MANIFEST
+    try ref []char8 mtext = fs.read_file(mfile) else:
+        w^.message = "cannot read the downloaded manifest"
+        remove_quietly(staging)
+        return Stage.MANIFEST
+    try json.Document doc = json.parse_text(mtext) else:
+        w^.message = "the manifest is not valid JSON"
+        remove_quietly(staging)
+        return Stage.MANIFEST
+    Manifest m
+    string8 reason = ""
+    if !read_manifest(doc.root(), &m, &reason):
+        w^.message = reason
+        remove_quietly(staging)
+        return Stage.MANIFEST
+
+    // 2. compatibility and ordering
+    if m.driver_api < API_MIN || m.driver_api > API_MAX:
+        w^.message = #format("release ", m.release, " needs driver API ", m.driver_api, "; this app runs ", API_MIN, "..", API_MAX, ": update the app")
+        remove_quietly(staging)
+        return Stage.COMPATIBILITY
+    i64 need = version_number(m.min_app)
+    i64 have = version_number(c.app_version)
+    if need < 0 || have < 0 || need > have:
+        w^.message = #format("release ", m.release, " needs app ", m.min_app, " or newer; this is ", c.app_version)
+        remove_quietly(staging)
+        return Stage.COMPATIBILITY
+    i64 serial = active_serial(w^.root)
+    if m.release == w^.release && m.serial == serial:
+        w^.message = #format("drivers are up to date (", m.release, ")")
+        remove_quietly(staging)
+        return Stage.DONE
+    if m.serial < serial && !c.allow_downgrade:
+        w^.message = #format("release ", m.release, " (serial ", m.serial, ") is older than the active set (serial ", serial, "); refused")
+        remove_quietly(staging)
+        return Stage.COMPATIBILITY
+
+    // 3. every file, verified
+    i64 total = #len(m.files)
+    for f, i in m.files:
+        tell(w^.p, i, total, f.path)
+        Stage at = Stage.FETCH_FILE
+        if !take_file(w, &m, f, staging, &at):
+            remove_quietly(staging)
+            return at
+    tell(w^.p, total, total, "verified")
+    string8 missing = ""
+    if !engines_present(c, &m, staging, &missing):
+        w^.message = missing
+        remove_quietly(staging)
+        return Stage.VERIFY
+
+    // 4. install: staging -> sets/<release>, then move the links
+    ref []char8 dest = path.join(sets, m.release)
+    if m.release == w^.release:
+        // reinstalling the active release under a new serial: keep the live
+        // directory until the new one is in place
+        ref []char8 aside = #format(dest, ".old.", os.pid())
+        try fs.rename(dest, aside) else:
+            w^.message = "cannot move the active set aside"
+            remove_quietly(staging)
+            return Stage.INSTALL
+        try fs.rename(staging, dest) else:
+            try fs.rename(aside, dest) else:
+                w^.message = "cannot install, and the active set could not be put back"
+                return Stage.INSTALL
+            w^.message = "cannot install the new set"
+            return Stage.INSTALL
+        remove_quietly(aside)
+    else:
+        remove_quietly(dest)
+        try fs.rename(staging, dest) else:
+            w^.message = #format("cannot move the verified set into ", dest)
+            remove_quietly(staging)
+            return Stage.INSTALL
+        if #len(w^.release) > 0:
+            try point(w^.root, "previous", w^.release) else:
+                w^.message = "cannot record the previous set"
+                return Stage.INSTALL
+        w^.previous = w^.release
+    try point(w^.root, "active", m.release) else:
+        w^.message = "cannot activate the new set"
+        return Stage.INSTALL
+    w^.release = #format(m.release)
+    prune(w^.root)
+    w^.message = #format("installed drivers ", m.release, " (", w^.files, " files, ", w^.bytes, " bytes)")
+    return Stage.DONE
+
+private void remove_quietly(string8 staging):
+    try fs.remove_all(staging) else:
+        return
+
+// Fetch, verify and activate the latest (or the pinned) driver release.
+// Never fails: the Report says what happened, and on FAILED the active set
+// is untouched.
+Report update_drivers(Config c):
+    return update_drivers_with(c, no_progress())
+
+// update_drivers, telling `p` as it goes.
+Report update_drivers_with(Config c, Progress p):
+    arena.Arena a = arena.over(#heap)
+    defer arena.destroy(&a)
+    Work w
+    Stage st = Stage.SETUP
+    using arena.allocator(&a):
+        w = Work(c: c, p: p, root: "", message: "", release: "", previous: "", files: 0, bytes: 0)
+        try ref []char8 root = drivers_root(c) else:
+            w.message = "no data directory (HOME unset?)"
+            return make_report(Status.FAILED, Stage.SETUP, &w)
+        w.root = root
+        st = run_update(&w)
+    if st != Stage.DONE:
+        return make_report(Status.FAILED, st, &w)
+    if w.files == 0:
+        return make_report(Status.UP_TO_DATE, st, &w)
+    return make_report(Status.INSTALLED, st, &w)
+
+// Swap active and previous. FAILED when there is no previous set.
+Report rollback(Config c):
+    arena.Arena a = arena.over(#heap)
+    defer arena.destroy(&a)
+    Work w
+    Status s = Status.FAILED
+    using arena.allocator(&a):
+        w = Work(c: c, p: no_progress(), root: "", message: "", release: "", previous: "", files: 0, bytes: 0)
+        try ref []char8 root = drivers_root(c) else:
+            w.message = "no data directory"
+            return make_report(Status.FAILED, Stage.SETUP, &w)
+        w.root = root
+        string8 active = release_of(root, "active")
+        string8 previous = release_of(root, "previous")
+        if #len(previous) == 0:
+            w.message = "no previous driver set to roll back to"
+            w.release = active
+        else:
+            bool ok = true
+            try point(root, "active", previous) else:
+                ok = false
+            if ok && #len(active) > 0:
+                try point(root, "previous", active) else:
+                    ok = false
+            if ok:
+                w.release = previous
+                w.previous = active
+                w.message = #format("rolled back to drivers ", previous)
+                s = Status.ROLLED_BACK
+            else:
+                w.message = "cannot move the links"
+    return make_report(s, Stage.DONE if s == Status.ROLLED_BACK else Stage.INSTALL, &w)
+
+// One line for a CLI.
+ref []char8 describe(Report r):
+    string8 msg = r.message
+    switch r.status:
+        case Status.UP_TO_DATE:
+            return #format("up to date: ", msg)
+        case Status.INSTALLED:
+            return #format("installed: ", msg)
+        case Status.ROLLED_BACK:
+            return #format("rolled back: ", msg)
+        case Status.FAILED:
+            return #format("FAILED (", stage_name(r.stage), "): ", msg)
+        else:
+            return #format(msg)
+
+string8 stage_name(Stage s):
+    switch s:
+        case Stage.SETUP:
+            return "setup"
+        case Stage.FETCH_MANIFEST:
+            return "fetch manifest"
+        case Stage.MANIFEST:
+            return "manifest"
+        case Stage.COMPATIBILITY:
+            return "compatibility"
+        case Stage.FETCH_FILE:
+            return "fetch file"
+        case Stage.VERIFY:
+            return "verify"
+        case Stage.INSTALL:
+            return "install"
+        case Stage.DONE:
+            return "done"
+        else:
+            return "?"

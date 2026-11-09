@@ -1,0 +1,31 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Every bundled model definition is complete and self-consistent.
+package radio
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    bool ok = #expect(#len(models) >= 30, "model count ", #len(models))
+    for i in 0..<#len(models):
+        ^const Model m = &models[i]
+        ok = #expect(engine_known(m), m^.id, ": engine ", m^.engine) && ok
+        ok = #expect(#len(m^.name) != 0 && #len(m^.source) != 0, m^.id, ": name and source") && ok
+        ok = #expect(m^.image_size > 0 && m^.layout.count > 0, m^.id, ": sizes") && ok
+        ok = #expect(power_count(m) >= 2, m^.id, ": powers") && ok
+        ok = #expect(word_count(m^.magics) >= 1, m^.id, ": magics") && ok
+        ref []u8 blank = #make([]u8, m^.image_size)
+        ok = #expect(layout_fits(m, blank), m^.id, ": layout fits the image") && ok
+        #delete(blank)
+        if m^.engine == "uv17pro":
+            [4]u8 key
+            ok = #expect(uv17_key(m, &key) >= 0 && word_count(m^.ident) >= 1, m^.id, ": key/ident") && ok
+            i64 total = 0
+            i64 r = 0
+            for region_at(m, r).addr >= 0:
+                total += region_at(m, r).len
+                r += 1
+            ok = #expect(total == m^.image_size && total % i64(m^.block) == 0, m^.id, ": regions") && ok
+    return 0 if ok else 1

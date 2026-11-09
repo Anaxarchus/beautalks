@@ -1,0 +1,153 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Listing serial ports, with their USB vendor/product IDs where the system
+// tells them (Linux: sysfs; macOS: `ioreg`), so a UI can probe only known
+// programming-cable chips.
+package radio
+
+import "core:io"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+import "core:strings"
+import "core:strings/parse"
+
+type PortInfo:
+    // owned by the PortList's pool
+    Span path
+    // USB IDs, -1 when unknown
+    i32 vid
+    i32 pid
+
+type PortList:
+    ref []PortInfo ports
+    ref []char8 pool
+
+    string8 path_of(^self, i64 i):
+        Span s = self.ports[i].path
+        return string8(self.pool[s.at..<s.at + s.len])
+
+    void destroy(^self):
+        #delete(self.ports)
+        #delete(self.pool)
+        self.ports = nil
+        self.pool = nil
+
+// Known USB serial chips used in programming cables.
+bool known_cable_chip(i32 vid, i32 pid):
+    if vid == 0x1A86 && pid == 0x7523:
+        return true
+    if vid == 0x067B && pid == 0x2303:
+        return true
+    if vid == 0x0403 && (pid == 0x6001 || pid == 0x6015):
+        return true
+    if vid == 0x10C4 && pid == 0xEA60:
+        return true
+    return false
+
+// A name for a cable chip ("CH340", ...) or "".
+string8 cable_chip_name(i32 vid, i32 pid):
+    if vid == 0x1A86:
+        return "CH340"
+    if vid == 0x067B:
+        return "PL2303"
+    if vid == 0x0403:
+        return "FTDI"
+    if vid == 0x10C4:
+        return "CP210x"
+    return ""
+
+private i32 read_hex_file(string8 file):
+    try ref []char8 t = fs.read_file(file) else:
+        return -1
+    defer #delete(t)
+    string8 s = strings.trim(t)
+    try i64 v = parse.to_i64(s, 16) else:
+        return -1
+    return i32(v)
+
+private void add_port(^PortList l, string8 p):
+    i64 at = #len(l^.pool)
+    for i in 0..<#len(p):
+        l^.pool = #append(l^.pool, p[i])
+    l^.ports = #append(l^.ports, PortInfo(path: Span(at: at, len: #len(p)), vid: -1, pid: -1))
+
+private void glob_into(^PortList l, string8 pattern):
+    try fs.Listing ls = fs.glob(pattern) else:
+        return
+    defer ls.destroy()
+    for e in ls.entries:
+        add_port(l, e.path)
+
+// Linux: /sys/class/tty/<name>/device/../idVendor (ttyACM) or
+// device/../../idVendor (ttyUSB).
+private void sysfs_ids(^PortList l, i64 i):
+    string8 name = path.base(l^.path_of(i))
+    for up in 1..<3:
+        ref []char8 dir = path.join("/sys/class/tty", name, "device")
+        for _ in 0..<up:
+            ref []char8 next = path.join(dir, "..")
+            #delete(dir)
+            dir = next
+        ref []char8 vf = path.join(dir, "idVendor")
+        ref []char8 pf = path.join(dir, "idProduct")
+        i32 v = read_hex_file(vf)
+        i32 p = read_hex_file(pf)
+        #delete(vf)
+        #delete(pf)
+        #delete(dir)
+        if v >= 0 && p >= 0:
+            l^.ports[i].vid = v
+            l^.ports[i].pid = p
+            return
+
+// macOS: `ioreg -r -c IOUSBHostDevice -l` lists each USB device with its
+// idVendor / idProduct, and below it the IOCalloutDevice of its serial port.
+private void ioreg_ids(^PortList l):
+    try ^io.FILE f = proc.read("ioreg -r -c IOUSBHostDevice -l 2>/dev/null") else:
+        return
+    i32 vid = -1
+    i32 pid = -1
+    for !io.at_end(f):
+        try ref []char8 line = io.read_line(f) else:
+            break
+        string8 s = line
+        i64 eq = strings.find(s, "\" = ")
+        if eq > 0:
+            string8 val = strings.trim(s[eq + 4..<#len(s)])
+            if strings.contains(s, "\"idVendor\""):
+                i64 v = -1
+                try v = parse.to_i64(val) else:
+                    v = -1
+                vid = i32(v)
+            else if strings.contains(s, "\"idProduct\""):
+                i64 v = -1
+                try v = parse.to_i64(val) else:
+                    v = -1
+                pid = i32(v)
+            else if strings.contains(s, "\"IOCalloutDevice\""):
+                string8 p = strings.trim_suffix(strings.trim_prefix(val, "\""), "\"")
+                for i in 0..<#len(l^.ports):
+                    if l^.path_of(i) == p:
+                        l^.ports[i].vid = vid
+                        l^.ports[i].pid = pid
+        #delete(line)
+    try proc.Ended _ = proc.close(f) else:
+        return
+
+// Every serial port that may be a programming cable.
+PortList list_ports():
+    PortList l
+    glob_into(&l, "/dev/cu.*")
+    glob_into(&l, "/dev/ttyUSB*")
+    glob_into(&l, "/dev/ttyACM*")
+    bool mac = false
+    for i in 0..<#len(l.ports):
+        if strings.starts_with(l.path_of(i), "/dev/cu."):
+            mac = true
+        else:
+            sysfs_ids(&l, i)
+    if mac:
+        ioreg_ids(&l)
+    return l

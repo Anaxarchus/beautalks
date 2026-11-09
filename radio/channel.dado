@@ -1,0 +1,377 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Channels: decoding one from a memory image through a model definition's Layout, and
+// encoding one back. Encoding is read-modify-write: only the bytes and bits a
+// field owns are touched, and a field whose stored value already decodes to
+// the wanted one is not rewritten at all, so decode -> encode reproduces the
+// image byte for byte and settings this program does not know survive.
+package radio
+
+import "core:strings"
+
+const i64 NAME_MAX = 16
+
+distinct enum i32 Mode:
+    FM = 0,
+    NFM = 1,
+    AM = 2,
+
+string8 mode_name(Mode m):
+    if m == Mode.NFM:
+        return "NFM"
+    if m == Mode.AM:
+        return "AM"
+    return "FM"
+
+type Channel:
+    i32 number
+    bool empty
+    // receive frequency in Hz
+    i64 rx_hz
+    // transmit frequency in Hz, or -1 when transmit is off
+    i64 tx_hz
+    Tone rx_tone
+    Tone tx_tone
+    // index into the model's `powers` list
+    i32 power
+    Mode mode
+    bool scan
+    // busy channel lockout
+    bool bcl
+    [16]char8 name
+    i64 name_len
+
+// Why a channel cannot be stored on, or read from, an image.
+distinct enum i32 ChannelError:
+    // the number is outside the model's channel range
+    NUMBER = 1,
+    // the image is smaller than the layout needs
+    IMAGE = 2,
+
+// An empty channel numbered `number`.
+Channel empty_channel(i32 number):
+    Channel c
+    c.number = number
+    c.empty = true
+    c.tx_hz = -1
+    c.scan = true
+    c.mode = Mode.FM
+    return c
+
+string8 channel_name(^const Channel c):
+    return string8(c^.name[0..<c^.name_len])
+
+void set_channel_name(^Channel c, string8 name):
+    i64 n = #len(name)
+    if n > NAME_MAX:
+        n = NAME_MAX
+    for i in 0..<n:
+        c^.name[i] = name[i]
+    c^.name_len = n
+
+// The last valid channel number.
+i32 last_number(^const Model p):
+    return p^.layout.first + p^.layout.count - 1
+
+private i64 field_at(^const Field f, i64 idx):
+    return f^.table + idx * f^.stride + f^.offset
+
+private bool field_fits(^const Field f, i64 idx, i64 size):
+    if f^.codec == Codec.NONE:
+        return true
+    i64 at = field_at(f, idx)
+    i64 w = i64(f^.width)
+    if f^.codec == Codec.BITS:
+        w = 1
+    return at >= 0 && at + w <= size
+
+private i64 read_num(^const Field f, []u8 img, i64 idx):
+    i64 at = field_at(f, idx)
+    if f^.codec == Codec.LBCD:
+        return get_lbcd(img, at, i64(f^.width))
+    if f^.codec == Codec.BITS:
+        i64 v = get_bits(img, at, f^.bit, f^.width)
+        if f^.invert && f^.width == 1:
+            v = 1 - v
+        return v
+    if f^.codec == Codec.TONE_BF:
+        return get_u16le(img, at)
+    return 0
+
+private void write_num(^const Field f, []u8 img, i64 idx, i64 v):
+    i64 at = field_at(f, idx)
+    if f^.codec == Codec.LBCD:
+        put_lbcd(img, at, i64(f^.width), v)
+    else if f^.codec == Codec.BITS:
+        i64 w = v
+        if f^.invert && f^.width == 1:
+            w = 1 - v
+        put_bits(img, at, f^.bit, f^.width, w)
+    else if f^.codec == Codec.TONE_BF:
+        put_u16le(img, at, v)
+
+private bool tx_is_off(^const Field f, []u8 img, i64 idx):
+    i64 at = field_at(f, idx)
+    i64 w = i64(f^.width)
+    return all_equal(img, at, w, 0xFF) || all_equal(img, at, w, 0x00)
+
+// The record of channel `number`, or -1 when out of range.
+i64 channel_index(^const Model p, i32 number):
+    i64 idx = i64(number) - i64(p^.layout.first)
+    if idx < 0 || idx >= i64(p^.layout.count):
+        return -1
+    return idx
+
+bool layout_fits(^const Model p, []u8 img):
+    i64 last = i64(p^.layout.count) - 1
+    if last < 0:
+        return false
+    i64 size = #len(img)
+    ^const Layout l = &p^.layout
+    i64 rec_end = l^.start + last * l^.stride + l^.stride
+    if rec_end > size:
+        return false
+    return field_fits(&l^.name, last, size) && field_fits(&l^.rx, last, size) && field_fits(&l^.tx, last, size)
+
+bool is_empty_at(^const Model p, []u8 img, i64 idx):
+    i64 rec = p^.layout.start + idx * p^.layout.stride
+    return img[rec + p^.layout.empty_at] == p^.layout.empty_byte
+
+private void read_name(^const Field f, []u8 img, i64 idx, ^Channel c):
+    c^.name_len = 0
+    if f^.codec != Codec.TEXT:
+        return
+    i64 at = field_at(f, idx)
+    i64 w = i64(f^.width)
+    if w > NAME_MAX:
+        w = NAME_MAX
+    for i in 0..<w:
+        u8 b = img[at + i]
+        char8 ch = ' '
+        if b != 0xFF && b != 0x00:
+            ch = char8(b)
+        c^.name[i] = ch
+    i64 n = w
+    for n > 0 && c^.name[n - 1] == ' ':
+        n -= 1
+    c^.name_len = n
+
+// Decodes channel `number`. A number out of range or an image too small
+// fails; an empty slot answers a channel with `empty` set.
+ChannelError!Channel decode_channel(^const Model p, []u8 img, i32 number):
+    i64 idx = channel_index(p, number)
+    if idx < 0:
+        fail ChannelError.NUMBER
+    if !layout_fits(p, img):
+        fail ChannelError.IMAGE
+    Channel c = empty_channel(number)
+    if is_empty_at(p, img, idx):
+        return c
+    ^const Layout l = &p^.layout
+    c.empty = false
+    i64 rx = read_num(&l^.rx, img, idx)
+    c.rx_hz = rx * 10 if rx >= 0 else 0
+    if tx_is_off(&l^.tx, img, idx):
+        c.tx_hz = -1
+    else:
+        i64 tx = read_num(&l^.tx, img, idx)
+        c.tx_hz = tx * 10 if tx >= 0 else -1
+    if l^.rx_tone.codec == Codec.TONE_BF:
+        c.rx_tone = decode_tone_bf(read_num(&l^.rx_tone, img, idx))
+    if l^.tx_tone.codec == Codec.TONE_BF:
+        c.tx_tone = decode_tone_bf(read_num(&l^.tx_tone, img, idx))
+    c.power = i32(read_num(&l^.power, img, idx))
+    bool wide = read_num(&l^.wide, img, idx) != 0 if l^.wide.codec == Codec.BITS else true
+    c.mode = Mode.FM if wide else Mode.NFM
+    // like CHIRP: AM is not stored, it is what the radio does in its airband
+    if has_mode(p, "AM") && #len(p^.am_bands) != 0 && in_band_list(p^.am_bands, c.rx_hz):
+        c.mode = Mode.AM
+    c.scan = read_num(&l^.scan, img, idx) != 0 if l^.scan.codec == Codec.BITS else true
+    c.bcl = read_num(&l^.bcl, img, idx) != 0 if l^.bcl.codec == Codec.BITS else false
+    read_name(&l^.name, img, idx, &c)
+    return c
+
+bool tone_equal(Tone a, Tone b):
+    if a.kind != b.kind:
+        return false
+    if a.kind == ToneKind.OFF:
+        return true
+    return a.value == b.value && a.inverted == b.inverted
+
+private bool name_separate(^const Layout l):
+    return l^.name.codec == Codec.TEXT && (l^.name.table != l^.start || l^.name.stride != l^.stride)
+
+// Writes the model's new-channel template into record `idx`.
+private void write_blank(^const Model p, []u8 img, i64 idx):
+    i64 rec = p^.layout.start + idx * p^.layout.stride
+    [64]u8 blank
+    i64 n = decode_bytes(p^.layout.blank_hex, blank[:])
+    for i in 0..<p^.layout.stride:
+        u8 v = 0
+        if i < n:
+            v = blank[i]
+        img[rec + i] = v
+
+// Stores `c` into the image (read-modify-write, see the file comment).
+ChannelError!void encode_channel(^const Model p, []u8 img, ^const Channel c):
+    i64 idx = channel_index(p, c^.number)
+    if idx < 0:
+        fail ChannelError.NUMBER
+    if !layout_fits(p, img):
+        fail ChannelError.IMAGE
+    ^const Layout l = &p^.layout
+    i64 rec = l^.start + idx * l^.stride
+    if c^.empty:
+        // an already empty slot keeps whatever stale bytes it holds
+        if is_empty_at(p, img, idx):
+            return
+        fill(img, rec, l^.stride, 0xFF)
+        if name_separate(l):
+            fill(img, l^.name.table + idx * l^.name.stride, l^.name.stride, 0xFF)
+        return
+    if is_empty_at(p, img, idx):
+        write_blank(p, img, idx)
+    Channel cur
+    try cur = decode_channel(p, img, c^.number) else why:
+        fail why
+    if cur.rx_hz != c^.rx_hz || read_num(&l^.rx, img, idx) < 0:
+        write_num(&l^.rx, img, idx, c^.rx_hz / 10)
+    if c^.tx_hz < 0:
+        if !tx_is_off(&l^.tx, img, idx):
+            fill(img, field_at(&l^.tx, idx), i64(l^.tx.width), 0xFF)
+    else if cur.tx_hz != c^.tx_hz:
+        write_num(&l^.tx, img, idx, c^.tx_hz / 10)
+    if l^.rx_tone.codec == Codec.TONE_BF && !tone_equal(cur.rx_tone, c^.rx_tone):
+        write_num(&l^.rx_tone, img, idx, encode_tone_bf(c^.rx_tone))
+    if l^.tx_tone.codec == Codec.TONE_BF && !tone_equal(cur.tx_tone, c^.tx_tone):
+        write_num(&l^.tx_tone, img, idx, encode_tone_bf(c^.tx_tone))
+    if l^.power.codec == Codec.BITS && cur.power != c^.power:
+        write_num(&l^.power, img, idx, i64(c^.power))
+    // AM is stored as CHIRP stores it: the bit of "not NFM"
+    bool want_wide = c^.mode != Mode.NFM
+    bool cur_wide = cur.mode != Mode.NFM
+    if l^.wide.codec == Codec.BITS && cur_wide != want_wide:
+        write_num(&l^.wide, img, idx, 1 if want_wide else 0)
+    if l^.scan.codec == Codec.BITS && cur.scan != c^.scan:
+        write_num(&l^.scan, img, idx, 1 if c^.scan else 0)
+    if l^.bcl.codec == Codec.BITS && cur.bcl != c^.bcl:
+        write_num(&l^.bcl, img, idx, 1 if c^.bcl else 0)
+    if l^.name.codec == Codec.TEXT && channel_name(&cur) != channel_name(c):
+        i64 at = field_at(&l^.name, idx)
+        for i in 0..<i64(l^.name.width):
+            u8 v = 0xFF
+            if i < c^.name_len:
+                v = u8(c^.name[i])
+            img[at + i] = v
+
+// How many channels hold something.
+i32 used_count(^const Model p, []u8 img):
+    if !layout_fits(p, img):
+        return 0
+    i32 n = 0
+    for i in 0..<i64(p^.layout.count):
+        if !is_empty_at(p, img, i):
+            n += 1
+    return n
+
+// ── validation: only what the radio cannot physically store ─────────────────
+
+distinct enum i32 Issue:
+    // the channel number is outside the model's range
+    NUMBER = 1,
+    // receive frequency outside every hardware band of the model
+    RX_BAND = 2,
+    // transmit frequency outside every hardware band of the model
+    TX_BAND = 3,
+    // a frequency that is not a whole number of 10 Hz (what BCD stores)
+    FREQ_STEP = 4,
+    // a tone the radio cannot store (unknown DCS code, CTCSS out of range)
+    RX_TONE = 5,
+    TX_TONE = 6,
+    // the name is longer than the radio stores
+    NAME_LONG = 7,
+    // the name holds a character the radio cannot show
+    NAME_CHARS = 8,
+    // no such power level on this model
+    POWER = 9,
+
+string8 issue_message(Issue i):
+    switch i:
+        case Issue.NUMBER:
+            return "channel number out of range"
+        case Issue.RX_BAND:
+            return "receive frequency outside the radio's bands"
+        case Issue.TX_BAND:
+            return "transmit frequency outside the radio's bands"
+        case Issue.FREQ_STEP:
+            return "frequency is not a multiple of 10 Hz"
+        case Issue.RX_TONE:
+            return "receive tone cannot be stored"
+        case Issue.TX_TONE:
+            return "transmit tone cannot be stored"
+        case Issue.NAME_LONG:
+            return "name too long"
+        case Issue.NAME_CHARS:
+            return "name has characters the radio cannot show"
+        case Issue.POWER:
+            return "no such power level"
+        else:
+            return "?"
+
+bool tone_storable(Tone t):
+    if t.kind == ToneKind.CTCSS:
+        return t.value >= 600 && t.value <= 3000
+    if t.kind == ToneKind.DCS:
+        return dcs_index(t.value) >= 0
+    return true
+
+private bool name_char_ok(^const Model p, char8 ch):
+    if #len(p^.charset) == 0:
+        return ch >= ' ' && ch <= '~'
+    return strings.has_byte(p^.charset, ch)
+
+// Fills `out` with what stops `c` from being stored; answers how many.
+// Licensing is not judged here: only what the hardware cannot hold.
+i64 validate_channel(^const Model p, ^const Channel c, []Issue out):
+    i64 n = 0
+    [12]Issue found
+    if channel_index(p, c^.number) < 0:
+        found[n] = Issue.NUMBER
+        n += 1
+    if !c^.empty:
+        if !in_band_list(p^.rx_bands, c^.rx_hz):
+            found[n] = Issue.RX_BAND
+            n += 1
+        if c^.tx_hz >= 0 && !in_band_list(p^.tx_bands, c^.tx_hz):
+            found[n] = Issue.TX_BAND
+            n += 1
+        if c^.rx_hz % 10 != 0 || (c^.tx_hz >= 0 && c^.tx_hz % 10 != 0):
+            found[n] = Issue.FREQ_STEP
+            n += 1
+        if !tone_storable(c^.rx_tone):
+            found[n] = Issue.RX_TONE
+            n += 1
+        if !tone_storable(c^.tx_tone):
+            found[n] = Issue.TX_TONE
+            n += 1
+        if c^.name_len > i64(p^.layout.name.width):
+            found[n] = Issue.NAME_LONG
+            n += 1
+        bool bad = false
+        for i in 0..<c^.name_len:
+            if !name_char_ok(p, c^.name[i]):
+                bad = true
+        if bad:
+            found[n] = Issue.NAME_CHARS
+            n += 1
+        i64 pc = power_count(p)
+        if c^.power < 0 || (pc > 0 && i64(c^.power) >= pc):
+            found[n] = Issue.POWER
+            n += 1
+    i64 k = 0
+    for i in 0..<n:
+        if k < #len(out):
+            out[k] = found[i]
+            k += 1
+    return n

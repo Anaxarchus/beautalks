@@ -1,0 +1,813 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Profiles: a model-independent, ordered list of channels that moves between
+// radios of different models. `extract` reads one out of an image; `apply`
+// places one into an image of any model and reports, channel by channel,
+// what the destination could not hold and what was changed to make it fit.
+// Licensing is never judged here: only what the hardware can store.
+//
+// (In code a profile is a `ChannelList`, to keep the word apart from the
+// per-radio model definitions in models/*.ini.)
+package radio
+
+import "core:strings"
+
+// A span of a ChannelList's text pool.
+type Span:
+    i64 at
+    i64 len
+
+// A transmit power, normalized across models.
+distinct enum i32 Level:
+    NONE = 0,
+    LOW = 1,
+    MEDIUM = 2,
+    HIGH = 3,
+
+string8 level_name(Level l):
+    if l == Level.HIGH:
+        return "High"
+    if l == Level.MEDIUM:
+        return "Medium"
+    if l == Level.LOW:
+        return "Low"
+    return ""
+
+Level level_of(string8 name):
+    string8 s = strings.trim(name)
+    if strings.equal_fold(s, "high") || strings.equal_fold(s, "hi") || strings.equal_fold(s, "h"):
+        return Level.HIGH
+    if strings.equal_fold(s, "low") || strings.equal_fold(s, "lo") || strings.equal_fold(s, "l"):
+        return Level.LOW
+    if is_mid(s) || strings.equal_fold(s, "m"):
+        return Level.MEDIUM
+    return Level.NONE
+
+// One channel, independent of any radio.
+type Entry:
+    // where it came from (channel number), or -1
+    i32 slot
+    i64 rx_hz
+    // -1 when transmit is off
+    i64 tx_hz
+    Tone rx_tone
+    Tone tx_tone
+    Mode mode
+    Level power
+    // tenths of a watt, 0 when unknown
+    i32 deciwatts
+    bool scan
+    bool bcl
+    Span name
+    Span comment
+    // licence / service note (channel libraries); reported as info only
+    Span license
+
+type ChannelList:
+    ref []Entry entries
+    ref []char8 pool
+    Span title
+    Span notes
+
+    Span add_text(^self, string8 s):
+        i64 at = #len(self.pool)
+        for i in 0..<#len(s):
+            self.pool = #append(self.pool, s[i])
+        return Span(at: at, len: #len(s))
+
+    // A view of pooled text; stale after the next add_text.
+    string8 text(^self, Span s):
+        if s.len == 0:
+            return ""
+        return string8(self.pool[s.at..<s.at + s.len])
+
+    void destroy(^self):
+        #delete(self.entries)
+        #delete(self.pool)
+        self.entries = nil
+        self.pool = nil
+
+// The level of the model's power index `i` ("Med", "Mid" -> MEDIUM).
+Level model_level(^const Model m, i64 i):
+    return level_of(power_name(m, i))
+
+// ── extract ──────────────────────────────────────────────────────────────────
+
+// Every used channel of `img`, in channel order.
+ChannelList extract(^const Model m, []u8 img):
+    ChannelList out
+    i32 first = m^.layout.first
+    for i in 0..<i64(m^.layout.count):
+        i32 number = first + i32(i)
+        try Channel c = decode_channel(m, img, number) else:
+            break
+        if c.empty:
+            continue
+        Entry e
+        e.slot = number
+        e.rx_hz = c.rx_hz
+        e.tx_hz = c.tx_hz
+        e.rx_tone = c.rx_tone
+        e.tx_tone = c.tx_tone
+        e.mode = c.mode
+        e.power = model_level(m, i64(c.power))
+        e.scan = c.scan
+        e.bcl = c.bcl
+        e.name = out.add_text(channel_name(&c))
+        out.entries = #append(out.entries, e)
+    return out
+
+// ── CSV ──────────────────────────────────────────────────────────────────────
+
+const string8 CSV_HEADER = "number,name,rx_mhz,tx_mhz,rx_tone,tx_tone,power,mode,scan,bcl,comment"
+
+// The list as beautalks CSV. `# title:` and `# notes:` lines carry the
+// list's own name and notes. The caller #deletes the text.
+ref []char8 list_to_csv(^ChannelList l):
+    strings.Builder b = strings.builder(4096)
+    if l^.title.len != 0:
+        strings.append(&b, "# title: ")
+        strings.append(&b, l^.text(l^.title))
+        strings.append_char(&b, '\n')
+    if l^.notes.len != 0:
+        strings.append(&b, "# notes: ")
+        strings.append(&b, l^.text(l^.notes))
+        strings.append_char(&b, '\n')
+    strings.append(&b, CSV_HEADER)
+    strings.append_char(&b, '\n')
+    for k in 0..<#len(l^.entries):
+        Entry e = l^.entries[k]
+        if e.slot >= 0:
+            append_int(&b, i64(e.slot))
+        strings.append_char(&b, ',')
+        csv_field(&b, l^.text(e.name))
+        strings.append_char(&b, ',')
+        append_mhz(&b, e.rx_hz)
+        strings.append_char(&b, ',')
+        if e.tx_hz >= 0:
+            append_mhz(&b, e.tx_hz)
+        strings.append_char(&b, ',')
+        append_tone(&b, e.rx_tone)
+        strings.append_char(&b, ',')
+        append_tone(&b, e.tx_tone)
+        strings.append_char(&b, ',')
+        strings.append(&b, level_name(e.power))
+        strings.append_char(&b, ',')
+        strings.append(&b, mode_name(e.mode))
+        strings.append_char(&b, ',')
+        strings.append(&b, "yes" if e.scan else "no")
+        strings.append_char(&b, ',')
+        strings.append(&b, "yes" if e.bcl else "no")
+        strings.append_char(&b, ',')
+        csv_field(&b, l^.text(e.comment))
+        strings.append_char(&b, '\n')
+    return strings.finish(&b)
+
+// Column positions of a CSV header; -1 for an absent column.
+type Columns:
+    i64 number
+    i64 name
+    i64 long_name
+    i64 rx
+    i64 tx
+    i64 rx_tone
+    i64 tx_tone
+    i64 power
+    i64 mode
+    i64 scan
+    i64 bcl
+    i64 comment
+    i64 notes
+    i64 license_note
+    i64 set
+
+private Columns columns_of(^const CsvRow row):
+    Columns c = Columns(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+    for i in 0..<#len(row^.fields):
+        string8 h = strings.trim(row^.fields[i])
+        if h == "number" || h == "slot" || h == "location":
+            c.number = i
+        else if h == "name":
+            c.name = i
+        else if h == "long_name":
+            c.long_name = i
+        else if h == "rx_mhz" || h == "rx" || h == "frequency":
+            c.rx = i
+        else if h == "tx_mhz" || h == "tx":
+            c.tx = i
+        else if h == "rx_tone":
+            c.rx_tone = i
+        else if h == "tx_tone":
+            c.tx_tone = i
+        else if h == "power":
+            c.power = i
+        else if h == "mode":
+            c.mode = i
+        else if h == "scan":
+            c.scan = i
+        else if h == "bcl":
+            c.bcl = i
+        else if h == "comment":
+            c.comment = i
+        else if h == "notes":
+            c.notes = i
+        else if h == "license_note":
+            c.license_note = i
+        else if h == "set":
+            c.set = i
+    return c
+
+private string8 col(^const CsvRow row, i64 i):
+    if i < 0 || i >= #len(row^.fields):
+        return ""
+    return strings.trim(row^.fields[i])
+
+// Why a CSV line could not be read.
+type CsvProblem:
+    // 1-based line number in the file
+    i64 line
+    Span what
+
+// Reads beautalks CSV or a channel-library CSV (columns set, name,
+// long_name, rx_mhz, tx_mhz, mode, rx_tone, tx_tone, license_note, notes,
+// source). Lines that cannot be read are listed in `problems` (texts in the
+// list's pool) and skipped. An empty tx_mhz means transmit off.
+ChannelList list_from_csv(string8 text, ^ref([]CsvProblem) problems):
+    ChannelList out
+    CsvRow row
+    defer row.destroy()
+    i64 at = 0
+    i64 line = 0
+    bool have_header = false
+    Columns c
+    for at >= 0 && at < #len(text):
+        i64 here = at
+        at = csv_next(text, at, &row)
+        line += 1
+        string8 raw = strings.trim(text[here..<(at if at >= 0 else #len(text))])
+        if #len(raw) == 0:
+            continue
+        if raw[0] == '#':
+            string8 body = strings.trim(raw[1..<#len(raw)])
+            if strings.starts_with(body, "title:"):
+                out.title = out.add_text(strings.trim(body[6..<#len(body)]))
+            else if strings.starts_with(body, "notes:"):
+                out.notes = out.add_text(strings.trim(body[6..<#len(body)]))
+            continue
+        if !have_header:
+            c = columns_of(&row)
+            have_header = true
+            if c.rx < 0:
+                problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("header has no rx_mhz column")))
+                return out
+            continue
+        Entry e
+        e.slot = -1
+        e.scan = true
+        e.mode = Mode.FM
+        string8 num = col(&row, c.number)
+        if #len(num) != 0:
+            e.slot = i32(parse_num(num, -1))
+        e.rx_hz = parse_mhz(col(&row, c.rx))
+        if e.rx_hz <= 0:
+            problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("bad rx_mhz")))
+            continue
+        string8 txs = col(&row, c.tx)
+        e.tx_hz = -1
+        if #len(txs) != 0:
+            e.tx_hz = parse_mhz(txs)
+            if e.tx_hz < 0:
+                problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("bad tx_mhz")))
+                continue
+        if !parse_tone(col(&row, c.rx_tone), &e.rx_tone):
+            problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("bad rx_tone")))
+            continue
+        if !parse_tone(col(&row, c.tx_tone), &e.tx_tone):
+            problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("bad tx_tone")))
+            continue
+        if !parse_mode(col(&row, c.mode), &e.mode):
+            problems^ = #append(problems^, CsvProblem(line: line, what: out.add_text("bad mode")))
+            continue
+        e.power = level_of(col(&row, c.power))
+        string8 sc = col(&row, c.scan)
+        e.scan = #len(sc) == 0 || parse_yes(sc)
+        e.bcl = parse_yes(col(&row, c.bcl))
+        e.name = out.add_text(col(&row, c.name))
+        // comment: our own column, else the library's long name / notes
+        string8 cm = col(&row, c.comment)
+        if #len(cm) != 0:
+            e.comment = out.add_text(cm)
+        else:
+            strings.Builder b = strings.builder(64)
+            string8 parts0 = col(&row, c.long_name)
+            string8 parts2 = col(&row, c.notes)
+            append_part(&b, parts0)
+            append_part(&b, parts2)
+            ref []char8 joined = strings.finish(&b)
+            e.comment = out.add_text(joined)
+            #delete(joined)
+        string8 lic = col(&row, c.license_note)
+        if #len(lic) != 0:
+            e.license = out.add_text(lic)
+        out.entries = #append(out.entries, e)
+    return out
+
+private void append_part(^strings.Builder b, string8 s):
+    if #len(s) == 0:
+        return
+    string8 sofar = strings.text(b^)
+    if #len(sofar) != 0:
+        strings.append(b, " | ")
+    strings.append(b, s)
+
+// ── apply ────────────────────────────────────────────────────────────────────
+
+distinct enum i32 Severity:
+    INFO = 0,
+    // the channel was changed to fit
+    WARNING = 1,
+    // the channel was skipped
+    ERROR = 2,
+
+string8 severity_name(Severity s):
+    if s == Severity.ERROR:
+        return "error"
+    if s == Severity.WARNING:
+        return "warning"
+    return "info"
+
+// Which attribute a diagnostic is about (the cell a preview highlights).
+distinct enum i32 FieldId:
+    NONE = 0,
+    SLOT = 1,
+    RX = 2,
+    TX = 3,
+    NAME = 4,
+    POWER = 5,
+    MODE = 6,
+    RX_TONE = 7,
+    TX_TONE = 8,
+    COMMENT = 9,
+
+string8 field_id_name(FieldId f):
+    switch f:
+        case FieldId.SLOT:
+            return "slot"
+        case FieldId.RX:
+            return "rx"
+        case FieldId.TX:
+            return "tx"
+        case FieldId.NAME:
+            return "name"
+        case FieldId.POWER:
+            return "power"
+        case FieldId.MODE:
+            return "mode"
+        case FieldId.RX_TONE:
+            return "rx_tone"
+        case FieldId.TX_TONE:
+            return "tx_tone"
+        case FieldId.COMMENT:
+            return "comment"
+        case FieldId.NONE:
+            return ""
+        else:
+            return ""
+
+// Why: one code per kind of finding.
+distinct enum i32 DiagCode:
+    // info: where the channel went (new = the channel number)
+    PLACED = 1,
+    // error: receive frequency outside the radio's receive bands
+    RX_OUT_OF_BAND = 2,
+    // warning: transmit outside the transmit bands; made receive-only
+    TX_OUT_OF_BAND = 3,
+    // error: more channels than free slots
+    NO_FREE_SLOT = 4,
+    // error: the kept slot number does not exist on this model
+    SLOT_OUT_OF_RANGE = 5,
+    // error: an earlier entry already took this slot
+    DUPLICATE_SLOT = 6,
+    // error: fill-empty mode and the slot holds a channel
+    SLOT_OCCUPIED = 7,
+    // warning: name cut to the radio's length
+    NAME_TRUNCATED = 8,
+    // warning: name characters the radio cannot show were replaced
+    NAME_CHARS = 9,
+    // warning: power level not on this model; nearest used
+    POWER_MAPPED = 10,
+    // warning: mode changed (AM in/out of the airband)
+    MODE_CHANGED = 11,
+    // warning: a tone the radio cannot store was removed
+    TONE_UNSUPPORTED = 12,
+    // error: something else the radio cannot store
+    NOT_STORABLE = 13,
+    // warning: frequency rounded to the 10 Hz the radio stores
+    FREQ_ROUNDED = 14,
+    // info: a licence / service note carried by the channel (never a problem)
+    LICENSE_NOTE = 15,
+
+type Diag:
+    Severity severity
+    DiagCode code
+    FieldId field
+    // index into the ChannelList's entries, -1 for the whole list
+    i64 entry
+    // destination channel number, -1 when none
+    i32 slot
+    // the value before and after, as text in the Report's pool ("" if none)
+    Span old_value
+    Span new_value
+
+type Report:
+    ref []Diag diags
+    ref []char8 pool
+    i32 placed
+    i32 skipped
+    i32 changed
+
+    Span keep(^self, string8 s):
+        i64 at = #len(self.pool)
+        for i in 0..<#len(s):
+            self.pool = #append(self.pool, s[i])
+        return Span(at: at, len: #len(s))
+
+    void add(^self, Severity sev, DiagCode code, FieldId field, i64 entry, i32 slot, string8 old_value, string8 new_value):
+        Span o = self.keep(old_value)
+        Span n = self.keep(new_value)
+        Diag d = Diag(severity: sev, code: code, field: field, entry: entry, slot: slot, old_value: o, new_value: n)
+        self.diags = #append(self.diags, d)
+
+    // A view of pooled text; stale after the next add.
+    string8 text(^self, Span s):
+        if s.len == 0:
+            return ""
+        return string8(self.pool[s.at..<s.at + s.len])
+
+    i64 count(^self, Severity sev):
+        i64 n = 0
+        for d in self.diags:
+            if d.severity == sev:
+                n += 1
+        return n
+
+    void destroy(^self):
+        #delete(self.diags)
+        #delete(self.pool)
+        self.diags = nil
+        self.pool = nil
+
+// A human sentence for one diagnostic, appended to `b`.
+void diag_message(^Report rep, Diag d, ^strings.Builder b):
+    string8 o = rep^.text(d.old_value)
+    string8 n = rep^.text(d.new_value)
+    switch d.code:
+        case DiagCode.PLACED:
+            strings.append(b, "placed in channel ")
+            strings.append(b, n)
+        case DiagCode.RX_OUT_OF_BAND:
+            strings.append(b, o)
+            strings.append(b, " MHz is outside the radio's receive bands (")
+            strings.append(b, n)
+            strings.append(b, "); skipped")
+        case DiagCode.TX_OUT_OF_BAND:
+            strings.append(b, "transmit ")
+            strings.append(b, o)
+            strings.append(b, " MHz is outside the radio's transmit bands; receive only")
+        case DiagCode.NO_FREE_SLOT:
+            strings.append(b, "no free channel left (the radio has ")
+            strings.append(b, o)
+            strings.append(b, "); skipped")
+        case DiagCode.SLOT_OUT_OF_RANGE:
+            strings.append(b, "channel ")
+            strings.append(b, o)
+            strings.append(b, " does not exist (")
+            strings.append(b, n)
+            strings.append(b, "); skipped")
+        case DiagCode.DUPLICATE_SLOT:
+            strings.append(b, "channel ")
+            strings.append(b, o)
+            strings.append(b, " already taken by an earlier entry; skipped")
+        case DiagCode.SLOT_OCCUPIED:
+            strings.append(b, "channel ")
+            strings.append(b, o)
+            strings.append(b, " is in use and only empty channels may be filled; skipped")
+        case DiagCode.NAME_TRUNCATED:
+            strings.append(b, "name \"")
+            strings.append(b, o)
+            strings.append(b, "\" shortened to \"")
+            strings.append(b, n)
+            strings.append(b, "\"")
+        case DiagCode.NAME_CHARS:
+            strings.append(b, "name \"")
+            strings.append(b, o)
+            strings.append(b, "\" has characters the radio cannot show; now \"")
+            strings.append(b, n)
+            strings.append(b, "\"")
+        case DiagCode.POWER_MAPPED:
+            strings.append(b, "power ")
+            strings.append(b, o)
+            strings.append(b, " not available; using ")
+            strings.append(b, n)
+        case DiagCode.MODE_CHANGED:
+            strings.append(b, "mode ")
+            strings.append(b, o)
+            strings.append(b, " -> ")
+            strings.append(b, n)
+            if n == "AM":
+                strings.append(b, " (the radio receives AM here)")
+            else:
+                strings.append(b, " (the radio has no AM at this frequency)")
+        case DiagCode.TONE_UNSUPPORTED:
+            strings.append(b, field_id_name(d.field))
+            strings.append(b, " ")
+            strings.append(b, o)
+            strings.append(b, " cannot be stored; removed")
+        case DiagCode.NOT_STORABLE:
+            strings.append(b, "cannot be stored: ")
+            strings.append(b, n)
+        case DiagCode.FREQ_ROUNDED:
+            strings.append(b, field_id_name(d.field))
+            strings.append(b, " ")
+            strings.append(b, o)
+            strings.append(b, " rounded to ")
+            strings.append(b, n)
+        case DiagCode.LICENSE_NOTE:
+            strings.append(b, "note: ")
+            strings.append(b, o)
+        else:
+            strings.append(b, "?")
+
+type ApplyOptions:
+    // first destination channel when packing; -1 = the model's first
+    i32 start
+    // put each entry at its own `slot` (when it has one) instead of packing
+    bool keep_slots
+    // never replace a used channel; only fill empty ones
+    bool fill_empty
+
+ApplyOptions default_apply():
+    return ApplyOptions(start: -1, keep_slots: false, fill_empty: false)
+
+// The model's power index for `want`, and whether it is exact. NONE takes
+// the model's first level (index 0).
+(i64 index, bool exact) map_power(^const Model m, Level want):
+    i64 n = power_count(m)
+    if n == 0:
+        return (0, true)
+    if want == Level.NONE:
+        return (0, true)
+    for i in 0..<n:
+        if model_level(m, i) == want:
+            return (i, true)
+    // nearest: step down first (less power is the conservative change),
+    // then up
+    i32 w = i32(want)
+    for d in 1..<4:
+        for i in 0..<n:
+            if i32(model_level(m, i)) == w - i32(d):
+                return (i, false)
+        for i in 0..<n:
+            if i32(model_level(m, i)) == w + i32(d):
+                return (i, false)
+    return (0, false)
+
+private bool char_ok(^const Model m, char8 ch):
+    if #len(m^.charset) == 0:
+        return ch >= ' ' && ch <= '~'
+    return strings.has_byte(m^.charset, ch)
+
+private char8 fit_char(^const Model m, char8 ch):
+    if char_ok(m, ch):
+        return ch
+    if ch >= 'a' && ch <= 'z':
+        char8 up = char8(i32(ch) - 32)
+        if char_ok(m, up):
+            return up
+    if char_ok(m, '-'):
+        return '-'
+    return ' '
+
+private bool slot_used(^const Model m, []u8 img, i32 number):
+    i64 idx = channel_index(m, number)
+    if idx < 0:
+        return true
+    return !is_empty_at(m, img, idx)
+
+// Small text scratch for old/new values.
+private type Val:
+    strings.Builder o
+    strings.Builder n
+    void clear(^self):
+        #delete(self.o)
+        #delete(self.n)
+        self.o = strings.builder(32)
+        self.n = strings.builder(32)
+    void free(^self):
+        #delete(self.o)
+        #delete(self.n)
+
+private void emit(^Report rep, ^Val v, Severity sev, DiagCode code, FieldId field, i64 entry, i32 slot):
+    rep^.add(sev, code, field, entry, slot, strings.text(v^.o), strings.text(v^.n))
+    v^.clear()
+
+// Places the list into `img` (an image of model `m`, changed in place) and
+// records every channel's fate in `rep`. With `img` a scratch copy this is
+// also the dry run.
+void apply(^ChannelList l, ^const Model m, []u8 img, ApplyOptions opt, ^Report rep):
+    i32 first = m^.layout.first
+    i32 last = last_number(m)
+    i32 cursor = opt.start if opt.start >= 0 else first
+    ref []bool taken = #make([]bool, i64(m^.layout.count))
+    defer #delete(taken)
+    Val v = Val(o: strings.builder(32), n: strings.builder(32))
+    defer v.free()
+    if !layout_fits(m, img):
+        strings.append(&v.n, "the image does not fit the model")
+        emit(rep, &v, Severity.ERROR, DiagCode.NOT_STORABLE, FieldId.NONE, -1, -1)
+        return
+    for k in 0..<#len(l^.entries):
+        Entry e = l^.entries[k]
+        string8 ename = l^.text(e.name)
+        if e.license.len != 0:
+            strings.append(&v.o, l^.text(e.license))
+            emit(rep, &v, Severity.INFO, DiagCode.LICENSE_NOTE, FieldId.COMMENT, k, -1)
+        // ── where it goes
+        i32 slot = -1
+        if opt.keep_slots && e.slot >= 0:
+            slot = e.slot
+            if slot < first || slot > last:
+                append_int(&v.o, i64(slot))
+                append_int(&v.n, i64(first))
+                strings.append(&v.n, "..")
+                append_int(&v.n, i64(last))
+                emit(rep, &v, Severity.ERROR, DiagCode.SLOT_OUT_OF_RANGE, FieldId.SLOT, k, -1)
+                rep^.skipped += 1
+                continue
+            if taken[i64(slot - first)]:
+                append_int(&v.o, i64(slot))
+                emit(rep, &v, Severity.ERROR, DiagCode.DUPLICATE_SLOT, FieldId.SLOT, k, slot)
+                rep^.skipped += 1
+                continue
+            if opt.fill_empty && slot_used(m, img, slot):
+                append_int(&v.o, i64(slot))
+                emit(rep, &v, Severity.ERROR, DiagCode.SLOT_OCCUPIED, FieldId.SLOT, k, slot)
+                rep^.skipped += 1
+                continue
+        else:
+            for cursor <= last && (taken[i64(cursor - first)] || (opt.fill_empty && slot_used(m, img, cursor))):
+                cursor += 1
+            if cursor > last:
+                append_int(&v.o, i64(m^.layout.count))
+                strings.append(&v.o, " channels")
+                emit(rep, &v, Severity.ERROR, DiagCode.NO_FREE_SLOT, FieldId.SLOT, k, -1)
+                rep^.skipped += 1
+                continue
+            slot = cursor
+        // ── what it becomes
+        Channel c = empty_channel(slot)
+        c.empty = false
+        c.rx_hz = e.rx_hz
+        c.tx_hz = e.tx_hz
+        c.rx_tone = e.rx_tone
+        c.tx_tone = e.tx_tone
+        c.scan = e.scan
+        c.bcl = e.bcl
+        c.mode = e.mode
+        bool changed = false
+        if c.rx_hz % 10 != 0:
+            append_mhz(&v.o, c.rx_hz)
+            c.rx_hz = (c.rx_hz + 5) / 10 * 10
+            append_mhz(&v.n, c.rx_hz)
+            emit(rep, &v, Severity.WARNING, DiagCode.FREQ_ROUNDED, FieldId.RX, k, slot)
+            changed = true
+        if c.tx_hz > 0 && c.tx_hz % 10 != 0:
+            append_mhz(&v.o, c.tx_hz)
+            c.tx_hz = (c.tx_hz + 5) / 10 * 10
+            append_mhz(&v.n, c.tx_hz)
+            emit(rep, &v, Severity.WARNING, DiagCode.FREQ_ROUNDED, FieldId.TX, k, slot)
+            changed = true
+        if !in_band_list(m^.rx_bands, c.rx_hz):
+            append_mhz(&v.o, c.rx_hz)
+            strings.append(&v.n, m^.rx_bands)
+            emit(rep, &v, Severity.ERROR, DiagCode.RX_OUT_OF_BAND, FieldId.RX, k, -1)
+            rep^.skipped += 1
+            continue
+        if c.tx_hz >= 0 && !in_band_list(m^.tx_bands, c.tx_hz):
+            append_mhz(&v.o, c.tx_hz)
+            strings.append(&v.n, "off")
+            emit(rep, &v, Severity.WARNING, DiagCode.TX_OUT_OF_BAND, FieldId.TX, k, slot)
+            c.tx_hz = -1
+            changed = true
+        // mode
+        bool am_here = has_mode(m, "AM") && #len(m^.am_bands) != 0 && in_band_list(m^.am_bands, c.rx_hz)
+        if am_here && c.mode != Mode.AM:
+            strings.append(&v.o, mode_name(c.mode))
+            strings.append(&v.n, "AM")
+            emit(rep, &v, Severity.WARNING, DiagCode.MODE_CHANGED, FieldId.MODE, k, slot)
+            c.mode = Mode.AM
+            changed = true
+        else if !am_here && c.mode == Mode.AM:
+            strings.append(&v.o, "AM")
+            strings.append(&v.n, "FM")
+            emit(rep, &v, Severity.WARNING, DiagCode.MODE_CHANGED, FieldId.MODE, k, slot)
+            c.mode = Mode.FM
+            changed = true
+        // tones
+        if !tone_storable(c.rx_tone):
+            append_tone(&v.o, c.rx_tone)
+            strings.append(&v.n, "off")
+            emit(rep, &v, Severity.WARNING, DiagCode.TONE_UNSUPPORTED, FieldId.RX_TONE, k, slot)
+            c.rx_tone = Tone(kind: ToneKind.OFF, value: 0, inverted: false)
+            changed = true
+        if !tone_storable(c.tx_tone):
+            append_tone(&v.o, c.tx_tone)
+            strings.append(&v.n, "off")
+            emit(rep, &v, Severity.WARNING, DiagCode.TONE_UNSUPPORTED, FieldId.TX_TONE, k, slot)
+            c.tx_tone = Tone(kind: ToneKind.OFF, value: 0, inverted: false)
+            changed = true
+        // power
+        (i64 pi, bool exact) = map_power(m, e.power)
+        c.power = i32(pi)
+        if !exact:
+            strings.append(&v.o, level_name(e.power))
+            strings.append(&v.n, power_name(m, pi))
+            emit(rep, &v, Severity.WARNING, DiagCode.POWER_MAPPED, FieldId.POWER, k, slot)
+            changed = true
+        // name
+        i64 width = name_width(m)
+        i64 n = #len(ename)
+        if n > width:
+            n = width
+        if n > NAME_MAX:
+            n = NAME_MAX
+        bool bad_chars = false
+        for i in 0..<n:
+            char8 ch = fit_char(m, ename[i])
+            if ch != ename[i]:
+                bad_chars = true
+            c.name[i] = ch
+        c.name_len = n
+        for c.name_len > 0 && c.name[c.name_len - 1] == ' ':
+            c.name_len -= 1
+        if #len(ename) > width:
+            strings.append(&v.o, ename)
+            strings.append(&v.n, channel_name(&c))
+            emit(rep, &v, Severity.WARNING, DiagCode.NAME_TRUNCATED, FieldId.NAME, k, slot)
+            changed = true
+        if bad_chars:
+            strings.append(&v.o, ename)
+            strings.append(&v.n, channel_name(&c))
+            emit(rep, &v, Severity.WARNING, DiagCode.NAME_CHARS, FieldId.NAME, k, slot)
+            changed = true
+        // final guard: anything the radio still cannot store
+        [12]Issue issues
+        i64 ni = validate_channel(m, &c, issues[:])
+        if ni > 0:
+            strings.append(&v.n, issue_message(issues[0]))
+            emit(rep, &v, Severity.ERROR, DiagCode.NOT_STORABLE, FieldId.NONE, k, slot)
+            rep^.skipped += 1
+            continue
+        try encode_channel(m, img, &c) else:
+            strings.append(&v.n, "the image could not take it")
+            emit(rep, &v, Severity.ERROR, DiagCode.NOT_STORABLE, FieldId.NONE, k, slot)
+            rep^.skipped += 1
+            continue
+        taken[i64(slot - first)] = true
+        append_int(&v.n, i64(slot))
+        emit(rep, &v, Severity.INFO, DiagCode.PLACED, FieldId.SLOT, k, slot)
+        rep^.placed += 1
+        if changed:
+            rep^.changed += 1
+
+// The report as text lines for a terminal or a log. The caller #deletes it.
+ref []char8 report_text(^ChannelList l, ^Report rep, bool with_info):
+    strings.Builder b = strings.builder(1024)
+    for d in rep^.diags:
+        if d.severity == Severity.INFO && !with_info:
+            continue
+        strings.append(&b, severity_name(d.severity))
+        strings.append(&b, ": ")
+        if d.entry >= 0:
+            strings.append(&b, "#")
+            append_int(&b, d.entry + 1)
+            strings.append(&b, " ")
+            Entry e = l^.entries[d.entry]
+            string8 nm = l^.text(e.name)
+            if #len(nm) != 0:
+                strings.append(&b, nm)
+                strings.append(&b, " ")
+            strings.append(&b, "(")
+            append_mhz(&b, e.rx_hz)
+            strings.append(&b, "): ")
+        diag_message(rep, d, &b)
+        strings.append_char(&b, '\n')
+    strings.append(&b, "placed ")
+    append_int(&b, i64(rep^.placed))
+    strings.append(&b, ", changed ")
+    append_int(&b, i64(rep^.changed))
+    strings.append(&b, ", skipped ")
+    append_int(&b, i64(rep^.skipped))
+    strings.append_char(&b, '\n')
+    return strings.finish(&b)

@@ -1,0 +1,115 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Memory images on disk: raw bytes exactly as downloaded (the same bytes the
+// Python probes dumped). A CHIRP .img is accepted too: its metadata trailer
+// (b"\x00\xffchirp\xeeimg\x00\x01" + base64 JSON) is dropped on load.
+package radio
+
+import "core:os/fs"
+import "core:strings"
+
+distinct enum i32 ImageError:
+    // the file could not be read
+    READ = 1,
+    // the file could not be written
+    WRITE = 2,
+
+private const [10]u8 CHIRP_MAGIC = (0x00, 0xFF, 0x63, 0x68, 0x69, 0x72, 0x70, 0xEE, 0x69, 0x6D)
+
+// Where a CHIRP metadata trailer starts, or #len(data) when there is none.
+i64 chirp_trailer_at([]u8 data):
+    i64 n = #len(data)
+    i64 m = #len(CHIRP_MAGIC)
+    i64 i = 0
+    for i + m <= n:
+        bool hit = true
+        for j in 0..<m:
+            if data[i + j] != CHIRP_MAGIC[j]:
+                hit = false
+                break
+        if hit:
+            return i
+        i += 1
+    return n
+
+// Reads an image file. The caller #deletes it.
+ImageError!ref []u8 load_image(string8 file):
+    try ref []u8 data = fs.read_bytes(file) else:
+        fail ImageError.READ
+    i64 cut = chirp_trailer_at(data)
+    if cut < #len(data):
+        ref []u8 out = #make([]u8, cut)
+        for i in 0..<cut:
+            out[i] = data[i]
+        #delete(data)
+        return out
+    return data
+
+ImageError!void save_image(string8 file, []u8 img):
+    try fs.write_bytes(file, img) else:
+        fail ImageError.WRITE
+
+// A fresh copy of `img`. The caller #deletes it.
+ref []u8 copy_image([]u8 img):
+    ref []u8 out = #make([]u8, #len(img))
+    for i in 0..<#len(img):
+        out[i] = img[i]
+    return out
+
+bool images_equal([]u8 a, []u8 b):
+    if #len(a) != #len(b):
+        return false
+    for i in 0..<#len(a):
+        if a[i] != b[i]:
+            return false
+    return true
+
+// ── choosing a model ─────────────────────────────────────────────────────────
+
+// The model answering to `name` (id, name or alias), or -1.
+i64 find_model([]Model models, string8 name):
+    for i in 0..<#len(models):
+        if answers_to(&models[i], name):
+            return i
+    return -1
+
+// How well `img` fits model `m`: -1 = not at all (wrong size); else lower
+// is better: 0 basetype match + tested, 1 basetype match, 2 tested, 3 size only.
+i32 image_match_score(^const Model m, []u8 img):
+    if m^.image_size != #len(img):
+        return -1
+    i32 s = 0
+    if m^.engine == "uv5r" && !basetype_matches(m, img):
+        s += 2
+    else if m^.engine != "uv5r":
+        s += 2
+    if m^.tested == Tested.UNTESTED:
+        s += 1
+    return s
+
+// Indices of the models `img` fits, appended to `into`, best first (see
+// image_match_score).
+ref []i64 models_for_image([]Model models, []u8 img, ref []i64 into):
+    ref []i64 out = into
+    for pass in 0..<4:
+        for i in 0..<#len(models):
+            if image_match_score(&models[i], img) == i32(pass):
+                out = #append(out, i)
+    return out
+
+// Whether the image's firmware tag (CHIRP _fw_ver_file_start..stop) holds one
+// of the model's basetypes.
+bool basetype_matches(^const Model m, []u8 img):
+    if #len(img) < 0x1846 || #len(m^.basetype) == 0:
+        return false
+    string8 tag = string8(img[0x1838..<0x1846])
+    for i in 0..<word_count(m^.basetype):
+        string8 bt = word_at(m^.basetype, i)
+        // INI words cannot hold spaces; `_` stands for one (BFP3V3 B)
+        ref []char8 want = strings.replace(bt, "_", " ")
+        bool hit = strings.contains(tag, want)
+        #delete(want)
+        if hit:
+            return true
+    return false

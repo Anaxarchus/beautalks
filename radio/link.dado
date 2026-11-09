@@ -1,0 +1,100 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The narrow interface between the radio core and protocol engines. An
+// engine (uv17pro.dado, uv5r.dado, or a scripted driver later) needs only
+// these: a byte link, the model definition's values, and a progress callback.
+// It answers the image bytes on download and takes them on upload.
+package radio
+
+// A byte pipe to the radio: a serial port, a pty in tests, or anything else.
+trait Link:
+    // writes every byte of `data`
+    !void send(^self, []u8 data)
+    // reads into `into` until it is full or `timeout_ms` passes; answers the count
+    !i64 recv(^self, []u8 into, i32 timeout_ms)
+    // reads one byte; -1 on timeout
+    i32 recv_byte(^self, i32 timeout_ms)
+    void sleep_ms(^self, i32 ms)
+    // throws away anything received and not yet read
+    void discard(^self)
+
+// Called as a transfer goes: `done` of `total` bytes, plus the context the
+// caller passed in. May be nil.
+type ProgressFn: void(rawptr, i64, i64)
+
+type Progress:
+    ProgressFn fn
+    rawptr ctx
+
+Progress no_progress():
+    return Progress(fn: nil, ctx: nil)
+
+void report(Progress p, i64 done, i64 total):
+    if p.fn != nil:
+        p.fn(p.ctx, done, total)
+
+// Why a transfer with the radio failed. Every engine fails with these.
+// The numbers are a stable API shared with scripted drivers (driverhost):
+// never renumber; add new codes at the end. 20-22 are reserved for the
+// driver host's own codes.
+distinct enum i32 LinkError:
+    // the link could not be written or read
+    IO = 1,
+    // the radio did not answer (wrong model, cable, radio off)
+    NO_ANSWER = 2,
+    // the radio answered something unexpected
+    BAD_REPLY = 3,
+    // the radio refused a block or a write
+    REFUSED = 4,
+    // the image does not belong to this radio (CHIRP's upload guards)
+    IMAGE_MISMATCH = 5,
+    // the model definition is not tested for writing, and no override was given
+    UNTESTED = 6,
+    // the model definition lacks something the engine needs
+    BAD_MODEL = 7,
+    // the image is the wrong size for the model
+    IMAGE_SIZE = 8,
+    // the backup of the radio could not be saved, so nothing was written
+    BACKUP = 9,
+    // the radio's memory read back after writing differs from the image
+    VERIFY = 10,
+
+string8 link_error_message(LinkError e):
+    switch e:
+        case LinkError.IO:
+            return "the link to the radio failed (cable unplugged?)"
+        case LinkError.NO_ANSWER:
+            return "the radio did not answer"
+        case LinkError.BAD_REPLY:
+            return "the radio answered something unexpected"
+        case LinkError.REFUSED:
+            return "the radio refused the transfer"
+        case LinkError.IMAGE_MISMATCH:
+            return "the image is not compatible with this radio"
+        case LinkError.UNTESTED:
+            return "writing to this model is not tested; refused"
+        case LinkError.BAD_MODEL:
+            return "the model definition is incomplete"
+        case LinkError.IMAGE_SIZE:
+            return "the image size does not match the model"
+        case LinkError.BACKUP:
+            return "the backup of the radio could not be saved; nothing was written"
+        case LinkError.VERIFY:
+            return "read-back after writing does not match the image"
+        else:
+            return "unknown error"
+
+// Reads exactly #len(into) bytes or fails NO_ANSWER (nothing came) /
+// BAD_REPLY (some came).
+LinkError!void recv_exact(^Link link, []u8 into, i32 timeout_ms):
+    try i64 n = link.recv(into, timeout_ms) else:
+        fail LinkError.IO
+    if n == 0:
+        fail LinkError.NO_ANSWER
+    if n != #len(into):
+        fail LinkError.BAD_REPLY
+
+LinkError!void send_all(^Link link, []u8 data):
+    try link.send(data) else:
+        fail LinkError.IO

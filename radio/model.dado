@@ -1,0 +1,452 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Model definitions: one INI file per radio model, in the `models/` folder. A
+// model definition names the protocol engine that talks to the radio and gives every
+// constant that engine needs, plus where each channel attribute lives in the
+// memory image. Adding a model inside a known family is writing one of these.
+package radio
+
+import "core:cfg"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:strings/parse"
+
+// How one channel attribute is stored.
+distinct enum i32 Codec:
+    NONE = 0,
+    // little-endian BCD, `width` bytes, in units of 10 Hz
+    LBCD = 1,
+    // Baofeng 16-bit tone word (see decode_tone_bf)
+    TONE_BF = 2,
+    // `width` bits starting at bit `bit` of one byte
+    BITS = 3,
+    // `width` bytes of text, padded with 0xFF (or 0x00 / spaces)
+    TEXT = 4,
+
+// Where an attribute lives. Its address in the image is
+// table + index * stride + offset, where table/stride default to the
+// channel array's own start and stride. `invert` flips a one-bit field
+// (a "narrow" bit read as "wide").
+type Field:
+    i64 offset
+    Codec codec
+    i32 bit
+    i32 width
+    i64 table
+    i64 stride
+    bool invert
+
+// The channel array.
+type Layout:
+    i32 count
+    i32 first
+    i64 start
+    i64 stride
+    i64 empty_at
+    u8 empty_byte
+    string8 blank_hex
+    Field rx
+    Field tx
+    Field rx_tone
+    Field tx_tone
+    Field power
+    Field wide
+    Field scan
+    Field bcl
+    Field name
+
+distinct enum i32 Tested:
+    UNTESTED = 0,
+    READ = 1,
+    WRITE = 2,
+
+// One radio model. The string8 fields view text owned by the definition's
+// Config, which lives for the whole run.
+type Model:
+    string8 id
+    string8 file
+    string8 vendor
+    string8 name
+    string8 aliases
+    string8 engine
+    string8 source
+    string8 notes
+    Tested tested
+    i32 baud
+    // uv17pro: space-separated PROGRAM... idents
+    string8 ident
+    // space-separated `hex:..[/replylen]` magics
+    string8 magics
+    // uv17pro: scramble key, `hex:...` or `none`
+    string8 key
+    i32 block
+    // uv17pro: `0x0000+0x8040 ...` radio regions concatenated into the image
+    string8 regions
+    // uv5r: whether the radio has the aux block at 0x1EC0
+    bool aux
+    // uv5r: `bfb` (image is "original" when its firmware tag says BFB < 291) or `never`
+    string8 orig_check
+    // uv5r: CHIRP _basetype strings (space separated) matched in the image firmware tag
+    string8 basetype
+    string8 model_reply
+    string8 ident_reply
+    string8 powers
+    // hardware band limits in MHz, e.g. `136-174 400-520`: where the radio
+    // transmits (tx_bands) and receives (rx_bands, defaults to tx_bands)
+    string8 tx_bands
+    string8 rx_bands
+    // receive ranges the radio demodulates as AM (airband), e.g. `108-136`
+    string8 am_bands
+    // modes the radio offers, e.g. `FM,NFM` or `FM,NFM,AM`
+    string8 modes
+    // characters the radio's name field accepts (empty = printable ASCII)
+    string8 charset
+    i64 image_size
+    Layout layout
+
+private ref [](cfg.Config) g_configs
+
+// ── parsing helpers ──────────────────────────────────────────────────────────
+
+// A number written as decimal or 0x-hex; `fallback` when absent or bad.
+i64 parse_num(string8 s, i64 fallback):
+    string8 t = strings.trim(s)
+    if #len(t) == 0:
+        return fallback
+    if strings.starts_with(t, "0x") || strings.starts_with(t, "0X"):
+        string8 h = t[2..<#len(t)]
+        try i64 v = parse.to_i64(h, 16) else:
+            return fallback
+        return v
+    try i64 v = parse.to_i64(t) else:
+        return fallback
+    return v
+
+i32 hex_digit(char8 c):
+    if c >= '0' && c <= '9':
+        return i32(c - '0')
+    if c >= 'a' && c <= 'f':
+        return i32(c - 'a') + 10
+    if c >= 'A' && c <= 'F':
+        return i32(c - 'A') + 10
+    return -1
+
+// Decodes "hex:4D50" or plain text into `into`; answers the byte count, or -1.
+i64 decode_bytes(string8 spec, []u8 into):
+    string8 s = strings.trim(spec)
+    if strings.starts_with(s, "hex:"):
+        string8 h = s[4..<#len(s)]
+        i64 n = 0
+        i64 i = 0
+        for i < #len(h):
+            if h[i] == ' ':
+                i += 1
+                continue
+            if i + 1 >= #len(h):
+                return -1
+            i32 a = hex_digit(h[i])
+            i32 b = hex_digit(h[i + 1])
+            if a < 0 || b < 0 || n >= #len(into):
+                return -1
+            into[n] = u8(a * 16 + b)
+            n += 1
+            i += 2
+        return n
+    if #len(s) > #len(into):
+        return -1
+    for i in 0..<#len(s):
+        into[i] = u8(s[i])
+    return #len(s)
+
+// The `i`th space-separated word of `list`, or "" when there are fewer.
+string8 word_at(string8 list, i64 i):
+    i64 n = 0
+    string8 piece
+    strings.Splitter it = strings.splitter(list, " ")
+    for strings.split_next(&it, &piece):
+        if #len(piece) == 0:
+            continue
+        if n == i:
+            return piece
+        n += 1
+    return ""
+
+i64 word_count(string8 list):
+    i64 n = 0
+    string8 piece
+    strings.Splitter it = strings.splitter(list, " ")
+    for strings.split_next(&it, &piece):
+        if #len(piece) != 0:
+            n += 1
+    return n
+
+// One magic of a `magics` list: its bytes into `into` (count answered, -1
+// when absent or bad) and the reply length written after a `/` (1 if none).
+(i64 n, i64 reply) magic_at(string8 list, i64 i, []u8 into):
+    string8 w = word_at(list, i)
+    if #len(w) == 0:
+        return (-1, 0)
+    (string8 head, string8 rest, bool found) = strings.split_first(w, "/")
+    i64 reply = 1
+    if found:
+        reply = parse_num(rest, 1)
+    return (decode_bytes(head, into), reply)
+
+// "0 lbcd 4", "14 bits 0 2", "20 text 12", "0 text 7 table 0x1008 16".
+Field parse_field(string8 spec, ^const Layout l):
+    Field f = Field(offset: 0, codec: Codec.NONE, bit: 0, width: 0, table: l^.start, stride: l^.stride, invert: false)
+    string8 s = strings.trim(spec)
+    if #len(s) == 0:
+        return f
+    [8]string8 tok
+    i64 n = 0
+    string8 piece
+    strings.Splitter it = strings.splitter(s, " ")
+    for strings.split_next(&it, &piece):
+        if #len(piece) == 0:
+            continue
+        if n < 8:
+            tok[n] = piece
+            n += 1
+    if n < 2:
+        return f
+    f.offset = parse_num(tok[0], 0)
+    string8 kind = tok[1]
+    i64 next = 2
+    if kind == "lbcd":
+        f.codec = Codec.LBCD
+        f.width = i32(parse_num(tok[2], 4)) if n > 2 else 4
+        next = 3
+    else if kind == "tone_bf":
+        f.codec = Codec.TONE_BF
+        f.width = 2
+    else if kind == "bits":
+        f.codec = Codec.BITS
+        f.bit = i32(parse_num(tok[2], 0)) if n > 2 else 0
+        f.width = i32(parse_num(tok[3], 1)) if n > 3 else 1
+        next = 4
+    else if kind == "text":
+        f.codec = Codec.TEXT
+        f.width = i32(parse_num(tok[2], 7)) if n > 2 else 7
+        next = 3
+    if n >= next + 3 && tok[next] == "table":
+        f.table = parse_num(tok[next + 1], l^.start)
+        f.stride = parse_num(tok[next + 2], l^.stride)
+    return f
+
+private string8 text_of(cfg.Config c, string8 section, string8 key):
+    return strings.trim(cfg.get_string(c, section, key, ""))
+
+// Reads one model definition file. Answers false when it cannot be read.
+bool load_model(string8 file, ^Model into):
+    (cfg.Config c, bool ok, i32 _) = cfg.load(file)
+    if !ok:
+        return false
+    g_configs = #append(g_configs, c)
+    // keep a copy of the file name the definition can view for the whole run
+    cfg.set_string(&g_configs[#len(g_configs) - 1], "_beautalks", "file", file)
+    cfg.Config k = g_configs[#len(g_configs) - 1]
+    Model p
+    p.file = text_of(k, "_beautalks", "file")
+    p.id = strings.trim_suffix(path.base(p.file), ".ini")
+    p.vendor = text_of(k, "model", "vendor")
+    p.name = text_of(k, "model", "name")
+    p.aliases = text_of(k, "model", "aliases")
+    p.engine = text_of(k, "model", "engine")
+    p.source = text_of(k, "model", "source")
+    p.notes = text_of(k, "model", "notes")
+    string8 t = text_of(k, "model", "tested")
+    p.tested = Tested.UNTESTED
+    if t == "write":
+        p.tested = Tested.WRITE
+    else if t == "read":
+        p.tested = Tested.READ
+    p.baud = i32(parse_num(text_of(k, "link", "baud"), 9600))
+    p.ident = text_of(k, "link", "ident")
+    p.magics = text_of(k, "link", "magics")
+    p.key = text_of(k, "link", "key")
+    p.block = i32(parse_num(text_of(k, "link", "block"), 0x40))
+    p.regions = text_of(k, "link", "regions")
+    p.aux = text_of(k, "link", "aux") != "no"
+    p.orig_check = text_of(k, "link", "orig_check")
+    p.basetype = text_of(k, "link", "basetype")
+    p.model_reply = text_of(k, "detect", "model_reply")
+    p.ident_reply = text_of(k, "detect", "ident_reply")
+    p.powers = text_of(k, "channels", "powers")
+    p.tx_bands = text_of(k, "channels", "tx_bands")
+    p.rx_bands = text_of(k, "channels", "rx_bands")
+    if #len(p.rx_bands) == 0:
+        p.rx_bands = p.tx_bands
+    p.am_bands = text_of(k, "channels", "am_bands")
+    p.modes = text_of(k, "channels", "modes")
+    if #len(p.modes) == 0:
+        p.modes = "FM,NFM"
+    p.charset = text_of(k, "channels", "charset")
+
+    Layout l
+    l.count = i32(parse_num(text_of(k, "channels", "count"), 0))
+    l.first = i32(parse_num(text_of(k, "channels", "first"), 1))
+    l.start = parse_num(text_of(k, "channels", "start"), 0)
+    l.stride = parse_num(text_of(k, "channels", "stride"), 16)
+    l.empty_at = parse_num(text_of(k, "channels", "empty_at"), 0)
+    l.empty_byte = u8(parse_num(text_of(k, "channels", "empty_byte"), 0xFF))
+    l.blank_hex = text_of(k, "channels", "blank")
+    l.rx = parse_field(text_of(k, "channels", "rx"), &l)
+    l.tx = parse_field(text_of(k, "channels", "tx"), &l)
+    l.rx_tone = parse_field(text_of(k, "channels", "rx_tone"), &l)
+    l.tx_tone = parse_field(text_of(k, "channels", "tx_tone"), &l)
+    l.power = parse_field(text_of(k, "channels", "power"), &l)
+    string8 narrow = text_of(k, "channels", "narrow")
+    if #len(narrow) != 0:
+        l.wide = parse_field(narrow, &l)
+        l.wide.invert = true
+    else:
+        l.wide = parse_field(text_of(k, "channels", "wide"), &l)
+    l.scan = parse_field(text_of(k, "channels", "scan"), &l)
+    l.bcl = parse_field(text_of(k, "channels", "bcl"), &l)
+    l.name = parse_field(text_of(k, "channels", "name"), &l)
+    p.layout = l
+    p.image_size = compute_image_size(&p)
+    into^ = p
+    return true
+
+// Loads every *.ini in `dir`, sorted by file name.
+ref []Model load_models(string8 dir):
+    ref []Model out = #make([]Model, 0)
+    try fs.Listing ls = fs.read_dir(dir) else:
+        return out
+    defer ls.destroy()
+    ref []string8 names = #make([]string8, 0)
+    defer #delete(names)
+    for e in ls.entries:
+        if strings.ends_with(e.path, ".ini") && !e.is_dir:
+            names = #append(names, e.path)
+    // insertion sort by base name keeps the order stable across systems
+    for i in 1..<#len(names):
+        i64 j = i
+        for j > 0 && strings.before(path.base(names[j]), path.base(names[j - 1])):
+            string8 tmp = names[j]
+            names[j] = names[j - 1]
+            names[j - 1] = tmp
+            j -= 1
+    for n in names:
+        ref []char8 full = path.join(dir, path.base(n))
+        Model p
+        if load_model(full, &p):
+            out = #append(out, p)
+        #delete(full)
+    return out
+
+// The power level names, e.g. "High, Low, Medium" -> index `i`'s name.
+string8 power_name(^const Model p, i64 i):
+    i64 n = 0
+    string8 piece
+    strings.Splitter it = strings.splitter(p^.powers, ",")
+    for strings.split_next(&it, &piece):
+        if n == i:
+            return strings.trim(piece)
+        n += 1
+    return "?"
+
+i64 power_count(^const Model p):
+    string8 t = strings.trim(p^.powers)
+    if #len(t) == 0:
+        return 0
+    return strings.count(t, ",") + 1
+
+// Index of a power name (case-insensitive), or -1. "Mid", "Med" and
+// "Medium" are one level.
+i64 power_index(^const Model p, string8 name):
+    i64 n = 0
+    string8 want = strings.trim(name)
+    string8 piece
+    strings.Splitter it = strings.splitter(p^.powers, ",")
+    for strings.split_next(&it, &piece):
+        string8 have = strings.trim(piece)
+        if strings.equal_fold(have, want):
+            return n
+        if is_mid(have) && is_mid(want):
+            return n
+        n += 1
+    return -1
+
+private bool is_mid(string8 s):
+    return strings.equal_fold(s, "mid") || strings.equal_fold(s, "med") || strings.equal_fold(s, "medium")
+
+// Whether `name` is this model's id, name, vendor+name or one of its aliases.
+bool answers_to(^const Model p, string8 name):
+    string8 want = strings.trim(name)
+    if strings.equal_fold(p^.name, want) || strings.equal_fold(p^.id, want):
+        return true
+    string8 piece
+    strings.Splitter it = strings.splitter(p^.aliases, ",")
+    for strings.split_next(&it, &piece):
+        if strings.equal_fold(strings.trim(piece), want):
+            return true
+    return false
+
+// The size in bytes of this model's memory image.
+i64 compute_image_size(^const Model p):
+    if p^.engine == "uv5r":
+        // CHIRP: 8-byte ident + main 0x1800, + aux 0x140 when the radio has it
+        return 8 + 0x1800 + (0x140 if p^.aux else 0)
+    i64 total = 0
+    string8 piece
+    strings.Splitter it = strings.splitter(p^.regions, " ")
+    for strings.split_next(&it, &piece):
+        (string8 _, string8 len, bool found) = strings.split_first(piece, "+")
+        if found:
+            total += parse_num(len, 0)
+    return total
+
+// Region `i` of a `regions` list as (radio address, length); (-1, 0) past the end.
+(i64 addr, i64 len) region_at(^const Model p, i64 i):
+    string8 w = word_at(p^.regions, i)
+    if #len(w) == 0:
+        return (-1, 0)
+    (string8 a, string8 l, bool found) = strings.split_first(w, "+")
+    if !found:
+        return (-1, 0)
+    return (parse_num(a, -1), parse_num(l, 0))
+
+// Band `i` of a band list (`136-174 400-520`, MHz) in Hz as (low, high);
+// (-1, -1) past the end.
+(i64 lo, i64 hi) band_at(string8 bands, i64 i):
+    string8 w = word_at(bands, i)
+    if #len(w) == 0:
+        return (-1, -1)
+    (string8 a, string8 b, bool found) = strings.split_first(w, "-")
+    if !found:
+        return (-1, -1)
+    i64 lo = parse_mhz(a)
+    i64 hi = parse_mhz(b)
+    return (lo, hi)
+
+// Whether `hz` is inside one of the bands of a band list. An empty list
+// accepts everything.
+bool in_band_list(string8 bands, i64 hz):
+    i64 n = word_count(bands)
+    if n == 0:
+        return true
+    for i in 0..<n:
+        (i64 lo, i64 hi) = band_at(bands, i)
+        if lo >= 0 && hz >= lo && hz <= hi:
+            return true
+    return false
+
+// Whether the model lists `mode` (e.g. "AM") among its modes.
+bool has_mode(^const Model p, string8 mode):
+    string8 piece
+    strings.Splitter it = strings.splitter(p^.modes, ",")
+    for strings.split_next(&it, &piece):
+        if strings.equal_fold(strings.trim(piece), mode):
+            return true
+    return false
+
+// The longest name the model stores.
+i64 name_width(^const Model p):
+    if p^.layout.name.codec != Codec.TEXT:
+        return 0
+    return i64(p^.layout.name.width)

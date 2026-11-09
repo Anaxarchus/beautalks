@@ -1,0 +1,297 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The UV-5R family protocol (Baofeng UV-5R/UV-5RE, BF-F8HP, UV-82, UV-6, ...),
+// ported from CHIRP's uv5r.py (_do_ident, _read_block, _do_download,
+// _send_block, _do_upload). 9600 8N1.
+//   ident: magic one byte at a time 10 ms apart -> 06; 02 -> 8-byte ident
+//          (or 12, compacted); 06 -> 06
+//   read:  53 aH aL len -> [06 unless first] 58 aH aL len + data; we ack 06
+//   write: 58 aH aL len + data -> 06
+// Image = ident(8) + main 0x0000..0x1800 [+ aux 0x1EC0..0x2000].
+//
+// Engine code depends only on Link, Model and Progress (see link.dado).
+package radio
+
+const i64 UV5R_MAIN = 0x1800
+const i64 UV5R_AUX_START = 0x1EC0
+const i64 UV5R_AUX_END = 0x2000
+
+// Sends one magic and, when the radio acks it, reads the ident.
+// `second_ack` sends the closing 06 and wants 06 back (CHIRP secondack).
+LinkError!void uv5r_try_magic(^Link link, []u8 magic, bool second_ack, ^[8]u8 ident):
+    for i in 0..<#len(magic):
+        try send_all(link, magic[i..<i + 1])
+        link.sleep_ms(10)
+    i32 ack = link.recv_byte(1000)
+    if ack < 0:
+        fail LinkError.NO_ANSWER
+    if ack != 0x06:
+        fail LinkError.BAD_REPLY
+    [1]u8 two = [0x02]
+    try send_all(link, two[:])
+    [12]u8 resp
+    i64 n = 0
+    for n < 12:
+        i32 b = link.recv_byte(1000)
+        if b < 0:
+            break
+        resp[n] = u8(b)
+        n += 1
+        if b == 0xDD:
+            break
+    if n == 12:
+        // CHIRP: 12-byte idents are compacted to 8
+        ident^[0] = resp[0]
+        ident^[1] = resp[3]
+        ident^[2] = resp[5]
+        for k in 0..<5:
+            ident^[3 + k] = resp[7 + k]
+    else if n == 8:
+        for k in 0..<8:
+            ident^[k] = resp[k]
+    else:
+        fail LinkError.BAD_REPLY
+    if second_ack:
+        [1]u8 six = [0x06]
+        try send_all(link, six[:])
+        if link.recv_byte(1000) != 0x06:
+            fail LinkError.REFUSED
+
+// CHIRP _ident_radio: each of the model's magics in turn, 2 s apart after a
+// failure.
+LinkError!void uv5r_ident(^Link link, ^const Model m, ^[8]u8 ident):
+    i64 n = word_count(m^.magics)
+    if n == 0:
+        fail LinkError.BAD_MODEL
+    LinkError last = LinkError.NO_ANSWER
+    for i in 0..<n:
+        [16]u8 mb
+        (i64 len, i64 _) = magic_at(m^.magics, i, mb[:])
+        if len <= 0:
+            fail LinkError.BAD_MODEL
+        try uv5r_try_magic(link, mb[0..<len], true, ident) else why:
+            last = why
+            link.sleep_ms(2000)
+            continue
+        return
+    fail last
+
+// CHIRP _read_block.
+LinkError!void uv5r_read_block(^Link link, i64 addr, i64 size, bool first, []u8 into):
+    [4]u8 cmd = (0x53, u8((addr >> 8) & 0xFF), u8(addr & 0xFF), u8(size))
+    try send_all(link, cmd[:])
+    if !first:
+        i32 ack = link.recv_byte(1500)
+        if ack < 0:
+            fail LinkError.NO_ANSWER
+        if ack != 0x06:
+            fail LinkError.REFUSED
+    [4]u8 hdr
+    try recv_exact(link, hdr[:], 1500)
+    if hdr[0] != 0x58 || hdr[1] != cmd[1] || hdr[2] != cmd[2] || hdr[3] != cmd[3]:
+        fail LinkError.BAD_REPLY
+    try recv_exact(link, into[0..<size], 1500)
+    [1]u8 six = [0x06]
+    try send_all(link, six[:])
+    link.sleep_ms(50)
+
+// CHIRP _send_block.
+LinkError!void uv5r_send_block(^Link link, i64 addr, []u8 data):
+    [80]u8 frame
+    i64 n = #len(data)
+    frame[0] = 0x58
+    frame[1] = u8((addr >> 8) & 0xFF)
+    frame[2] = u8(addr & 0xFF)
+    frame[3] = u8(n)
+    for k in 0..<n:
+        frame[4 + k] = data[k]
+    try send_all(link, frame[0..<4 + n])
+    link.sleep_ms(50)
+    i32 ack = link.recv_byte(1500)
+    if ack < 0:
+        fail LinkError.NO_ANSWER
+    if ack != 0x06:
+        fail LinkError.REFUSED
+
+// "BFB" + three digits in `tag` -> that number; -1 when absent; -2 when
+// the digits are not a number (CHIRP raises there).
+i64 bfb_version([]u8 tag):
+    i64 n = #len(tag)
+    for i in 0..<n:
+        if i + 6 <= n && tag[i] == 0x42 && tag[i + 1] == 0x46 && tag[i + 2] == 0x42:
+            i64 v = 0
+            for k in 0..<3:
+                u8 d = tag[i + 3 + k]
+                if d < 0x30 || d > 0x39:
+                    return -2
+                v = v * 10 + i64(d - 0x30)
+            return v
+    return -1
+
+// Downloads after a successful ident. The caller #deletes the image.
+LinkError!ref []u8 uv5r_read(^Link link, ^const Model m, [8]u8 ident, Progress pr):
+    i64 size = m^.image_size
+    ref []u8 img = #make([]u8, size)
+    for k in 0..<8:
+        img[k] = ident[k]
+    [64]u8 blk
+    bool dropped = false
+    if !m^.aux:
+        try uv5r_read_block(link, 0x0000, 0x40, true, blk[:]) else why:
+            #delete(img)
+            fail why
+    else:
+        // radios answer bad aux data unless another block is read first
+        try uv5r_read_block(link, 0x1E80, 0x40, true, blk[:]) else why:
+            #delete(img)
+            fail why
+        try uv5r_read_block(link, 0x1EC0, 0x40, false, blk[:]) else why:
+            #delete(img)
+            fail why
+        try uv5r_read_block(link, 0x1FC0, 0x40, false, blk[:]) else why:
+            #delete(img)
+            fail why
+        // some radios drop the byte at 0x1FCF in 0x40 reads
+        dropped = blk[15] == 0xFF
+    i64 at = 8
+    i64 a = 0
+    for a < UV5R_MAIN:
+        try uv5r_read_block(link, a, 0x40, false, img[at..<at + 0x40]) else why:
+            #delete(img)
+            fail why
+        at += 0x40
+        a += 0x40
+        report(pr, at, size)
+    if m^.aux:
+        a = UV5R_AUX_START
+        for a < UV5R_AUX_END:
+            i64 step = 0x40
+            if dropped && a >= 0x1FC0:
+                step = 0x10
+            try uv5r_read_block(link, a, step, false, img[at..<at + step]) else why:
+                #delete(img)
+                fail why
+            at += step
+            a += step
+            report(pr, at, size)
+    return img
+
+// Identifies and downloads. The caller #deletes the image.
+LinkError!ref []u8 uv5r_download(^Link link, ^const Model m, Progress pr):
+    [8]u8 ident
+    try uv5r_ident(link, m, &ident)
+    return uv5r_read(link, m, ident, pr)
+
+// Whether the image comes from an "original" (pre-BFB291) radio, as the
+// model's CHIRP class decides (_is_orig): `bfb` parses the image's firmware
+// tag, `never` is the subclasses that override it to False.
+LinkError!bool uv5r_image_is_orig(^const Model m, []u8 img):
+    if m^.orig_check != "bfb":
+        return false
+    if #len(img) < 0x1846:
+        return false
+    i64 v = bfb_version(img[0x1838..<0x1846])
+    if v == -2:
+        fail LinkError.IMAGE_MISMATCH
+    return v >= 0 && v < 291
+
+private bool same_bytes([]u8 a, []u8 b):
+    if #len(a) != #len(b):
+        return false
+    for i in 0..<#len(a):
+        if a[i] != b[i]:
+            return false
+    return true
+
+// One address range to upload, in image-or-radio address terms (see use).
+type Range:
+    i64 lo
+    i64 hi
+
+// Uploads `img`, porting CHIRP's guarded _do_upload: the 220 MHz band check,
+// the original/new firmware check, the aux-area comparison and the
+// dropped-byte refusal, and only the default (safe) ranges — never the
+// "all ranges" override. Refused unless the model is tested for writing or
+// the user explicitly confirmed an untested one (`allow_untested`; the
+// caller must still back up first and verify after).
+LinkError!void uv5r_upload(^Link link, ^const Model m, []u8 img, bool allow_untested, Progress pr):
+    if m^.tested != Tested.WRITE && !allow_untested:
+        fail LinkError.UNTESTED
+    if #len(img) != m^.image_size:
+        fail LinkError.IMAGE_SIZE
+    [8]u8 ident
+    try uv5r_ident(link, m, &ident)
+    // 220 MHz radios only take 220 MHz images and the other way round
+    u8 radio_band = ident[3]
+    u8 image_band = img[3]
+    if (image_band == 0x02 || radio_band == 0x02) && image_band != radio_band:
+        fail LinkError.IMAGE_MISMATCH
+    [3]Range main = (Range(0x0008, 0x0CF8), Range(0x0D08, 0x0DF8), Range(0x0E08, 0x1808))
+    [4]Range aux
+    i64 naux = 0
+    if m^.aux:
+        try bool image_orig = uv5r_image_is_orig(m, img)
+        // CHIRP _get_aux_data_from_radio
+        [6][64]u8 b
+        try uv5r_read_block(link, 0x1E80, 0x40, true, b[0][:])
+        try uv5r_read_block(link, 0x1EC0, 0x40, false, b[1][:])
+        try uv5r_read_block(link, 0x1F00, 0x40, false, b[2][:])
+        try uv5r_read_block(link, 0x1F40, 0x40, false, b[3][:])
+        try uv5r_read_block(link, 0x1F80, 0x40, false, b[4][:])
+        try uv5r_read_block(link, 0x1FC0, 0x40, false, b[5][:])
+        bool dropped = b[5][15] == 0xFF
+        i64 rv = bfb_version(b[1][48..<62])
+        if rv == -2:
+            fail LinkError.BAD_REPLY
+        bool radio_orig = rv >= 0 && rv < 291
+        if image_orig != radio_orig:
+            fail LinkError.IMAGE_MISMATCH
+        // area1 = block2 + block3[0:32]; area2 = block3[48:64]; area3 = block4[16:64]
+        [96]u8 area1
+        for k in 0..<64:
+            area1[k] = b[2][k]
+        for k in 0..<32:
+            area1[64 + k] = b[3][k]
+        bool aux_matched = same_bytes(img[0x1848..<0x18A8], area1[:]) && same_bytes(img[0x18B8..<0x18C8], b[3][48..<64]) && same_bytes(img[0x18D8..<0x1908], b[4][16..<64])
+        if dropped && !aux_matched:
+            // "Download from radio, make changes, upload back to the same radio."
+            fail LinkError.IMAGE_MISMATCH
+        if image_orig:
+            aux[0] = Range(0x1EE0, 0x1EF0)
+            aux[1] = Range(0x1FC0, 0x1FE0)
+            naux = 2
+        else if dropped || aux_matched:
+            aux[0] = Range(0x1EC0, 0x2000)
+            naux = 1
+        else:
+            aux[0] = Range(0x1EE0, 0x1EF0)
+            aux[1] = Range(0x1F60, 0x1F70)
+            aux[2] = Range(0x1F80, 0x1F90)
+            aux[3] = Range(0x1FC0, 0x1FD0)
+            naux = 4
+    i64 total = 0
+    for r in main:
+        total += r.hi - r.lo
+    for i in 0..<naux:
+        total += aux[i].hi - aux[i].lo
+    i64 done = 0
+    // main: image offset i goes to radio address i - 8
+    for r in main:
+        i64 i = r.lo
+        for i < r.hi:
+            try uv5r_send_block(link, i - 8, img[i..<i + 0x10])
+            i += 0x10
+            done += 0x10
+            report(pr, done, total)
+    if #len(img) == 0x1808 || !m^.aux:
+        return
+    // aux: radio address i lives at image offset 0x1808 + (i - 0x1EC0)
+    for k in 0..<naux:
+        i64 i = aux[k].lo
+        for i < aux[k].hi:
+            i64 at = 0x1808 + (i - UV5R_AUX_START)
+            try uv5r_send_block(link, i, img[at..<at + 0x10])
+            i += 0x10
+            done += 0x10
+            report(pr, done, total)

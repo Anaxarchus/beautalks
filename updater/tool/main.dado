@@ -1,0 +1,74 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// A small command line over the updater, until the beautalks CLI and GUI call
+// it themselves:
+//   dado run updater/tool -- update [--repo OWNER/REPO] [--tag TAG] [--data DIR]
+//   dado run updater/tool -- rollback [--data DIR]
+//   dado run updater/tool -- where [--data DIR]
+// Test-only: --base URL --proto =file|=http (the app always uses =https).
+package main
+
+import "core:fmt"
+import "core:strings"
+import "core:os"
+import "../../updater"
+
+void progress(rawptr ctx, i64 done, i64 total, string8 what):
+    fmt.println("  [", done, "/", total, "] ", what)
+
+i32 main(i32 argc, ^rawptr argv):
+    []string8 args = os.args(argc, argv)
+    if #len(args) < 2:
+        fmt.println("usage: tool update|rollback|where [--repo OWNER/REPO] [--tag TAG] [--data DIR] [--base URL --proto P]")
+        return 2
+    updater.Config c = updater.default_config()
+    i64 i = 2
+    for i + 1 < #len(args):
+        string8 k = args[i]
+        string8 v = args[i + 1]
+        if k == "--repo":
+            (string8 owner, string8 repo, bool ok) = strings.split_first(v, "/")
+            if !ok || !updater.safe_name(owner) || !updater.safe_name(repo):
+                fmt.println("--repo wants OWNER/REPO")
+                return 2
+            c.owner = owner
+            c.repo = repo
+        else if k == "--tag":
+            if !updater.safe_name(v):
+                fmt.println("bad tag")
+                return 2
+            c.tag = v
+        else if k == "--data":
+            c.data_dir = v
+        else if k == "--base":
+            c.base_url = v
+        else if k == "--proto":
+            c.proto = v
+        else:
+            fmt.println("unknown option ", k)
+            return 2
+        i += 2
+    string8 verb = args[1]
+    if verb == "where":
+        try ref []char8 a = updater.active_dir(c) else:
+            fmt.println("no data directory")
+            return 1
+        fmt.println(a)
+        #delete(a)
+        return 0
+    updater.Report r
+    if verb == "update":
+        updater.Progress p = updater.Progress(fn: progress, ctx: nil)
+        r = updater.update_drivers_with(c, p)
+    else if verb == "rollback":
+        r = updater.rollback(c)
+    else:
+        fmt.println("unknown command ", verb)
+        return 2
+    ref []char8 line = updater.describe(r)
+    fmt.println(line)
+    #delete(line)
+    bool failed = r.status == updater.Status.FAILED
+    r.destroy()
+    return 1 if failed else 0

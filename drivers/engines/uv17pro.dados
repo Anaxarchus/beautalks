@@ -1,0 +1,190 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+// Protocol derived from CHIRP (GPLv3): baofeng_uv17Pro.py.
+//
+// Driver engine (driver API 1) for the Baofeng UV-17Pro family: UV-5RM,
+// UV-17Pro, UV-21Pro, ... Everything model-specific comes from the model's
+// INI, handed in as `model` ("section.key" -> value):
+//   link.ident    the program-mode string (ASCII, or hex:...)
+//   link.magics   space-separated hex:XX/replylen, sent in order after ident
+//   link.key      the 4-byte scramble key (hex:...), empty = no scrambling
+//   link.block    block size (default 0x40)
+//   link.regions  radio address ranges, "0x0000+0x8040 0x9000+0x0040 ..."
+// The image is the regions' data concatenated, descrambled.
+//
+// Compiled with: dadoc --emit=mod drivers/engines/uv17pro.dados -o drivers/engines/uv17pro.js
+// A driver mod imports nothing: `link` (the host's Link) and `model` are all
+// it can reach.
+class Uv17pro
+
+any link = 0
+{string: string} model = {}
+
+// Failure codes, matching radio.LinkError (a class has no const yet).
+int NO_ANSWER = 2
+int BAD_REPLY = 3
+int REFUSED = 4
+int BAD_MODEL = 7
+int IMAGE_SIZE = 8
+
+void init(any l, {string: string} m):
+    link = l
+    model = m
+
+// The driver API this engine implements.
+int api():
+    return 1
+
+// ---- helpers (a mod imports nothing, so each engine carries its own) ----
+
+int hex_digit(string c):
+    string digits = "0123456789abcdef"
+    string lc = c.to_lower()
+    if !digits.contains(lc) || lc.len() != 1:
+        fail Error("bad hex digit '" + c + "'", BAD_MODEL)
+    return digits.index_of(lc)
+
+// "hex:434F" or "434F" -> bytes
+[]byte hex_bytes(string spec):
+    string h = spec.trim()
+    if h.starts_with("hex:"):
+        h = h[4..<h.len()]
+    if h.len() % 2 != 0:
+        fail Error("odd-length hex '" + spec + "'", BAD_MODEL)
+    []byte out = []
+    for i in 0..<(h.len() / 2):
+        out.append(hex_digit(h[2 * i]) * 16 + hex_digit(h[2 * i + 1]))
+    return out
+
+// "0x8040" or "64" -> int
+int number(string text):
+    string t = text.trim().to_lower()
+    if t.starts_with("0x"):
+        int v = 0
+        for i in 2..<t.len():
+            v = v * 16 + hex_digit(t[i])
+        return v
+    return t.to_int()
+
+string need(string key):
+    string v = model.get(key, "")
+    if v.trim().is_empty():
+        fail Error("model definition lacks " + key, BAD_MODEL)
+    return v.trim()
+
+// Words of a space-separated list, empties dropped.
+[]string words(string list):
+    []string out = []
+    for w in list.split(" "):
+        if !w.trim().is_empty():
+            out.append(w.trim())
+    return out
+
+// CHIRP's _crypt: XOR with the 4-byte key, skipping 00, FF, the key byte,
+// its complement, and key bytes that are a space. Its own inverse.
+[]byte crypt([]byte key, []byte data):
+    if key.len() == 0:
+        return data.copy()
+    []byte out = []
+    for b, i in data:
+        int k = key[i % 4]
+        if k != 0x20 && b != 0 && b != 0xFF && b != k && b != (k ~ 0xFF):
+            out.append(b ~ k)
+        else:
+            out.append(b)
+    return out
+
+// ---- protocol ----
+
+[]byte ident_bytes():
+    string id = need("link.ident")
+    if id.starts_with("hex:"):
+        return hex_bytes(id)
+    return id.bytes()
+
+// Program mode + magics. Answers the replies, as text, for detection:
+// "M:<the 'M' magic's reply>" is what [detect] model_reply matches.
+string identify():
+    link.discard()
+    link.write(ident_bytes())
+    []byte ack = link.read(1, 1000)
+    if ack.len() == 0:
+        fail Error("no answer to the program-mode string", NO_ANSWER)
+    if ack[0] != 0x06:
+        fail Error("program mode refused: " + string(ack[0]), BAD_REPLY)
+    string replies = ""
+    for spec in words(model.get("link.magics", "")):
+        []string parts = spec.split("/")
+        if parts.len() != 2:
+            fail Error("bad magic '" + spec + "'", BAD_MODEL)
+        string label = parts[0][4..<parts[0].len()] if parts[0].starts_with("hex:") else parts[0]
+        []byte magic = hex_bytes(parts[0])
+        int want = number(parts[1])
+        link.write(magic)
+        []byte got = link.read(want, 1000)
+        if got.len() != want:
+            fail Error("magic " + label + ": " + string(got.len()) + " of " + string(want) + " bytes", NO_ANSWER)
+        if magic.len() == 1 && magic[0] == 0x4D:
+            replies = replies + "M:" + got.decode_utf8() + "\n"
+        else:
+            replies = replies + label + ":" + string(got.len()) + "\n"
+    return replies
+
+// [[start, length], ...]
+[][]int regions():
+    [][]int out = []
+    for r in words(need("link.regions")):
+        []string p = r.split("+")
+        if p.len() != 2:
+            fail Error("bad region '" + r + "'", BAD_MODEL)
+        out.append([number(p[0]), number(p[1])])
+    return out
+
+int total_size():
+    int n = 0
+    for r in regions():
+        n += r[1]
+    return n
+
+[]byte download():
+    identify()
+    []byte key = hex_bytes(model.get("link.key", ""))
+    int block = number(model.get("link.block", "0x40"))
+    int total = total_size()
+    []byte image = []
+    for r in regions():
+        int addr = r[0]
+        for addr < r[0] + r[1]:
+            link.write([0x52, (addr >> 8) & 0xFF, addr & 0xFF, block])
+            []byte got = link.read(block + 4, 1000)
+            if got.len() != block + 4:
+                fail Error("block " + string(addr) + ": " + string(got.len()) + " bytes", NO_ANSWER)
+            if got[0] != 0x52 || got[1] != ((addr >> 8) & 0xFF) || got[2] != (addr & 0xFF):
+                fail Error("block " + string(addr) + ": bad header", BAD_REPLY)
+            image.append_array(crypt(key, got[4..<got.len()]))
+            addr += block
+            link.progress(image.len(), total)
+    return image
+
+// Untested on hardware (CHIRP's _upload). The host refuses unless the model
+// is tested = write.
+void upload([]byte image):
+    int total = total_size()
+    if image.len() != total:
+        fail Error("image is " + string(image.len()) + " bytes, model wants " + string(total), IMAGE_SIZE)
+    identify()
+    []byte key = hex_bytes(model.get("link.key", ""))
+    int block = number(model.get("link.block", "0x40"))
+    int at = 0
+    for r in regions():
+        int addr = r[0]
+        for addr < r[0] + r[1]:
+            []byte frame = [0x57, (addr >> 8) & 0xFF, addr & 0xFF, block]
+            frame.append_array(crypt(key, image[at..<at + block]))
+            link.write(frame)
+            []byte ack = link.read(1, 1000)
+            if ack.len() != 1 || ack[0] != 0x06:
+                fail Error("block " + string(addr) + " not acknowledged", REFUSED)
+            addr += block
+            at += block
+            link.progress(at, total)
