@@ -299,23 +299,23 @@ distinct enum i32 Issue:
 string8 issue_message(Issue i):
     switch i:
         case Issue.NUMBER:
-            return "channel number out of range"
+            return "Channel number out of range"
         case Issue.RX_BAND:
-            return "receive frequency outside the radio's bands"
+            return "Receive frequency outside the radio's range"
         case Issue.TX_BAND:
-            return "transmit frequency outside the radio's bands"
+            return "Transmit frequency outside the radio's range"
         case Issue.FREQ_STEP:
-            return "frequency is not a multiple of 10 Hz"
+            return "Frequency is not a multiple of 10 Hz"
         case Issue.RX_TONE:
-            return "receive tone cannot be stored"
+            return "Receive tone cannot be stored"
         case Issue.TX_TONE:
-            return "transmit tone cannot be stored"
+            return "Transmit tone cannot be stored"
         case Issue.NAME_LONG:
-            return "name too long"
+            return "Name too long"
         case Issue.NAME_CHARS:
-            return "name has characters the radio cannot show"
+            return "Name has characters the radio cannot show"
         case Issue.POWER:
-            return "no such power level"
+            return "No such power level"
         else:
             return "?"
 

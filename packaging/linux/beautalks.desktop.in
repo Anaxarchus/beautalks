@@ -1,0 +1,15 @@
+# beautalks - radio programming software
+# Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+# install-desktop-entry.sh fills @EXEC@ and @ICON@.
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=beautalks
+GenericName=Radio programmer
+Comment=Program channels on handheld radios
+Exec=@EXEC@ %F
+Icon=@ICON@
+Terminal=false
+Categories=Utility;HamRadio;
+Keywords=radio;baofeng;channels;chirp;ham;
+StartupWMClass=beautalks

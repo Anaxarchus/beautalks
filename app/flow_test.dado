@@ -1,0 +1,338 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The desktop app end to end, headless (btui with no window, jobs run
+// inline), against the pty emulator (tools/emu.py):
+//   UV-5RM: read -> edit in the table by keyboard (name, RX, duplex) and a
+//   tone through the picker's path -> undo/redo -> write (review, confirm,
+//   backup -> write -> verify) -> read again equals the edits; a profile
+//   made from the radio, with an out-of-band and a long-named channel,
+//   applied: the library's diagnostics are shown (skipped / changed).
+//   UV-5RE as an UNTESTED model (a models copy with tested = read): the
+//   write flow stops at "not tested"; guided verification (read + backup,
+//   identical write + compare, "yes, it works") records it locally, and
+//   the write then goes through the gate; a second verification answered
+//   "no" restores the backup.
+package main
+
+import "core:fmt"
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+import btui "../ui"
+import "../radio"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+private bool start_emu(string8 model_ini, string8 image, ^Emu out):
+    if fs.exists("build/appflow.port"):
+        try fs.remove_file("build/appflow.port") else:
+            return false
+    [8]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--port-file", "build/appflow.port")
+    try out^.d = proc.duplex(argv[:]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists("build/appflow.port"):
+            try out^.port = fs.read_file("build/appflow.port") else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+private bool start_emu_extra(string8 model_ini, string8 image, string8 a1, string8 a2, ^Emu out):
+    if fs.exists("build/appflow.port"):
+        try fs.remove_file("build/appflow.port") else:
+            return false
+    [10]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--port-file", "build/appflow.port", a1, a2)
+    try out^.d = proc.duplex(argv[:]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists("build/appflow.port"):
+            try out^.port = fs.read_file("build/appflow.port") else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+private void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        return
+
+private void step():
+    btui.headless_frame(0.05)
+
+private void settle():
+    for _ in 0..<6:
+        step()
+
+private i32 first_used():
+    for i in 0..<doc_count():
+        if !g_doc.rows[i].empty:
+            return i32(i)
+    return -1
+
+private void type_into(i32 row, i32 col, string8 text):
+    btui.set_focus(btui.id("chan"))
+    g_ct.cur_row = row
+    g_ct.cur_col = col
+    step()
+    btui.push_text(text)
+    step()
+    btui.push_key(btui.KEY_ENTER, 0)
+    settle()
+
+// Copy the model definitions, marking `id` as read-tested only.
+private bool models_with_untested(string8 dst, string8 file):
+    if fs.exists(dst):
+        try fs.remove_all(dst) else:
+            return false
+    try fs.make_dirs(dst) else:
+        return false
+    try fs.Listing l = fs.read_dir("models") else:
+        return false
+    for e in l.entries:
+        if !strings.ends_with(e.path, ".ini"):
+            continue
+        try ref []char8 t = fs.read_file(#format("models/", e.path)) else:
+            return false
+        string8 text = t
+        if e.path == file:
+            text = strings.replace(text, "tested = write", "tested = read")
+        try fs.write_file(#format(dst, "/", e.path), text) else:
+            return false
+    return true
+
+i32 test():
+    bool ok = true
+    for d in ["build/appflow_data", "build/appflow_lib"]:
+        if fs.exists(d):
+            try fs.remove_all(d) else:
+                return 1
+    ok = #expect(models_with_untested("build/appflow_models", "uv-5r.ini"), "models copy") && ok
+    using app_keep():
+        g_arg_models = strings.clone("build/appflow_models")
+        g_arg_data = strings.clone("build/appflow_data")
+        g_arg_library = strings.clone("build/appflow_lib")
+    g_headless_test = true
+    g_watch = false
+    g_theme_forced = true
+    btui.set_dark(false)
+    ok = #expect(btui.headless_up(1440.0, 900.0, 1.0, app_frame), "headless up") && ok
+    app_init()
+    ok = #expect(#len(g_models) > 10 && #len(g_sets) > 5, "models and channel library loaded") && ok
+
+    // ── UV-5RM (tested = write) ──
+    Emu e
+    if !start_emu("models/uv-5rm.ini", "testdata/uv5rm.img", &e):
+        _ = #expect(false, "emulator did not start")
+        return 1
+    string8 p = e.port
+    ports_set_one(p, true)
+    settle()
+    // a busy machine (sanitizers, other suites on ptys) can make the first
+    // full detection miss its handshake windows; a person would try again
+    for attempt in 0..<3:
+        start_read(p, "")
+        settle()
+        if g_doc.open:
+            break
+        fmt.eprintln("flow_test: read attempt ", attempt + 1, " failed (err ", g_last_err, " link ", g_last_link, "), again")
+    ok = #expect(g_doc.open && doc_model().id == "uv-5rm", "read opened the UV-5RM (err ", g_last_err, " link ", g_last_link, ")") && ok
+    if !g_doc.open:
+        stop_emu(&e)
+        return 1
+    ok = #expect(fs.exists(g_doc.path), "the read was backed up: ", g_doc.path) && ok
+    ok = #expect(g_page == PAGE_CHANNELS, "the read opens the Channels page") && ok
+    i32 s0 = first_used()
+    ok = #expect(s0 >= 0, "the image has channels") && ok
+    // edits through the table: name, RX, then duplex Plus via the menu
+    type_into(0, 1, "TRUCK1")
+    ok = #expect(radio.channel_name(&g_doc.rows[s0]) == "TRUCK1", "name edited: ", radio.channel_name(&g_doc.rows[s0])) && ok
+    type_into(0, 2, "146.52")
+    ok = #expect(g_doc.rows[s0].rx_hz == 146520000, "RX edited: ", g_doc.rows[s0].rx_hz) && ok
+    btui.set_focus(btui.id("chan"))
+    g_ct.cur_row = 0
+    g_ct.cur_col = 3
+    step()
+    btui.push_key(btui.KEY_SPACE, 0)
+    settle()
+    btui.push_key(btui.KEY_DOWN, 0)
+    step()
+    btui.push_key(btui.KEY_ENTER, 0)
+    settle()
+    ok = #expect(g_doc.rows[s0].tx_hz == 146520000 + 600000, "duplex Plus with the 2 m offset: ", g_doc.rows[s0].tx_hz) && ok
+    channels_set_tone(s0, K_TXT, radio.Tone(kind: radio.ToneKind.CTCSS, value: 1000, inverted: false))
+    // undo and redo
+    ok = #expect(doc_undo() && g_doc.rows[s0].tx_tone.kind == radio.ToneKind.OFF, "undo the tone") && ok
+    ok = #expect(doc_redo() && g_doc.rows[s0].tx_tone.value == 1000, "redo the tone") && ok
+    ok = #expect(changed_count() == 1 && problem_count() == 0, "one changed slot, no problems") && ok
+    // write: review -> confirm -> progress -> result
+    write_flow_open()
+    ok = #expect(g_wf == WF_REVIEW && g_wf_written == 1, "review lists 1 change") && ok
+    go_next_after_review()
+    ok = #expect(g_wf == WF_CONFIRM, "a tested model goes straight to confirm") && ok
+    g_wf_ack = true
+    begin_write()
+    settle()
+    ok = #expect(g_wf == WF_RESULT && g_wf_ok, "written and verified (err ", g_wf_err, " link ", g_wf_link, ")") && ok
+    ok = #expect(changed_count() == 0, "nothing left to write") && ok
+    // read again: the radio holds the edits
+    g_doc.open = false
+    start_read(p, "")
+    settle()
+    ok = #expect(g_doc.open && radio.channel_name(&g_doc.rows[s0]) == "TRUCK1" && g_doc.rows[s0].rx_hz == 146520000, "re-read shows the edits") && ok
+    ok = #expect(g_doc.rows[s0].tx_hz == 147120000 && g_doc.rows[s0].tx_tone.value == 1000, "re-read: duplex and tone") && ok
+    // the radio is remembered
+    radio.Registry reg = radio.open_registry(g_data_dir)
+    radio.KnownList kl = radio.list_known(&reg)
+    ok = #expect(#len(kl.radios) == 1 && kl.radios[0].seen >= 2, "remembered radio") && ok
+    kl.destroy()
+    reg.destroy()
+
+    // ── a profile applied with diagnostics ──
+    profile_from_doc()
+    ok = #expect(g_prof_open && #len(g_prof.entries) > 10, "profile from the radio") && ok
+    using app_keep():
+        radio.Entry bad = g_prof.entries[0]
+        bad.rx_hz = 30000000
+        bad.tx_hz = 30000000
+        bad.name = g_prof.add_text("LOWBAND")
+        g_prof.entries = #append(g_prof.entries, bad)
+        radio.Entry longn = g_prof.entries[1]
+        longn.name = g_prof.add_text("A VERY LONG CHANNEL NAME")
+        g_prof.entries = #append(g_prof.entries, longn)
+    apply_open()
+    step()
+    i64 n = #len(g_prof.entries)
+    ok = #expect(g_pf_mode == PF_APPLY && g_ap_rep.skipped >= 1, "apply: skipped ", g_ap_rep.skipped) && ok
+    ok = #expect(g_ap_sev[n - 2] == 2 && g_ap_sev[n - 1] == 1, "per-row badges: out of band skipped, long name changed (", g_ap_sev[n - 2], ", ", g_ap_sev[n - 1], ")") && ok
+    g_ap_filter = 1
+    g_page = PAGE_PROFILES
+    step()
+    ok = #expect(#len(g_ap_view) >= 2 && #len(g_ap_view) < n, "the Problems filter shows only problems: ", #len(g_ap_view)) && ok
+    // an inline fix (the frequency of the skipped one) runs the library again
+    btui.TableEvent fx
+    fx.kind = btui.TEV_COMMIT
+    fx.row = i32(n - 2)
+    fx.col = P_RX
+    fx.text = "146.40"
+    papply(fx)
+    apply_run()
+    ok = #expect(g_ap_sev[n - 2] == 0, "fixing the frequency inline places it (", g_ap_sev[n - 2], ")") && ok
+    // an inline power fix
+    fx.kind = btui.TEV_CHOICE
+    fx.col = P_POW
+    fx.choice = 3
+    papply(fx)
+    apply_run()
+    ok = #expect(g_prof.entries[n - 2].power == radio.Level(3), "power fixed inline") && ok
+    // keeping positions: two channels asking for the same slot -> one skipped
+    g_ap_pack = 1
+    g_prof.entries[0].slot = 5
+    g_prof.entries[1].slot = 5
+    apply_run()
+    ok = #expect(g_ap_sev[0] == 0 && g_ap_sev[1] == 2 && g_ap_slot[0] == 5, "keep positions: duplicate slot skipped (", g_ap_sev[0], ", ", g_ap_sev[1], ")") && ok
+    g_ap_filter = 0
+    step()
+    g_ap_pack = 0
+    g_pf_mode = PF_EDIT
+    stop_emu(&e)
+
+    // ── UV-5RE, untested here: verification, then write ──
+    Emu e2
+    if !start_emu("build/appflow_models/uv-5r.ini", "testdata/uv5re.img", &e2):
+        _ = #expect(false, "emulator 2 did not start")
+        return 1
+    string8 p2 = e2.port
+    ports_set_one(p2, true)
+    g_radio.known = false
+    g_doc.open = false
+    start_read(p2, "uv-5r")
+    settle()
+    ok = #expect(g_doc.open && doc_model().id == "uv-5r", "read the UV-5RE (err ", g_last_err, " link ", g_last_link, ")") && ok
+    ok = #expect(!doc_tested(), "UV-5RE counts as untested here") && ok
+    i32 s1 = first_used()
+    type_into(0, 1, "CAMP")
+    ok = #expect(radio.channel_name(&g_doc.rows[s1]) == "CAMP", "UV-5RE name edited: ", radio.channel_name(&g_doc.rows[s1]), " slot ", s1, " row0 slot ", g_view[0]) && ok
+    write_flow_open()
+    go_next_after_review()
+    ok = #expect(g_wf == WF_UNTESTED, "an untested radio stops at the choice") && ok
+    // guided verification
+    g_wf = WF_NONE
+    verify_flow_open(true)
+    g_vf = VF_READING
+    start_verify_begin()
+    settle()
+    ok = #expect(g_vf == VF_CHANNELS && job().ver_open, "verification read and backed up (", g_vf, ")") && ok
+    g_vf = VF_WRITING
+    start_verify_step(JOB_VERIFY_WRITE)
+    settle()
+    ok = #expect(g_vf == VF_POWER, "identical copy written and compared (", g_vf, ")") && ok
+    ok = #expect(record(true), "\"yes, it works\" recorded") && ok
+    g_vf = VF_PASS
+    ok = #expect(g_doc.status_by == i32(radio.TestedBy.LOCAL) && doc_tested(), "now verified on this computer") && ok
+    // the Radios page's status comes from the library (fingerprint match)
+    radio.Registry reg2 = radio.open_registry(g_data_dir)
+    radio.KnownList kl2 = radio.list_known(&reg2)
+    radio.TestedStore ts2 = radio.open_tested(g_data_dir)
+    i32 local_n = 0
+    for i in 0..<#len(kl2.radios):
+        if kl2.text(kl2.radios[i].model) == "uv-5r":
+            radio.WriteStatus ws2 = radio.known_write_status(&kl2, i64(i), g_models, &ts2)
+            if ws2.by == radio.TestedBy.LOCAL:
+                local_n += 1
+    ok = #expect(local_n == 1, "Radios page: the UV-5RE shows as verified on this computer") && ok
+    ts2.destroy()
+    kl2.destroy()
+    reg2.destroy()
+    verify_flow_close()
+    // the write now passes the gate
+    write_flow_open()
+    ok = #expect(g_wf_written == 1, "still one change to write: ", g_wf_written) && ok
+    go_next_after_review()
+    ok = #expect(g_wf == WF_CONFIRM, "verified radio goes to confirm") && ok
+    g_wf_ack = true
+    begin_write()
+    settle()
+    ok = #expect(g_wf_ok, "UV-5RE written through the gate (err ", g_wf_err, " link ", g_wf_link, ")") && ok
+    start_read(p2, "uv-5r")
+    settle()
+    ok = #expect(radio.channel_name(&g_doc.rows[s1]) == "CAMP", "UV-5RE re-read shows the edit: ", radio.channel_name(&g_doc.rows[s1])) && ok
+    // a second verification answered "no": restore
+    verify_flow_open(false)
+    g_vf = VF_READING
+    start_verify_begin()
+    settle()
+    g_vf = VF_WRITING
+    start_verify_step(JOB_VERIFY_WRITE)
+    settle()
+    _ = record(false)
+    g_vf = VF_RESTORING
+    start_verify_step(JOB_VERIFY_RESTORE)
+    settle()
+    ok = #expect(g_vf == VF_RESTORED, "\"no\" -> backup restored (", g_vf, ")") && ok
+    stop_emu(&e2)
+    // a radio that never answers: the checklist, with the detection's log
+    Emu e3
+    if start_emu_extra("models/uv-5rm.ini", "testdata/uv5rm.img", "--drop-first", "100000000", &e3):
+        string8 p3 = e3.port
+        g_doc.open = false
+        start_detect(p3)
+        settle()
+        ok = #expect(g_last_err == JERR_NO_RADIO && g_err_kind == EK_NO_ANSWER, "no answer -> the checklist (err ", g_last_err, ")") && ok
+        ok = #expect(#len(g_err_log) > 0, "the checklist has the detection's log for Details") && ok
+        g_err_show_log = true
+        settle()
+        btui.dialog_close()
+        stop_emu(&e3)
+    else:
+        ok = #expect(false, "emulator 3 did not start") && ok
+    // every page draws (headless) without trouble
+    for pg in 0..<6:
+        g_page = i32(pg)
+        settle()
+    return 0 if ok else 1

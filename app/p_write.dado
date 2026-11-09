@@ -1,0 +1,381 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Writing to the radio, in separate steps (UI_PLAN §1.6 and the owner's
+// decisions):
+//   1. Review: what changes ON THIS RADIO (slot by slot), and what will not
+//      be written (channels the radio cannot store).
+//   2. Untested radio (not shipped `tested = write`, not verified on this
+//      computer for this radio's fingerprint): offer guided verification
+//      first, or "write anyway" with an explicit warning (owner decision).
+//   3. Confirm: a checkbox naming what will be replaced.
+//   4. Progress, on its own: back up → write → verify, with cancel.
+//   5. Result: success, or failure with Restore (the backup, through the
+//      same safe write).
+// The single write gate is the library's (Runner.safe_write_detected ->
+// radio.gate_allows); this page only collects the user's decision.
+package main
+
+import "core:path"
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+const i32 WF_NONE = 0
+const i32 WF_REVIEW = 1
+const i32 WF_UNTESTED = 2
+const i32 WF_CONFIRM = 3
+const i32 WF_PROGRESS = 4
+const i32 WF_RESULT = 5
+
+i32 g_wf
+bool g_wf_anyway
+bool g_wf_anyway_ack
+bool g_wf_ack
+bool g_wf_ok
+bool g_wf_restoring
+ref []u8 g_wf_img
+i32 g_wf_written
+i32 g_wf_skipped
+ref []char8 g_wf_backup
+ref []char8 g_wf_detail
+i32 g_wf_err
+i32 g_wf_link
+btui.Scroll g_wf_scroll
+
+bool write_flow_active():
+    return g_wf != WF_NONE
+
+void write_flow_close():
+    g_wf = WF_NONE
+
+// The model on the cable counts as tested for writing (shipped, or verified
+// here for this radio's fingerprint)?
+bool doc_tested():
+    if doc_model().tested == radio.Tested.WRITE:
+        return true
+    return g_doc.status_by == i32(radio.TestedBy.LOCAL) || g_doc.status_by == i32(radio.TestedBy.SHIPPED)
+
+void write_flow_open():
+    using app_keep():
+        #delete(g_wf_img)
+        (ref []u8 img, i32 w, i32 s) = doc_build_image()
+        g_wf_img = img
+        g_wf_written = w
+        g_wf_skipped = s
+    g_wf_anyway = false
+    g_wf_anyway_ack = false
+    g_wf_ack = false
+    g_wf_restoring = false
+    btui.Scroll z
+    g_wf_scroll = z
+    g_wf = WF_REVIEW
+
+// Write a whole image as it is (restoring a backup).
+void write_flow_open_image(ref []u8 img):
+    using app_keep():
+        #delete(g_wf_img)
+        g_wf_img = radio.copy_image(img)
+    g_wf_written = used_count()
+    g_wf_skipped = 0
+    g_wf_anyway = false
+    g_wf_anyway_ack = false
+    g_wf_ack = false
+    g_wf_restoring = false
+    g_wf = WF_REVIEW
+
+private void go_next_after_review():
+    if doc_tested():
+        g_wf = WF_CONFIRM
+    else:
+        g_wf = WF_UNTESTED
+
+private void begin_write():
+    g_wf = WF_PROGRESS
+    start_write(g_wf_img, g_wf_anyway)
+
+void write_job_done(^Job j):
+    g_wf_err = j.err
+    g_wf_link = j.link_err
+    g_wf_ok = j.err == JERR_NONE
+    using app_keep():
+        #delete(g_wf_backup)
+        #delete(g_wf_detail)
+        g_wf_backup = strings.clone(j.backup)
+        g_wf_detail = strings.clone(j.status_detail)
+    if g_wf_ok:
+        if !g_wf_restoring:
+            doc_mark_written(g_wf_img)
+        radio_set(j.model_used, j.rid, j.nickname, j.port, j.how, j.seen, j.fast_path)
+    g_wf = WF_RESULT
+
+// ── the page ─────────────────────────────────────────────────────────────────
+
+private void flow_header(btui.Rect body, string8 title, string8 sub, bool can_back):
+    ^btui.Scheme t = btui.theme()
+    f32 x = body.x
+    if can_back:
+        if btui.icon_button("arrow_back", btui.rect(body.x - 8.0, body.y - 4.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Back"):
+            if g_wf == WF_REVIEW || g_wf == WF_RESULT:
+                g_wf = WF_NONE
+            else if g_wf == WF_UNTESTED:
+                g_wf = WF_REVIEW
+            else if g_wf == WF_CONFIRM:
+                g_wf = WF_REVIEW
+        x = body.x + 48.0
+    _ = btui.text(btui.HEADLINE_SMALL, x, body.y, title, t.on_surface)
+    _ = btui.text(btui.BODY_MEDIUM, x, body.y + 36.0, sub, t.on_surface_variant)
+
+void write_flow_page(btui.Rect sheet):
+    btui.Rect body = btui.inset(sheet, 32.0)
+    if g_wf == WF_REVIEW:
+        review_step(body)
+    else if g_wf == WF_UNTESTED:
+        untested_step(body)
+    else if g_wf == WF_CONFIRM:
+        confirm_step(body)
+    else if g_wf == WF_PROGRESS:
+        progress_step(body)
+    else:
+        result_step(body)
+
+private string8 chan_summary(^radio.Channel c):
+    if c.empty:
+        return "(empty)"
+    ref []char8 rx = mhz_text(c.rx_hz)
+    string8 dup = DUP_NAMES[dup_of(c)]
+    ref []char8 tt = tone_text(c.tx_tone)
+    return #format(radio.channel_name(c), "  ", rx, "  ", dup, "  tone ", tt, "  ", radio.power_name(doc_model(), i64(c.power)), " ", radio.mode_name(c.mode))
+
+private void review_step(btui.Rect body):
+    ^btui.Scheme t = btui.theme()
+    string8 who = radio_title()
+    flow_header(body, #format("Write to ", who), "Step 1 of 3 · Review what changes on the radio", true)
+    f32 y = body.y + 80.0
+    // summary chips
+    f32 x = body.x
+    x = x + btui.status_chip(x, y, #format(g_wf_written, " channel", "" if g_wf_written == 1 else "s", " will change"), btui.TONE_PRIMARY, "edit") + 8.0
+    if g_wf_skipped > 0:
+        x = x + btui.status_chip(x, y, #format(g_wf_skipped, " can't be stored, not written"), btui.TONE_ERROR, "error") + 8.0
+    if !doc_tested():
+        x = x + btui.status_chip(x, y, "Not tested for writing", btui.TONE_WARNING, "lock") + 8.0
+    // the slot list
+    btui.Rect list = btui.rect(body.x, y + 52.0, body.w, btui.bottom(body) - y - 52.0 - 64.0)
+    _ = btui.card(list, btui.CARD_OUTLINED)
+    btui.Rect inner = btui.inset(list, 1.0)
+    i32 n = 0
+    for i in 0..<doc_count():
+        if row_changed(i32(i)) || g_wf_restoring:
+            n += 1
+    _ = btui.scroll_update(inner, &g_wf_scroll, f32(n) * 56.0 + 8.0)
+    btui.push_clip(inner)
+    f32 ry = inner.y + 4.0 - g_wf_scroll.y
+    i32 shown = 0
+    for i in 0..<doc_count():
+        if !row_changed(i32(i)):
+            continue
+        if ry > btui.bottom(inner):
+            break
+        if ry + 56.0 >= inner.y:
+            ^radio.Channel before = &g_doc.base_rows[i]
+            ^radio.Channel after = &g_doc.rows[i]
+            bool blocked = row_blocked(i32(i))
+            btui.Rect rr = btui.rect(inner.x, ry, inner.w, 56.0)
+            _ = btui.text(btui.tabular(btui.TITLE_SMALL), rr.x + 20.0, ry + 8.0, #format("#", after.number), t.on_surface_variant)
+            string8 kind = "Changed"
+            if before.empty:
+                kind = "New"
+            else if after.empty:
+                kind = "Removed"
+            i32 tone = btui.TONE_PRIMARY if !blocked else btui.TONE_ERROR
+            _ = btui.status_chip(rr.x + 76.0, ry + 6.0, kind if !blocked else "Not written", tone, "", true)
+            _ = btui.text(btui.BODY_SMALL, rr.x + 76.0, ry + 32.0, #format("was: ", chan_summary(before)), t.on_surface_variant)
+            _ = btui.text(btui.BODY_MEDIUM, rr.x + 200.0, ry + 8.0, chan_summary(after), t.on_surface if !blocked else t.error)
+            btui.divider(rr.x + 16.0, btui.right(rr) - 16.0, ry + 55.0)
+        ry = ry + 56.0
+        shown += 1
+    if n == 0:
+        btui.text_in(inner, btui.BODY_MEDIUM, "The whole image as it is will be written (a backup restore).", t.on_surface_variant, btui.ALIGN_CENTER)
+    btui.pop_clip()
+    btui.scrollbar("wfreview", inner, &g_wf_scroll)
+    f32 bw = btui.button_width("Continue", "chevron_right")
+    if btui.button("Continue", btui.rect(btui.right(body) - bw, btui.bottom(body) - 40.0, bw, 40.0), btui.BTN_FILLED, "chevron_right", g_wf_written == 0 && !g_wf_restoring):
+        go_next_after_review()
+    f32 cw = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(body) - bw - 8.0 - cw, btui.bottom(body) - 40.0, cw, 40.0), btui.BTN_TEXT):
+        g_wf = WF_NONE
+
+private void untested_step(btui.Rect body):
+    ^btui.Scheme t = btui.theme()
+    flow_header(body, "This radio hasn't been tested for writing", "Step 2 of 3 · Choose how to go on", true)
+    f32 y = body.y + 84.0
+    f32 cw = (body.w - 24.0) * 0.5
+    btui.Rect a = btui.rect(body.x, y, cw, 300.0)
+    btui.Rect b = btui.rect(body.x + cw + 24.0, y, cw, 300.0)
+    // the recommended way: verification
+    _ = btui.card(a, btui.CARD_FILLED)
+    btui.Rect ai = btui.inset(a, 24.0)
+    btui.icon("verified", ai.x, ai.y, 24.0, t.primary, true)
+    _ = btui.status_chip(ai.x + 36.0, ai.y, "Recommended", btui.TONE_SUCCESS, "", true)
+    _ = btui.text(btui.TITLE_LARGE, ai.x, ai.y + 40.0, "Verify this radio first", t.on_surface)
+    _ = btui.text_wrap(btui.rect(ai.x, ai.y + 76.0, ai.w, 120.0), btui.BODY_MEDIUM, #format("beautalks writes an identical copy of what is on the radio now, checks it byte for byte, and asks you to switch the radio off and on. If all is well, writing to this ", doc_model().name, " (this firmware) counts as tested on this computer."), t.on_surface_variant)
+    f32 vw = btui.button_width("Verify this radio", "verified")
+    if btui.button("Verify this radio", btui.rect(ai.x, btui.bottom(ai) - 40.0, vw, 40.0), btui.BTN_FILLED, "verified"):
+        g_wf = WF_NONE
+        verify_flow_open(true)
+    // write anyway
+    _ = btui.card(b, btui.CARD_OUTLINED)
+    btui.Rect bi = btui.inset(b, 24.0)
+    btui.icon("warning", bi.x, bi.y, 24.0, t.warning, true)
+    _ = btui.text(btui.TITLE_LARGE, bi.x, bi.y + 40.0, "Write anyway", t.on_surface)
+    _ = btui.text_wrap(btui.rect(bi.x, bi.y + 76.0, bi.w, 90.0), btui.BODY_MEDIUM, "Writing to this model hasn't been checked. A wrong write can leave the radio misconfigured. The radio is backed up first and read back after, so it can be restored.", t.on_surface_variant)
+    _ = btui.checkbox("I understand the risk", bi.x - 10.0, bi.y + 172.0, &g_wf_anyway_ack)
+    f32 ow = btui.button_width("Write anyway", "", btui.BTN_OUTLINED)
+    if btui.button("Write anyway", btui.rect(bi.x, btui.bottom(bi) - 40.0, ow, 40.0), btui.BTN_OUTLINED, "", !g_wf_anyway_ack):
+        g_wf_anyway = true
+        g_wf = WF_CONFIRM
+
+private void confirm_step(btui.Rect body):
+    ^btui.Scheme t = btui.theme()
+    flow_header(body, "Ready to write", "Step 3 of 3 · Confirm", true)
+    btui.Rect c = btui.rect(body.x, body.y + 84.0, minf2(body.w, 720.0), 260.0)
+    _ = btui.card(c, btui.CARD_OUTLINED)
+    btui.Rect ci = btui.inset(c, 24.0)
+    _ = btui.text(btui.TITLE_LARGE, ci.x, ci.y, radio_title(), t.on_surface)
+    string8 sub2 = radio_port()
+    if #len(g_radio.nickname) > 0:
+        sub2 = #format(model_label(g_doc.mi), "  ·  ", radio_port())
+    _ = btui.text(btui.BODY_MEDIUM, ci.x, ci.y + 32.0, sub2, t.on_surface_variant)
+    [3]string8 lines = ["First, the radio's current memory is saved as a backup.", "Then the channels are written, and read back to check them.", "Keep the radio on and the cable plugged in until it says done."]
+    for i in 0..<3:
+        btui.icon("check_circle", ci.x, ci.y + 72.0 + f32(i32(i)) * 28.0, 20.0, t.primary)
+        _ = btui.text(btui.BODY_MEDIUM, ci.x + 30.0, ci.y + 72.0 + f32(i32(i)) * 28.0, lines[i], t.on_surface)
+    string8 what = #format("I understand ", g_wf_written, " channel", "" if g_wf_written == 1 else "s", " on ", radio_title(), " will be replaced")
+    if g_wf_restoring:
+        what = #format("I understand the radio's memory will be replaced by the backup")
+    _ = btui.checkbox(what, ci.x - 10.0, ci.y + 164.0, &g_wf_ack)
+    f32 bw = btui.button_width("Write now", "upload")
+    if btui.button("Write now", btui.rect(btui.right(body) - bw, btui.bottom(body) - 40.0, bw, 40.0), btui.BTN_FILLED, "upload", !g_wf_ack || job_busy()):
+        begin_write()
+
+f32 minf2(f32 a, f32 b):
+    return a if a < b else b
+
+private void progress_step(btui.Rect body):
+    ^btui.Scheme t = btui.theme()
+    flow_header(body, #format("Writing to ", radio_title()), "Keep the radio on and the cable plugged in", false)
+    (i32 ph, i64 done, i64 total) = job_progress()
+    g_last_phase_seen = ph
+    [3]string8 titles = ["Back up", "Write", "Verify"]
+    [3]i32 st = [btui.STEP_PENDING, btui.STEP_PENDING, btui.STEP_PENDING]
+    string8 c1 = "Saving what's on the radio"
+    string8 c2 = #format(g_wf_written, " channels")
+    string8 c3 = "Read back and compare"
+    i32 cur = 0
+    if ph == PH_WRITE:
+        cur = 1
+    else if ph == PH_VERIFY:
+        cur = 2
+    for i in 0..<3:
+        if i32(i) < cur:
+            st[i] = btui.STEP_DONE
+        else if i32(i) == cur:
+            st[i] = btui.STEP_ACTIVE
+    [3]string8 caps = [c1, c2, c3]
+    f32 v = -1.0
+    if total > 0:
+        v = btui.clampf(f32(done) / f32(total), 0.0, 1.0)
+    btui.Rect c = btui.rect(body.x, body.y + 84.0, body.w, 220.0)
+    _ = btui.card(c, btui.CARD_OUTLINED)
+    btui.Rect ci = btui.inset(c, 28.0)
+    btui.stepper(btui.rect(ci.x, ci.y, minf2(ci.w, 760.0), 48.0), titles[:], caps[:], st[:], v)
+    _ = btui.text(btui.TITLE_MEDIUM, ci.x, ci.y + 84.0, #format(phase_words(ph), "…"), t.on_surface)
+    btui.progress_linear(btui.rect(ci.x, ci.y + 120.0, ci.w, 8.0), v)
+    if total > 0:
+        _ = btui.text(btui.BODY_SMALL, ci.x, ci.y + 136.0, #format(done * 100 / total, "%"), t.on_surface_variant)
+    f32 cw = btui.button_width("Cancel", "", btui.BTN_OUTLINED)
+    if btui.button("Cancel", btui.rect(btui.right(body) - cw, btui.bottom(body) - 40.0, cw, 40.0), btui.BTN_OUTLINED):
+        btui.dialog_open("cancelwrite")
+    (btui.Rect db, bool open) = btui.dialog_begin("cancelwrite", "Stop writing?", 460.0, 64.0, "warning")
+    if open:
+        _ = btui.text_wrap(db, btui.BODY_MEDIUM, "Stopping in the middle can leave the radio half-written. It stops at the next safe point; then restore the backup.", t.on_surface_variant)
+        btui.Rect acts = btui.dialog_actions(db)
+        f32 w1 = btui.button_width("Stop", "", btui.BTN_TEXT)
+        if btui.button("Stop", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT):
+            btui.dialog_close()
+            job_cancel()
+        f32 w2 = btui.button_width("Keep writing", "", btui.BTN_TEXT)
+        if btui.button("Keep writing", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+            btui.dialog_close()
+        btui.dialog_end()
+
+private void result_step(btui.Rect body):
+    ^btui.Scheme t = btui.theme()
+    flow_header(body, #format("Write to ", radio_title()), "Finished", false)
+    btui.Rect c = btui.rect(body.x, body.y + 84.0, minf2(body.w, 760.0), 260.0)
+    _ = btui.card(c, btui.CARD_OUTLINED)
+    btui.Rect ci = btui.inset(c, 28.0)
+    if g_wf_ok:
+        btui.fill_circle(ci.x + 28.0, ci.y + 28.0, 28.0, t.success_container)
+        btui.icon("check", ci.x + 16.0, ci.y + 16.0, 24.0, t.on_success_container)
+        _ = btui.text(btui.HEADLINE_SMALL, ci.x + 72.0, ci.y + 8.0, "Written and checked" if !g_wf_restoring else "Backup restored", t.on_surface)
+        _ = btui.text_wrap(btui.rect(ci.x + 72.0, ci.y + 52.0, ci.w - 72.0, 60.0), btui.BODY_MEDIUM, #format("The radio's memory was read back and matches. Its previous memory is saved in ", g_wf_backup), t.on_surface_variant)
+        if #len(g_wf_detail) > 0:
+            _ = btui.status_chip(ci.x + 72.0, ci.y + 120.0, g_wf_detail, btui.TONE_SUCCESS, "verified", true)
+        f32 w = btui.button_width("Done")
+        if btui.button("Done", btui.rect(btui.right(ci) - w, btui.bottom(ci) - 40.0, w, 40.0), btui.BTN_FILLED):
+            g_wf = WF_NONE
+            g_page = PAGE_CHANNELS
+        if #len(g_wf_backup) > 0:
+            f32 sw = btui.button_width("Show the backup", "folder_open", btui.BTN_TEXT)
+            if btui.button("Show the backup", btui.rect(btui.right(ci) - w - 8.0 - sw, btui.bottom(ci) - 40.0, sw, 40.0), btui.BTN_TEXT, "folder_open"):
+                string8 bdir = path.dir(g_wf_backup)
+                reveal(bdir)
+        return
+    btui.fill_circle(ci.x + 28.0, ci.y + 28.0, 28.0, t.error_container)
+    btui.icon("priority_high", ci.x + 16.0, ci.y + 16.0, 24.0, t.on_error_container)
+    string8 title = "The write didn't finish"
+    string8 sub = "Nothing was written."
+    radio.LinkError le = radio.LinkError(g_wf_link)
+    if g_wf_err == JERR_LINK && le == radio.LinkError.UNTESTED:
+        title = "Writing to this radio isn't allowed yet"
+        sub = "It isn't tested for writing. Verify the radio first, or choose \"Write anyway\"."
+    else if g_wf_err == JERR_LINK && le == radio.LinkError.VERIFY:
+        title = "The radio didn't read back the same"
+        sub = "Something went wrong while writing. Put the backup back to return the radio to how it was."
+    else if g_wf_err == JERR_LINK && le == radio.LinkError.CANCELLED:
+        title = "Stopped"
+        sub = "If writing had started, put the backup back to be safe."
+    else if g_wf_err == JERR_NOT_THIS_MODEL:
+        title = "A different radio is on the cable"
+        sub = "Plug in the radio these channels belong to. Nothing was written."
+    else if g_wf_err == JERR_LINK:
+        sub = #format(link_words(le), " If the write had started, put the backup back.")
+    else if g_wf_err == JERR_NO_RADIO || g_wf_err == JERR_SESSION:
+        sub = "The radio didn't answer. Check it is on and the cable is in, then try again. Nothing was written."
+    _ = btui.text(btui.HEADLINE_SMALL, ci.x + 72.0, ci.y + 8.0, title, t.on_surface)
+    _ = btui.text_wrap(btui.rect(ci.x + 72.0, ci.y + 52.0, ci.w - 72.0, 80.0), btui.BODY_MEDIUM, sub, t.on_surface_variant)
+    bool have_backup = #len(g_wf_backup) > 0 && file_exists(g_wf_backup)
+    f32 x = btui.right(ci)
+    if have_backup:
+        f32 rw = btui.button_width("Restore the backup", "settings_backup_restore")
+        x = x - rw
+        if btui.button("Restore the backup", btui.rect(x, btui.bottom(ci) - 40.0, rw, 40.0), btui.BTN_FILLED, "settings_backup_restore"):
+            try ref []u8 img = radio.load_image(g_wf_backup) else:
+                btui.snackbar_show("The backup file could not be read.")
+                return
+            using app_keep():
+                #delete(g_wf_img)
+                g_wf_img = img
+            g_wf_restoring = true
+            g_wf_anyway = true
+            begin_write()
+            return
+        x = x - 8.0
+    f32 tw = btui.button_width("Try again", "", btui.BTN_TONAL)
+    x = x - tw
+    if btui.button("Try again", btui.rect(x, btui.bottom(ci) - 40.0, tw, 40.0), btui.BTN_TONAL):
+        g_wf = WF_REVIEW
+    f32 cw = btui.button_width("Close", "", btui.BTN_TEXT)
+    if btui.button("Close", btui.rect(x - 8.0 - cw, btui.bottom(ci) - 40.0, cw, 40.0), btui.BTN_TEXT):
+        g_wf = WF_NONE

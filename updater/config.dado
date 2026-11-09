@@ -16,10 +16,14 @@ package updater
 import "core:os"
 import "core:path"
 
-// The app's own version and the driver APIs it can run. A bundle whose
+// The app's own version and the driver APIs it can run. APP_VERSION is set at
+// build time from the repo-root VERSION file: build.sh passes
+// `-D updater.APP_VERSION=$(cat VERSION)` (unquoted: the text is taken as the
+// string; quotes would become part of it). The default here is for dev
+// builds. A bundle whose
 // `driver_api` is outside [API_MIN, API_MAX], or whose `min_app` is newer than
 // APP_VERSION, is not installed.
-const string8 APP_VERSION = "0.1.0"
+@const string8 APP_VERSION = "0.1.0"
 const i64 API_MIN = 1
 const i64 API_MAX = 1
 

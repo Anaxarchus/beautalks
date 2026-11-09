@@ -1,0 +1,326 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Application state: folders, model definitions, the channel library, the
+// radio on the cable, and small shared helpers.
+package main
+
+import "core:os"
+import "core:os/fs"
+import "core:os/proc"
+import "core:path"
+import "core:strings"
+import "core:time"
+import btui "../ui"
+import "../radio"
+import "../updater"
+
+// Everything the app keeps across frames is made under this allocator
+// (frames run under a per-frame arena).
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) app_keep():
+    return btui.keep()
+
+ref []radio.Model g_models
+ref []char8 g_models_dir
+ref []char8 g_data_dir
+ref []char8 g_library_dir
+ref []char8 g_drivers_dir
+bool g_builtin
+ref []char8 g_port_override
+bool g_headless_test
+
+bool headless_test():
+    return g_headless_test
+
+// ── the radio on the cable (the last detection or read) ─────────────────────
+
+type RadioInfo:
+    bool known
+    i64 mi
+    ref []char8 rid
+    ref []char8 nickname
+    ref []char8 port
+    ref []char8 how
+    i64 seen
+    bool fast_path
+
+RadioInfo g_radio
+
+void radio_set(i64 mi, string8 rid, string8 nick, string8 port, string8 how, i64 seen, bool fast):
+    using app_keep():
+        #delete(g_radio.rid)
+        #delete(g_radio.nickname)
+        #delete(g_radio.port)
+        #delete(g_radio.how)
+        g_radio.known = true
+        g_radio.mi = mi
+        g_radio.rid = strings.clone(rid)
+        g_radio.nickname = strings.clone(nick)
+        g_radio.port = strings.clone(port)
+        g_radio.how = strings.clone(how)
+        g_radio.seen = seen
+        g_radio.fast_path = fast
+
+// "Truck radio" or "Baofeng UV-5RM".
+string8 radio_title():
+    if !g_radio.known:
+        return "No radio"
+    if #len(g_radio.nickname) > 0:
+        return g_radio.nickname
+    return model_label(g_radio.mi)
+
+string8 model_label(i64 mi):
+    if mi < 0 || mi >= #len(g_models):
+        return "Unknown radio"
+    return #format(g_models[mi].vendor, " ", g_models[mi].name)
+
+i64 model_index(string8 id):
+    return radio.find_model(g_models, id)
+
+// ── folders ─────────────────────────────────────────────────────────────────
+
+private ref []char8 models_dir_default():
+    string8 env = btui.os_env("BEAUTALKS_MODELS")
+    if #len(env) > 0:
+        return strings.clone(env)
+    string8 d = shipped_dir("models")
+    if #len(d) > 0:
+        return strings.clone(d)
+    return strings.clone("models")
+
+// A folder that ships with the program (models, drivers, data, assets), as
+// the library finds it for the CLI and the engines too (radio.find_shipped:
+// $BEAUTALKS_<NAME>, ./NAME, beside the program, one up, or a macOS bundle's
+// Resources). "" when none exists.
+string8 shipped_dir(string8 name):
+    ref []char8 d = nil
+    using app_keep():
+        d = radio.find_shipped(name)
+    if d == nil:
+        return ""
+    string8 out = d
+    return out
+
+private ref []char8 library_default():
+    string8 env = btui.os_env("BEAUTALKS_LIBRARY")
+    if #len(env) > 0:
+        return strings.clone(env)
+    try ref []char8 home = os.home_dir() else:
+        return strings.clone("beautalks-library")
+    return path.join(home, "Documents", "beautalks")
+
+void dirs_init(string8 models, string8 data, string8 library):
+    using app_keep():
+        g_models_dir = strings.clone(models) if #len(models) > 0 else models_dir_default()
+        if #len(data) > 0:
+            g_data_dir = strings.clone(data)
+        else:
+            string8 env = btui.os_env("BEAUTALKS_HOME")
+            g_data_dir = strings.clone(env) if #len(env) > 0 else radio.app_data_dir()
+        g_library_dir = strings.clone(library) if #len(library) > 0 else library_default()
+        try fs.make_dirs(g_data_dir) else:
+            _ = 0
+        try fs.make_dirs(path.join(g_library_dir, "profiles")) else:
+            _ = 0
+        g_models = radio.load_models(g_models_dir)
+
+string8 profiles_dir():
+    return path.join(g_library_dir, "profiles")
+
+// "2026-11-08 14:02" (UTC; core:time has no local zone yet).
+ref []char8 when_text(i64 unix):
+    time.DateTime t = time.utc(unix * 1000000000)
+    return date_words(t.year, i64(t.month), i64(t.day), i64(t.hour), i64(t.minute))
+
+// "9 Nov 2026, 03:09 UTC"
+ref []char8 date_words(i64 year, i64 month, i64 day, i64 hour, i64 minute):
+    [12]string8 mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    strings.Builder b = strings.builder(32)
+    radio.append_int(&b, day)
+    strings.append_char(&b, ' ')
+    if month >= 1 && month <= 12:
+        strings.append(&b, mon[month - 1])
+    strings.append_char(&b, ' ')
+    radio.append_int(&b, year)
+    strings.append(&b, ", ")
+    radio.append_padded(&b, hour, 2)
+    strings.append_char(&b, ':')
+    radio.append_padded(&b, minute, 2)
+    strings.append(&b, " UTC")
+    return strings.finish(&b)
+
+// "receive frequency ..." -> "Receive frequency ..." (library texts start
+// lower case; the UI shows sentences).
+ref []char8 sentence(string8 m):
+    strings.Builder b = strings.builder(#len(m) + 1)
+    for i in 0..<#len(m):
+        char8 c = m[i]
+        if i == 0 && c >= 'a' && c <= 'z':
+            c = c - 32
+        strings.append_char(&b, c)
+    return strings.finish(&b)
+
+// The library's link error as a sentence: "The radio did not answer."
+ref []char8 link_words(radio.LinkError le):
+    string8 m = radio.link_error_message(le)
+    strings.Builder b = strings.builder(#len(m) + 2)
+    for i in 0..<#len(m):
+        char8 c = m[i]
+        if i == 0 && c >= 'a' && c <= 'z':
+            c = c - 32
+        strings.append_char(&b, c)
+    if #len(m) > 0 && m[#len(m) - 1] != '.':
+        strings.append_char(&b, '.')
+    return strings.finish(&b)
+
+string8 app_version():
+    return updater.APP_VERSION
+
+// Open a folder in Finder / the file manager (one shell call).
+void reveal(string8 dir):
+    when #OS == #DARWIN:
+        string8 cmd = #format("open '", dir, "' &")
+    else:
+        string8 cmd = #format("xdg-open '", dir, "' >/dev/null 2>&1 &")
+    try proc.Ended _ = proc.run(cmd) else:
+        btui.snackbar_show(#format("Could not open ", dir))
+
+// ── the channel library (data/channels/*.csv) ───────────────────────────────
+
+type LibSet:
+    ref []char8 file
+    ref []char8 name
+    radio.ChannelList list
+
+// chip text, chip tone, and the licence in full (the library's license_text)
+type LibNote: (string8 text, i32 tone, string8 full)
+
+ref []LibSet g_sets
+{i64: LibNote} g_notes
+
+private string8 set_title(string8 file):
+    string8 b = path.base(file)
+    if b == "us_frs.csv":
+        return "FRS"
+    if b == "us_gmrs.csv":
+        return "GMRS"
+    if b == "us_murs.csv":
+        return "MURS"
+    if b == "us_noaa.csv":
+        return "NOAA weather"
+    if b == "us_marine.csv":
+        return "Marine VHF"
+    if b == "us_ham_calling.csv":
+        return "Ham calling"
+    if b == "us_interop.csv":
+        return "Interoperability"
+    if b == "us_aviation.csv":
+        return "Aviation (US)"
+    if b == "us_business.csv":
+        return "Business"
+    if b == "us_sar_fire.csv":
+        return "SAR / fire"
+    if b == "ak_aviation.csv":
+        return "Aviation (Alaska)"
+    if b == "ak_noaa_transmitters.csv":
+        return "NOAA transmitters (Alaska)"
+    if b == "ak_state.csv":
+        return "Alaska state"
+    return strings.trim_suffix(b, ".csv")
+
+// The note's chip tone: receive-only services read as info (blue), others
+// neutral grey. Never a problem colour.
+private i32 note_tone(string8 note):
+    if note == "rx_only_service" || strings.contains(note, "eceive") || strings.contains(note, "listen"):
+        return btui.TONE_INFO
+    return btui.TONE_NEUTRAL
+
+void library_load(string8 data_dir):
+    using app_keep():
+        string8 dir = path.join(data_dir, "channels")
+        try fs.Listing l = fs.read_dir(dir) else:
+            return
+        ref []string8 names = nil
+        for e in l.entries:
+            string8 n = e.path
+            if strings.ends_with(n, ".csv"):
+                names = #append(names, strings.clone(n))
+        // a stable order: US sets first, then by name
+        for i in 1..<#len(names):
+            string8 v = names[i]
+            i64 j = i - 1
+            for j >= 0 && strings.compare(v, names[j]) < 0:
+                names[j + 1] = names[j]
+                j -= 1
+            names[j + 1] = v
+        for n in names:
+            try ref []char8 text = fs.read_file(path.join(dir, n)) else:
+                continue
+            ref []radio.CsvProblem probs = nil
+            LibSet s
+            s.file = strings.clone(n)
+            s.name = strings.clone(set_title(n))
+            s.list = radio.list_from_csv(text, &probs)
+            #delete(probs)
+            #delete(text)
+            for e in s.list.entries:
+                string8 lic = s.list.text(e.license)
+                if #len(lic) > 0 && !(e.rx_hz in g_notes):
+                    string8 short = set_note(lic, s.name)
+                    // kept for the life of the program
+                    ref []char8 kept = strings.clone(short)
+                    string8 kv = kept
+                    string8 lt = s.list.text(e.license_text)
+                    ref []char8 full = strings.clone(lt if #len(lt) > 0 else short)
+                    string8 fv = full
+                    g_notes[e.rx_hz] = LibNote((kv, note_tone(lic), fv))
+            g_sets = #append(g_sets, s)
+
+// The library's licence code for a set ("required" says which licence).
+string8 set_note(string8 code, string8 set):
+    if code == "required":
+        if strings.starts_with(set, "GMRS"):
+            return "GMRS licence"
+        if strings.starts_with(set, "Ham"):
+            return "Amateur licence"
+        if strings.starts_with(set, "Marine"):
+            return "Marine licence"
+        if strings.starts_with(set, "Aviation"):
+            return "Aviation licence"
+        return "Licence required"
+    return short_note(code)
+
+// A chip-sized version of a library licence note or code.
+string8 short_note(string8 lic):
+    if lic == "none":
+        return "Licence-free"
+    if lic == "rx_only_service":
+        return "Receive only"
+    if lic == "required":
+        return "Licence required"
+    if strings.contains(lic, "eceive-only") || strings.contains(lic, "eceive only"):
+        return "Receive only"
+    if strings.starts_with(lic, "FRS") || strings.contains(lic, "licence-free") || strings.contains(lic, "license-free"):
+        return "Licence-free"
+    if strings.starts_with(lic, "GMRS"):
+        return "GMRS licence"
+    if strings.starts_with(lic, "Amateur"):
+        return "Amateur licence"
+    if strings.contains(lic, "Marine") || strings.contains(lic, "marine"):
+        return "Marine licence"
+    if strings.contains(lic, "Part 90"):
+        return "Part 90"
+    if strings.contains(lic, "FAA") || strings.contains(lic, "viation"):
+        return "Aviation"
+    (string8 head, string8 _, bool _) = strings.split_first(lic, "(")
+    string8 h = strings.trim(head)
+    if #len(h) > 22:
+        return h[0..<22]
+    return h
+
+// A ref'd text as a string view (for comparisons).
+string8 eq_s(string8 s):
+    return s
+
+ref []char8 strings_clone(string8 s):
+    return strings.clone(s)

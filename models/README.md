@@ -35,13 +35,21 @@ next run overwrites your change.
 
 ## Models
 
-UV-17Pro family (CHIRP `baofeng_uv17Pro.py`): UV-5RM (`tested = read`), UV-17Pro,
+Hardware-verified writes (owner's radios, 2026-11-08): **UV-5RM** read →
+safe write (backup, 526 W blocks acked, verify) → read, back to back in one
+open programming session, all identical; **UV-5RE** (firmware HN5RV011)
+read → guarded safe write (6432 bytes, CHIRP's default ranges) → read,
+identical; both radios worked normally afterwards. Both are `tested = write`.
+Every other model is `untested`: writing one needs the user's explicit
+override, and backup + verify still run.
+
+UV-17Pro family (CHIRP `baofeng_uv17Pro.py`): UV-5RM (`tested = write`), UV-17Pro,
 UV-21ProV2, UV-25, UV-17ProGPS, GM-30 Plus, GM-30 Pro, GM-21, UV-32, UV-21ProGPS,
 UV-28Plus, MaxTalker P15, MaxTalker MT-5RM, K5-Plus, UV-5RM Plus, GM-5RH, UV-5G Plus,
 UV-17R-Plus, UV-5RH, BF-F8HP-PRO, K6, UV-5R Mini, UV-5G Mini.
 
 UV-5R family (CHIRP `uv5r.py`): UV-5R (+ aliases UV-5RE, UV-5X, RT5R, RT5RV, RT5,
-RH5R, UV-5R EX, A-5R; `tested = read`), UV-5G Pro, F-11, UV-82, UV-82X3, UV-6,
+RH5R, UV-5R EX, A-5R; `tested = write`), UV-5G Pro, F-11, UV-82, UV-82X3, UV-6,
 KT-980HP, BF-F8HP (+ its aliases), UV-82HP, UV-5RX3, GT-5R, UV-5G.
 
 Every registered class of both CHIRP files is covered. Not carried over (no

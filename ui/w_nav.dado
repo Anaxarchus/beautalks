@@ -1,0 +1,346 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Navigation and containment: top app bar, navigation rail, tabs, cards,
+// lists, the stepper, and scroll areas.
+package btui
+
+// ── Top app bar ────────────────────────────────────────────────────────────
+
+// A small top app bar (64 dp) across `r`. `scrolled` gives it the
+// surface-container colour M3 uses once content scrolls under it. Answers
+// the rectangle left for trailing actions (lay 48 dp icon buttons into it
+// from the right) after the title.
+Rect top_app_bar(Rect r, string8 title, bool scrolled = false, bool logo = false):
+    ^Scheme t = theme()
+    f32 k = animate(id("appbar#scroll"), 1.0 if scrolled else 0.0, 0.2)
+    fill_rect(r, mix(t.surface, t.surface_container, k))
+    f32 x = r.x + 16.0
+    if logo:
+        f32 w = image("wordmark-dark" if is_dark() else "wordmark", x, cy(r) - 14.0, 28.0)
+        x = x + w + 16.0
+        if #len(title) > 0:
+            vline(x, cy(r) - 12.0, cy(r) + 12.0, 1.0, t.outline_variant)
+            x = x + 16.0
+    if #len(title) > 0:
+        x = text(TITLE_LARGE, x, cy(r) - TITLE_LARGE.line * 0.5, title, t.on_surface)
+    return Rect((x + 16.0, r.y, right(r) - x - 16.0 - 8.0, r.h))
+
+// ── Navigation rail ────────────────────────────────────────────────────────
+
+// An 80 dp navigation rail item at y (the rail's x is `x`). The active
+// indicator is a 56 x 32 pill; the icon fills when selected. Answers true
+// when clicked.
+bool rail_item(string8 icon_name, string8 label, f32 x, f32 y, bool selected, string8 badge_text = "", bool badge_on = false):
+    ^Scheme t = theme()
+    u64 uid = id(#format("rail#", label))
+    Rect hit = Rect((x, y, 80.0, 56.0))
+    Rect pill = Rect((x + 12.0, y, 56.0, 32.0))
+    Interact it = interact(uid, hit, true, false)
+    f32 k = animate(uid ~ u64(0x9111), 1.0 if selected else 0.0, 0.2)
+    if k > 0.001:
+        f32 pw = 56.0 * (0.5 + 0.5 * k)
+        Rect p = Rect((cx(pill) - pw * 0.5, pill.y, pw, 32.0))
+        fill_rrect(p, 16.0, alpha(t.secondary_container, k))
+    [4]u8 ic = t.on_secondary_container if selected else t.on_surface_variant
+    // state layer on the pill only
+    Interact it2 = it
+    state_layer(uid, pill, 16.0, ic, it2)
+    focus_ring(pill, 16.0, it.focused)
+    icon(icon_name, cx(pill) - 12.0, cy(pill) - 12.0, 24.0, ic, selected)
+    if badge_on:
+        badge(cx(pill) - 12.0, cy(pill) - 12.0, badge_text)
+    Style ls = LABEL_MEDIUM
+    [4]u8 lc = t.on_surface if selected else t.on_surface_variant
+    f32 lw = text_width(ls, label)
+    _ = text(with_face(ls, FACE_SEMIBOLD) if selected else ls, x + (80.0 - lw) * 0.5, y + 36.0, label, lc)
+    return it.clicked
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+
+// Primary tabs across `r` (48 dp tall, or 64 with icons). The active
+// indicator is a 3 dp bar under the label, sliding between tabs.
+bool tabs(string8 key, Rect r, []string8 labels, ^i32 sel, []string8 icons = nil):
+    ^Scheme t = theme()
+    i32 n = i32(#len(labels))
+    if n == 0:
+        return false
+    push_id(id(key))
+    bool changed = false
+    f32 w = r.w / f32(n)
+    bool with_icons = #len(icons) == #len(labels)
+    for i in 0..<n:
+        Rect tr = Rect((r.x + f32(i) * w, r.y, w, r.h))
+        u64 uid = idn("tab", i64(i))
+        Interact it = interact(uid, tr, true, false)
+        if it.clicked && sel^ != i32(i):
+            sel^ = i32(i)
+            changed = true
+        bool on = sel^ == i32(i)
+        [4]u8 c = t.primary if on else t.on_surface_variant
+        state_layer(uid, tr, 0.0, c, it)
+        if focus_visible() && it.focused:
+            stroke_rrect(inset(tr, 2.0), 4.0, 2.0, t.secondary)
+        if with_icons:
+            icon(icons[i], cx(tr) - 12.0, tr.y + 10.0, 24.0, c, on)
+            text_in(Rect((tr.x, tr.y + 36.0, tr.w, 20.0)), TITLE_SMALL, labels[i], c, ALIGN_CENTER)
+        else:
+            text_in(tr, TITLE_SMALL, labels[i], c, ALIGN_CENTER)
+    // the indicator slides; its width is the label's
+    f32 pos = animate(id("tabs#pos"), f32(sel^), 0.25)
+    i32 a = clampi(i32(floorf(pos)), 0, n - 1)
+    i32 b = clampi(a + 1, 0, n - 1)
+    f32 fr = pos - floorf(pos)
+    f32 wa = text_width(TITLE_SMALL, labels[a])
+    f32 wb = text_width(TITLE_SMALL, labels[b])
+    f32 iw = lerpf(wa, wb, fr) + 4.0
+    f32 icx = r.x + (pos + 0.5) * w
+    fill_rrect4(Rect((icx - iw * 0.5, bottom(r) - 3.0, iw, 3.0)), Radii((3.0, 3.0, 0.0, 0.0)), t.primary)
+    hline(r.x, right(r), bottom(r) - 1.0, 1.0, t.surface_variant)
+    pop_id()
+    return changed
+
+// ── Cards ──────────────────────────────────────────────────────────────────
+
+const i32 CARD_ELEVATED = 0
+const i32 CARD_FILLED = 1
+const i32 CARD_OUTLINED = 2
+
+// Draw a card's container (12 dp corners). Interactive cards: pass a key and
+// read the answer (clicked).
+bool card(Rect r, i32 kind = 0, string8 key = ""):
+    ^Scheme t = theme()
+    Interact it
+    u64 uid = 0
+    if #len(key) > 0:
+        uid = id(key)
+        it = interact(uid, r, true, false)
+    if kind == CARD_ELEVATED:
+        f32 e = 1.0
+        if uid != 0:
+            e = animate(uid ~ u64(0xCA4D), 2.0 if it.hover else 1.0, 0.2)
+        shadow(r, 12.0, maxi(1, iround(e)))
+        fill_rrect(r, 12.0, t.surface_container_low)
+    else if kind == CARD_FILLED:
+        fill_rrect(r, 12.0, t.surface_container_highest)
+    else:
+        fill_rrect(r, 12.0, t.surface)
+        stroke_rrect(r, 12.0, 1.0, t.outline_variant)
+    if uid != 0:
+        state_layer(uid, r, 12.0, t.on_surface, it)
+        focus_ring(r, 12.0, it.focused)
+    return it.clicked
+
+// ── Lists ──────────────────────────────────────────────────────────────────
+
+// One list item across `r` (56 dp for one line, 72 for two). Leading icon in
+// a 40 dp tonal circle when `avatar`; trailing supporting text; answers true
+// when clicked.
+bool list_item(Rect r, string8 headline, string8 supporting = "", string8 leading = "", string8 trailing = "", bool selected = false, bool avatar = false, string8 key = ""):
+    ^Scheme t = theme()
+    u64 uid = id(#format("li#", key if #len(key) > 0 else headline))
+    Interact it = interact(uid, r, true, false)
+    if selected:
+        fill_rect(r, t.secondary_container)
+    state_layer(uid, r, 0.0, t.on_surface, it)
+    if focus_visible() && it.focused:
+        stroke_rrect(inset(r, 2.0), 4.0, 2.0, t.secondary)
+    f32 x = r.x + 16.0
+    if #len(leading) > 0:
+        if avatar:
+            fill_circle(x + 20.0, cy(r), 20.0, t.primary_container)
+            icon(leading, x + 8.0, cy(r) - 12.0, 24.0, t.on_primary_container)
+            x = x + 40.0 + 16.0
+        else:
+            icon(leading, x, cy(r) - 12.0, 24.0, t.on_surface_variant)
+            x = x + 24.0 + 16.0
+    f32 tw = 0.0
+    if #len(trailing) > 0:
+        tw = text_width(LABEL_SMALL, trailing) + 16.0
+        _ = text(LABEL_SMALL, right(r) - tw, cy(r) - 8.0, trailing, t.on_surface_variant)
+    f32 avail = right(r) - x - tw - 16.0
+    if #len(supporting) > 0:
+        f32 top = cy(r) - 22.0
+        text_in(Rect((x, top, avail, 24.0)), BODY_LARGE, headline, t.on_surface)
+        text_in(Rect((x, top + 24.0, avail, 20.0)), BODY_MEDIUM, supporting, t.on_surface_variant)
+    else:
+        text_in(Rect((x, r.y, avail, r.h)), BODY_LARGE, headline, t.on_surface)
+    return it.clicked
+
+// ── Stepper ────────────────────────────────────────────────────────────────
+
+const i32 STEP_PENDING = 0
+const i32 STEP_ACTIVE = 1
+const i32 STEP_DONE = 2
+const i32 STEP_ERROR = 3
+
+// A horizontal stepper (Back up → Write → Verify): numbered circles joined
+// by lines, each with a title and a caption. `states` gives each step's
+// state; the active step's circle shows a progress ring when `progress` >= 0.
+void stepper(Rect r, []string8 titles, []string8 captions, []i32 states, f32 progress = -1.0):
+    ^Scheme t = theme()
+    i32 n = i32(#len(titles))
+    if n == 0:
+        return
+    f32 w = r.w / f32(n)
+    for i in 0..<n:
+        f32 x0 = r.x + f32(i) * w
+        f32 ccx = x0 + 20.0
+        f32 ccy = r.y + 20.0
+        i32 st = states[i]
+        // connector to the next step
+        if i < n - 1:
+            [4]u8 lc = t.primary if st == STEP_DONE else t.outline_variant
+            f32 tw = text_width(TITLE_SMALL, titles[i])
+            if i < i32(#len(captions)):
+                tw = maxf(tw, text_width(BODY_SMALL, captions[i]))
+            f32 lx0 = ccx + 20.0 + 12.0 + tw + 12.0
+            f32 lx1 = x0 + w - 8.0
+            if lx1 > lx0:
+                hline(lx0, lx1, ccy - 0.5, 1.0, lc)
+        if st == STEP_DONE:
+            fill_circle(ccx, ccy, 16.0, t.primary)
+            icon("check", ccx - 10.0, ccy - 10.0, 20.0, t.on_primary)
+        else if st == STEP_ERROR:
+            fill_circle(ccx, ccy, 16.0, t.error)
+            icon("priority_high", ccx - 10.0, ccy - 10.0, 20.0, t.on_error)
+        else if st == STEP_ACTIVE:
+            fill_circle(ccx, ccy, 16.0, t.primary_container)
+            text_in(Rect((ccx - 16.0, ccy - 10.0, 32.0, 20.0)), LABEL_LARGE, #format(i + 1), t.on_primary_container, ALIGN_CENTER)
+            progress_circular(ccx, ccy, 40.0, progress, 3.0)
+        else:
+            stroke_circle(ccx, ccy, 16.0, 1.0, t.outline)
+            text_in(Rect((ccx - 16.0, ccy - 10.0, 32.0, 20.0)), LABEL_LARGE, #format(i + 1), t.on_surface_variant, ALIGN_CENTER)
+        [4]u8 tc = t.on_surface if st != STEP_PENDING else t.on_surface_variant
+        if st == STEP_ERROR:
+            tc = t.error
+        _ = text(TITLE_SMALL, ccx + 32.0, ccy - 20.0, titles[i], tc)
+        if i < i32(#len(captions)):
+            [4]u8 cc = t.error if st == STEP_ERROR else t.on_surface_variant
+            _ = text(BODY_SMALL, ccx + 32.0, ccy + 2.0, captions[i], cc)
+
+// ── Scroll areas ───────────────────────────────────────────────────────────
+
+// A scroll position the app keeps (one per scrolling region).
+type Scroll:
+    f32 y
+    f32 target
+    f32 x
+    f32 target_x
+    f32 content_h
+    f32 content_w
+    f64 last_t
+    bool dragging
+    f32 drag_off
+
+private f32 wheel_step():
+    return 48.0
+
+// Feed this frame's wheel into `s` if the pointer is over `r`, ease the
+// position towards its target, clamp, and answer whether it moved.
+bool scroll_update(Rect r, ^Scroll s, f32 content_h, f32 content_w = 0.0):
+    s.content_h = content_h
+    s.content_w = content_w
+    f32 maxy = maxf(0.0, content_h - r.h)
+    f32 maxx = maxf(0.0, content_w - r.w)
+    f32 oldy = s.y
+    f32 oldx = s.x
+    if hovering(r) && (wheel_y() != 0.0 || wheel_x() != 0.0):
+        f32 dy = wheel_y()
+        f32 dx = wheel_x()
+        if shift_down() && dx == 0.0:
+            dx = dy
+            dy = 0.0
+        if wheel_fine():
+            // a trackpad: follow the fingers 1:1
+            s.target = clampf(s.target - dy * 10.0, 0.0, maxy)
+            s.y = s.target
+            s.target_x = clampf(s.target_x - dx * 10.0, 0.0, maxx)
+            s.x = s.target_x
+        else:
+            s.target = clampf(s.target - dy * wheel_step(), 0.0, maxy)
+            s.target_x = clampf(s.target_x - dx * wheel_step(), 0.0, maxx)
+        take_wheel()
+    s.target = clampf(s.target, 0.0, maxy)
+    s.target_x = clampf(s.target_x, 0.0, maxx)
+    // ease: close 1 - e^(-dt/τ) of the distance per frame (τ ≈ 60 ms)
+    f64 tnow = now()
+    f32 dt = clampf(f32(tnow - s.last_t), 0.0, 0.1)
+    s.last_t = tnow
+    f32 k = 1.0 - f32(exp_neg(f64(dt) / 0.06))
+    if absf(s.target - s.y) > 0.25:
+        s.y = s.y + (s.target - s.y) * k
+        animating()
+    else:
+        s.y = s.target
+    if absf(s.target_x - s.x) > 0.25:
+        s.x = s.x + (s.target_x - s.x) * k
+        animating()
+    else:
+        s.x = s.target_x
+    s.y = clampf(s.y, 0.0, maxy)
+    s.x = clampf(s.x, 0.0, maxx)
+    return s.y != oldy || s.x != oldx
+
+// Scroll so that [y0, y1] (content coordinates) is visible in a view `h` tall.
+void scroll_to_show(^Scroll s, f32 y0, f32 y1, f32 h):
+    if y0 < s.target:
+        s.target = y0
+    else if y1 > s.target + h:
+        s.target = y1 - h
+    request_frame()
+
+private f64 exp_neg(f64 x):
+    return 1.0 / (1.0 + x + x * x * 0.5 + x * x * x / 6.0 + x * x * x * x / 24.0)
+
+// A thin overlay scrollbar along the right edge of `r` (draggable).
+void scrollbar(string8 key, Rect r, ^Scroll s):
+    ^Scheme t = theme()
+    if s.content_h <= r.h + 0.5:
+        return
+    f32 th = maxf(32.0, r.h * r.h / s.content_h)
+    f32 maxy = s.content_h - r.h
+    f32 ty = r.y + (r.h - th) * (s.y / maxy)
+    Rect track = Rect((right(r) - 12.0, r.y, 12.0, r.h))
+    Rect thumb = Rect((right(r) - 10.0, ty + 2.0, 8.0, th - 4.0))
+    u64 uid = id(#format(key, "#sb"))
+    Interact it = interact(uid, track, false, false)
+    if it.pressed:
+        if contains(thumb, mouse_x(), mouse_y()):
+            s.drag_off = mouse_y() - ty
+        else:
+            s.drag_off = th * 0.5
+    if it.down:
+        f32 ny = (mouse_y() - s.drag_off - r.y) / (r.h - th) * maxy
+        s.target = clampf(ny, 0.0, maxy)
+        s.y = s.target
+    bool hot = it.hover || it.down
+    f32 k = animate(uid ~ u64(0x5C2B), 1.0 if hot else 0.0, 0.15)
+    Rect tb = Rect((right(r) - 4.0 - lerpf(4.0, 8.0, k), ty + 2.0, lerpf(4.0, 8.0, k), th - 4.0))
+    fill_rrect(tb, tb.w * 0.5, alpha(t.on_surface_variant, lerpf(0.35, 0.6, k)))
+
+// A thin overlay scrollbar along the bottom of `r` for horizontal scrolling
+// (`lead` dp of the content are frozen to the left of `r`).
+void scrollbar_h(string8 key, Rect r, ^Scroll s, f32 lead = 0.0):
+    f32 vw = r.w
+    f32 content = s.content_w - lead
+    if content <= vw + 0.5:
+        return
+    f32 maxx = s.content_w - (r.w + lead)
+    if maxx <= 0.0:
+        return
+    f32 tw = maxf(32.0, vw * vw / content)
+    f32 tx = r.x + (vw - tw) * (s.x / maxx)
+    Rect track = Rect((r.x, bottom(r) - 12.0, vw, 12.0))
+    u64 uid = id(#format(key, "#sbh"))
+    Interact it = interact(uid, track, false, false)
+    if it.pressed:
+        s.drag_off = mouse_x() - tx if mouse_x() >= tx && mouse_x() <= tx + tw else tw * 0.5
+    if it.down:
+        f32 nx = (mouse_x() - s.drag_off - r.x) / (vw - tw) * maxx
+        s.target_x = clampf(nx, 0.0, maxx)
+        s.x = s.target_x
+    f32 k = animate(uid ~ u64(0x5C2C), 1.0 if (it.hover || it.down) else 0.0, 0.15)
+    f32 th = lerpf(4.0, 8.0, k)
+    Rect tb = Rect((tx + 2.0, bottom(r) - 4.0 - th, tw - 4.0, th))
+    fill_rrect(tb, th * 0.5, alpha(theme().on_surface_variant, lerpf(0.35, 0.6, k)))

@@ -1,0 +1,126 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The data table, headless: virtualisation (1000 rows, only the visible ones
+// asked for), the keyboard cell cursor and paging, editing by typing,
+// choice cells, sorting by header click, row selection.
+package btui
+
+private TableState g_ts
+private ref []Column g_cols
+private i32 g_asked
+private i32 g_max_row
+private TableEvent g_last
+private i32 g_events
+[3]string8 MODES = ["FM", "NFM", "AM"]
+
+private string8 txt(i32 row, i32 col):
+    g_asked += 1
+    if row > g_max_row:
+        g_max_row = row
+    if col == 0:
+        return #format(row + 1)
+    if col == 1:
+        return #format("CH", row + 1)
+    return "FM"
+
+private i32 deco(i32 row, i32 col):
+    if row == 2 && col == 1:
+        return DECO_ERROR
+    return DECO_NONE
+
+private string8 msg(i32 row, i32 col):
+    return "out of band"
+
+private void frame():
+    TableEvent ev = table("t", rect(0.0, 0.0, 600.0, 400.0), g_cols[:], 1000, &g_ts, txt, deco, msg)
+    if ev.kind != TEV_NONE:
+        g_last = ev
+        g_events += 1
+
+private void step():
+    headless_frame(0.016)
+
+i32 test():
+    bool ok = #expect(headless_up(800.0, 600.0, 1.0, frame), "headless up")
+    _ = load_assets()
+    g_ts = table_state()
+    g_cols = #make([]Column, 0)
+    g_cols = #append(g_cols, column("#", 60.0, COL_INDEX, false))
+    g_cols = #append(g_cols, column("Name", 200.0, COL_TEXT))
+    Column m = column("Mode", 120.0, COL_CHOICE)
+    m.choices = MODES[:]
+    g_cols = #append(g_cols, m)
+    step()
+    // virtual: 1000 rows, but only the ~9 visible ones (x 3 columns) asked for
+    g_asked = 0
+    g_max_row = 0
+    step()
+    i32 visible = i32((400.0 - HEAD_H) / ROW_H) + 2
+    ok = #expect(g_asked <= visible * 3 && g_max_row < visible, "virtualised: asked ", g_asked, " cells, max row ", g_max_row) && ok
+    // click a cell: focus, cursor, single selection
+    push_mouse_move(100.0, HEAD_H + ROW_H * 1.5)
+    step()
+    push_click(100.0, HEAD_H + ROW_H * 1.5)
+    step()
+    ok = #expect(focus_id() == id("t") && g_ts.cur_row == 1 && g_ts.cur_col == 1, "click sets the cursor: ", g_ts.cur_row, ",", g_ts.cur_col) && ok
+    ok = #expect(table_row_selected(&g_ts, 1) && table_selected_count(&g_ts) == 1, "click selects the row") && ok
+    // keyboard paging scrolls to keep the cursor visible
+    push_key(KEY_PAGE_DOWN, 0)
+    push_key(KEY_PAGE_DOWN, 0)
+    push_key(KEY_PAGE_DOWN, 0)
+    step()
+    for i in 0..<60:
+        step()
+    i32 row = g_ts.cur_row
+    f32 y = f32(row) * ROW_H
+    ok = #expect(row > 15 && g_ts.scroll.y <= y && g_ts.scroll.y + 400.0 - HEAD_H >= y + ROW_H, "page down scrolls: row ", row, " scroll ", g_ts.scroll.y) && ok
+    // Ctrl+End to the last row
+    push_key(KEY_END, MOD_CTRL)
+    step()
+    for i in 0..<40:
+        step()
+    ok = #expect(g_ts.cur_row == 999 && g_max_row == 999, "Ctrl+End reaches row 1000 (asked up to ", g_max_row, ")") && ok
+    // Shift+Up extends the selection
+    push_key(KEY_UP, MOD_SHIFT)
+    push_key(KEY_UP, MOD_SHIFT)
+    step()
+    ok = #expect(table_selected_count(&g_ts) == 3, "shift extends: ", table_selected_count(&g_ts)) && ok
+    // typing starts an edit that replaces the value; Enter commits and moves down
+    g_events = 0
+    push_text("Truck")
+    step()
+    ok = #expect(g_ts.editing && field_text(&g_ts.edit) == "Truck", "typing edits: '", field_text(&g_ts.edit), "'") && ok
+    push_key(KEY_ENTER, 0)
+    step()
+    ok = #expect(g_last.kind == TEV_COMMIT && g_last.text == "Truck" && g_last.row == 997 && g_last.col == 1, "Enter commits: ", g_last.kind, " ", g_last.row) && ok
+    ok = #expect(!g_ts.editing && g_ts.cur_row == 998, "and moves down") && ok
+    // Esc cancels an edit
+    push_key(KEY_F2, 0)
+    step()
+    push_text("x")
+    push_key(KEY_ESCAPE, 0)
+    step()
+    ok = #expect(!g_ts.editing, "Esc cancels") && ok
+    // a choice cell: Right, Space opens the menu, Down + Enter chooses
+    push_key(KEY_RIGHT, 0)
+    push_key(KEY_SPACE, 0)
+    step()
+    step()
+    ok = #expect(menu_is_open("table#choice"), "Space opens the choice menu") && ok
+    push_key(KEY_DOWN, 0)
+    step()
+    push_key(KEY_ENTER, 0)
+    step()
+    ok = #expect(g_last.kind == TEV_CHOICE && g_last.choice == 1 && g_last.text == "NFM", "choice commits: ", g_last.kind, " ", g_last.choice) && ok
+    // header click sorts, a second click reverses
+    push_mouse_move(100.0, 20.0)
+    step()
+    push_click(100.0, 20.0)
+    step()
+    ok = #expect(g_last.kind == TEV_SORT && g_ts.sort_col == 1 && !g_ts.sort_desc, "header click sorts") && ok
+    push_click(100.0, 20.0)
+    step()
+    ok = #expect(g_ts.sort_desc, "second click reverses") && ok
+    return 0 if ok else 1

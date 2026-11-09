@@ -6,6 +6,7 @@
 // programming-cable chips.
 package radio
 
+import "../serial"
 import "core:io"
 import "core:os/fs"
 import "core:os/proc"
@@ -139,6 +140,30 @@ private void ioreg_ids(^PortList l):
 // Every serial port that may be a programming cable.
 PortList list_ports():
     PortList l
+    // Windows: COM ports and their USB IDs from the registry (serial package)
+    ref []char8 win = serial.windows_ports()
+    if #len(win) != 0:
+        string8 text = win
+        string8 line
+        strings.Splitter it = strings.splitter(text, "\n")
+        for strings.split_next(&it, &line):
+            (string8 name, string8 rest, bool f1) = strings.split_first(line, "\t")
+            if !f1 || #len(name) == 0:
+                continue
+            (string8 vid, string8 pid, bool f2) = strings.split_first(rest, "\t")
+            add_port(&l, name)
+            if f2 && vid != "-":
+                i64 v = -1
+                i64 p = -1
+                try v = parse.to_i64(vid, 16) else:
+                    v = -1
+                try p = parse.to_i64(pid, 16) else:
+                    p = -1
+                l.ports[#len(l.ports) - 1].vid = i32(v)
+                l.ports[#len(l.ports) - 1].pid = i32(p)
+        #delete(win)
+        return l
+    #delete(win)
     glob_into(&l, "/dev/cu.*")
     glob_into(&l, "/dev/ttyUSB*")
     glob_into(&l, "/dev/ttyACM*")

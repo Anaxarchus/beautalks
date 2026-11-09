@@ -1,47 +1,148 @@
 // beautalks - radio programming software
 // Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
 //
-// A Link over a serial port (the programming cable, or a pty in tests).
+// A Link over a serial port (the programming cable, or a pty in tests),
+// with an optional trace: a timestamped log of every byte sent and
+// received, port open/close, line changes, discards and waits, for
+// debugging on real hardware (`beautalks --trace FILE`).
 package radio
 
 import "../serial"
+import "core:io"
 import "core:strings"
+import "core:time"
+
+private ^io.FILE g_trace = nil
+private i64 g_trace_t0 = 0
+
+// Starts appending a trace to `file`; false when it cannot be opened.
+bool set_trace(string8 file):
+    try ^io.FILE f = io.open_append(file) else:
+        return false
+    g_trace = f
+    g_trace_t0 = i64(time.instant())
+    trace_text("TRACE start")
+    return true
+
+void stop_trace():
+    if g_trace != nil:
+        trace_text("TRACE stop")
+        _ = io.close(g_trace)
+        g_trace = nil
+
+bool tracing():
+    return g_trace != nil
+
+private void stamp(^strings.Builder b):
+    i64 us = time.as_microseconds(time.elapsed(time.Instant(g_trace_t0)))
+    strings.append_char(b, '+')
+    append_int(b, us / 1000000)
+    strings.append_char(b, '.')
+    append_padded(b, us % 1000000, 6)
+    strings.append_char(b, ' ')
+
+// Writes one trace line: time, then `text`.
+void trace_text(string8 text):
+    if g_trace == nil:
+        return
+    strings.Builder b = strings.builder(64)
+    stamp(&b)
+    strings.append(&b, text)
+    strings.append_char(&b, '\n')
+    _ = io.write(g_trace, strings.text(b))
+    _ = io.flush(g_trace)
+    #delete(b)
+
+// Writes one trace line: time, `tag`, the byte count and the bytes in hex.
+void trace_bytes(string8 tag, []u8 data):
+    if g_trace == nil:
+        return
+    strings.Builder b = strings.builder(64 + 3 * #len(data))
+    stamp(&b)
+    strings.append(&b, tag)
+    strings.append_char(&b, ' ')
+    append_int(&b, #len(data))
+    strings.append(&b, ":")
+    string8 digits = "0123456789ABCDEF"
+    for x in data:
+        strings.append_char(&b, ' ')
+        strings.append_char(&b, digits[i64(x >> 4)])
+        strings.append_char(&b, digits[i64(x & 0xF)])
+    strings.append_char(&b, '\n')
+    _ = io.write(g_trace, strings.text(b))
+    _ = io.flush(g_trace)
+    #delete(b)
+
+private void trace_n(string8 tag, i64 n):
+    if g_trace == nil:
+        return
+    strings.Builder b = strings.builder(32)
+    strings.append(&b, tag)
+    append_int(&b, n)
+    trace_text(strings.text(b))
+    #delete(b)
 
 type SerialLink using Link:
     serial.Port port
 
     !void send(^self, []u8 data):
+        trace_bytes("TX", data)
         try serial.write(self.port, data)
 
     !i64 recv(^self, []u8 into, i32 timeout_ms):
         try i64 n = serial.read_into(self.port, into, timeout_ms)
+        if g_trace != nil:
+            if n > 0:
+                trace_bytes("RX", into[0..<n])
+            else:
+                trace_n("RX timeout ms=", i64(timeout_ms))
         return n
 
     i32 recv_byte(^self, i32 timeout_ms):
         [1]u8 one
         try i64 n = serial.read_into(self.port, one[:], timeout_ms) else:
+            trace_text("RX error")
             return -1
         if n != 1:
+            trace_n("RX timeout ms=", i64(timeout_ms))
             return -1
+        trace_bytes("RX", one[:])
         return i32(one[0])
 
     void sleep_ms(^self, i32 ms):
+        if ms > 0:
+            trace_n("SLEEP ms=", i64(ms))
         serial.pause(ms)
 
     void discard(^self):
         // CHIRP _clean_buffer: read whatever is pending for a moment
         [256]u8 junk
-        try i64 _ = serial.read_into(self.port, junk[:], 5) else:
+        try i64 n = serial.read_into(self.port, junk[:], 5) else:
             return
+        if n > 0:
+            trace_bytes("DISCARD", junk[0..<n])
         serial.discard_input(self.port)
 
-// Opens `path` at `baud`.
+// Opens `path` at `baud` (the port settles and is flushed before use).
 LinkError!SerialLink open_serial(string8 path, i32 baud):
     ref []char8 c = strings.clone_to_cstring(path)
     defer #delete(c)
+    if g_trace != nil:
+        strings.Builder b = strings.builder(64)
+        strings.append(&b, "OPEN ")
+        strings.append(&b, path)
+        strings.append(&b, " baud=")
+        append_int(&b, i64(baud))
+        strings.append(&b, " (DTR+RTS up, settle 200 ms, flush)")
+        trace_text(strings.text(b))
+        #delete(b)
     try serial.Port p = serial.open(cstring(c), baud) else:
+        trace_text("OPEN failed")
         fail LinkError.IO
+    trace_text("OPEN ready")
     return SerialLink(p)
 
 void close_serial(^SerialLink l):
+    if l^.port.fd >= 0:
+        trace_text("CLOSE")
     serial.close(&l^.port)

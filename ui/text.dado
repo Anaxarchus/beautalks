@@ -1,0 +1,365 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Text: Inter (OFL) rasterised by stb_truetype at device-pixel size into the
+// shared atlas, glyph by glyph, on first use.
+//
+//   * Any code point the font has is drawn (Inter covers Latin, Greek,
+//     Cyrillic and the symbols the app uses: ✓ ° ± · — … → ⚠). app:font's
+//     ASCII-only range is not involved: btui keeps its own glyph cache.
+//   * Glyphs are cached per (face, pixel size, glyph, horizontal sub-pixel
+//     phase): 4 phases below 1.5x, 2 above, so text is laid out at fractional
+//     positions without uneven gaps and still sampled texel for texel.
+//   * Kerning and tabular figures come from the .btk sidecar that
+//     tools/make_fonts.py writes (stb_truetype reads neither from Inter 4).
+//   * Letter spacing follows Inter's "dynamic metrics" formula, so small
+//     sizes open up and large sizes tighten the way Inter is designed to.
+//   * The baseline is snapped to a device pixel; lines are centred in their
+//     line box the way a browser does (typo ascender/descender).
+package btui
+
+import "core:math"
+import "core:os/fs"
+import "core:path"
+import "vendor:stb/stb_truetype"
+
+type Face:
+    stb_truetype.stbtt_fontinfo info
+    ref []u8 data
+    bool ok
+    i32 ascent
+    i32 descent
+    i32 upem
+    {u32: i16} kern
+    {i32: i32} tnum
+    {i32: i32} gids
+    {i32: i32} advs
+
+private [3]Face g_faces
+private bool g_fonts_ok
+
+type Glyph: (i32 x, i32 y, i32 w, i32 h, i32 xoff, i32 yoff, i32 gen)
+
+private {u64: Glyph} g_glyphs
+
+private [256]u8 g_gamma
+
+bool fonts_ok():
+    return g_fonts_ok
+
+private u16 rd16([]u8 b, i64 at):
+    return u16(b[at]) | (u16(b[at + 1]) << 8)
+
+private u32 rd32([]u8 b, i64 at):
+    return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+
+private bool load_face(i32 slot, string8 file):
+    ^Face f = &g_faces[slot]
+    using keep():
+        try ref []u8 data = fs.read_bytes(file) else:
+            return false
+        f.data = data
+        if stb_truetype.stbtt_InitFont(&f.info, &f.data[0], 0) == 0:
+            return false
+        i32 a = 0
+        i32 d = 0
+        i32 g = 0
+        if stb_truetype.stbtt_GetFontVMetricsOS2(&f.info, &a, &d, &g) == 0:
+            stb_truetype.stbtt_GetFontVMetrics(&f.info, &a, &d, &g)
+        f.ascent = a
+        f.descent = d
+        f.upem = 2048
+        f32 s1 = stb_truetype.stbtt_ScaleForMappingEmToPixels(&f.info, 1.0)
+        if s1 > 0.0:
+            f.upem = iround(1.0 / s1)
+        // The sidecar: kerning pairs and the tnum map.
+        string8 side = #format(file, ".btk")
+        try ref []u8 k = fs.read_bytes(side) else:
+            f.ok = true
+            return true
+        if #len(k) >= 12 && k[0] == u8('B') && k[1] == u8('T') && k[2] == u8('K') && k[3] == u8('1'):
+            i64 np = i64(rd32(k[:], 4))
+            i64 ns = i64(rd32(k[:], 8))
+            i64 at = 12
+            for i in 0..<np:
+                u32 l = u32(rd16(k[:], at))
+                u32 r = u32(rd16(k[:], at + 2))
+                i16 v = i16(rd16(k[:], at + 4))
+                f.kern[(l << 16) | r] = v
+                at += 6
+            for i in 0..<ns:
+                f.tnum[i32(rd16(k[:], at))] = i32(rd16(k[:], at + 2))
+                at += 4
+        #delete(k)
+    f.ok = true
+    return true
+
+// Load the three Inter faces from `dir` (assets/fonts). Answers false if the
+// regular face is missing; a missing Medium/SemiBold falls back to Regular.
+bool load_fonts(string8 dir):
+    for i in 0..<256:
+        f32 v = f32(i32(i)) / 255.0
+        // A gentle contrast curve: stb's coverage is linear, and blending in
+        // sRGB space without one makes small text look thin and grey.
+        f32 g = f32(math.raised(f64(v), 0.80))
+        g_gamma[i] = u8(clampf(g * 255.0 + 0.5, 0.0, 255.0))
+    bool r = load_face(FACE_REGULAR, path.join(dir, "Inter-Regular.otf"))
+    bool m = load_face(FACE_MEDIUM, path.join(dir, "Inter-Medium.otf"))
+    bool s = load_face(FACE_SEMIBOLD, path.join(dir, "Inter-SemiBold.otf"))
+    g_fonts_ok = r
+    if !m:
+        g_faces[FACE_MEDIUM] = g_faces[FACE_REGULAR]
+    if !s:
+        g_faces[FACE_SEMIBOLD] = g_faces[FACE_MEDIUM]
+    return r
+
+private ^Face face(i32 i):
+    return &g_faces[clampi(i, 0, 2)]
+
+private i32 gid_of(^Face f, i32 cp, bool tnum):
+    i32 g = 0
+    try g = f.gids[cp] else:
+        using keep():
+            g = stb_truetype.stbtt_FindGlyphIndex(&f.info, cp)
+            f.gids[cp] = g
+    if tnum:
+        try i32 t = f.tnum[g] else:
+            return g
+        return t
+    return g
+
+private i32 adv_of(^Face f, i32 g):
+    try i32 a = f.advs[g] else:
+        i32 aw = 0
+        i32 lsb = 0
+        stb_truetype.stbtt_GetGlyphHMetrics(&f.info, g, &aw, &lsb)
+        using keep():
+            f.advs[g] = aw
+        return aw
+    return a
+
+private i32 kern_of(^Face f, i32 a, i32 b):
+    if a <= 0 || b <= 0:
+        return 0
+    try i16 v = f.kern[(u32(a) << 16) | u32(b)] else:
+        return 0
+    return i32(v)
+
+// Inter's dynamic tracking, in em, for a size in dp.
+f32 tracking_em(f32 size):
+    return -0.0223 + 0.185 * f32(math.e_to(f64(-0.1745 * size)))
+
+// Pixel metrics for a style at the current scale.
+type Metrics: (f32 px_size, f32 scale, f32 track_px, f32 ascent_px, f32 descent_px)
+
+private Metrics metrics(Style st):
+    ^Face f = face(st.face)
+    f32 ps = st.size * scale()
+    f32 sc = ps / f32(f.upem)
+    return Metrics((ps, sc, tracking_em(st.size) * ps, f32(f.ascent) * sc, f32(f.descent) * sc))
+
+// Width of `s` in dp.
+f32 text_width(Style st, string8 s):
+    if !g_fonts_ok:
+        return f32(#len(s)) * st.size * 0.55
+    ^Face f = face(st.face)
+    Metrics m = metrics(st)
+    f32 pen = 0.0
+    i32 prev = 0
+    i64 i = 0
+    for i < #len(s):
+        (i32 cp, i32 n) = utf8_at(s, i)
+        i += i64(n)
+        i32 g = gid_of(f, cp, st.tnum)
+        pen = pen + f32(kern_of(f, prev, g)) * m.scale + f32(adv_of(f, g)) * m.scale + m.track_px
+        prev = g
+    if #len(s) > 0:
+        pen = pen - m.track_px
+    return pen / scale()
+
+// The x (dp, from the start of the text) of byte index `at`.
+f32 text_x_at(Style st, string8 s, i64 at):
+    i64 n = at
+    if n > #len(s):
+        n = #len(s)
+    if n <= 0:
+        return 0.0
+    f32 w = text_width(st, s[0..<n])
+    ^Face f = face(st.face)
+    Metrics m = metrics(st)
+    _ = f
+    return w + m.track_px / scale()
+
+// The byte index nearest to x (dp from the start of the text).
+i64 text_index_at(Style st, string8 s, f32 x):
+    if x <= 0.0:
+        return 0
+    ^Face f = face(st.face)
+    Metrics m = metrics(st)
+    f32 pen = 0.0
+    i32 prev = 0
+    i64 i = 0
+    f32 want = x * scale()
+    for i < #len(s):
+        (i32 cp, i32 n) = utf8_at(s, i)
+        i32 g = gid_of(f, cp, st.tnum)
+        f32 adv = f32(kern_of(f, prev, g)) * m.scale + f32(adv_of(f, g)) * m.scale + m.track_px
+        if want < pen + adv * 0.5:
+            return i
+        pen = pen + adv
+        prev = g
+        i += i64(n)
+    return #len(s)
+
+private Glyph glyph(^Face f, i32 fi, f32 sc, i32 size_key, i32 g, i32 sub, i32 nsub):
+    u64 key = (u64(fi) << 56) | (u64(size_key & 0xFFFF) << 32) | (u64(g & 0xFFFFFF) << 4) | u64(sub & 0xF)
+    Glyph gl
+    bool have = true
+    try gl = g_glyphs[key] else:
+        have = false
+    if !have || gl.gen != atlas_gen():
+        f32 shift = f32(sub) / f32(nsub)
+        i32 x0 = 0
+        i32 y0 = 0
+        i32 x1 = 0
+        i32 y1 = 0
+        stb_truetype.stbtt_GetGlyphBitmapBoxSubpixel(&f.info, g, sc, sc, shift, 0.0, &x0, &y0, &x1, &y1)
+        i32 w = x1 - x0
+        i32 h = y1 - y0
+        Glyph ng = Glyph((0, 0, 0, 0, x0, y0, atlas_gen()))
+        if w > 0 && h > 0:
+            (i32 ax, i32 ay, bool ok) = atlas_alloc(w, h)
+            if ok:
+                ref []u8 tmp = #make([]u8, i64(w) * i64(h))
+                stb_truetype.stbtt_MakeGlyphBitmapSubpixel(&f.info, &tmp[0], w, h, w, sc, sc, shift, 0.0, g)
+                for yy in 0..<h:
+                    for xx in 0..<w:
+                        atlas_set(ax + i32(xx), ay + i32(yy), g_gamma[tmp[i64(yy) * i64(w) + i64(xx)]])
+                #delete(tmp)
+                ng = Glyph((ax, ay, w, h, x0, y0, atlas_gen()))
+        using keep():
+            g_glyphs[key] = ng
+        return ng
+    return gl
+
+// Draw `s` with its baseline at `base` (dp) starting at x (dp). Answers the
+// pen x (dp) at the end. Glyphs entirely outside [clip_x0, clip_x1] (dp) are
+// skipped.
+f32 text_baseline(Style st, f32 x, f32 base, string8 s, [4]u8 col, f32 clip_x0 = -100000.0, f32 clip_x1 = 100000.0):
+    if !g_fonts_ok || col[3] == 0:
+        return x + text_width(st, s)
+    ^Face f = face(st.face)
+    Metrics m = metrics(st)
+    f32 sc = scale()
+    i32 nsub = 4 if sc < 1.5 else 2
+    i32 size_key = iround(m.px_size * 4.0)
+    f32 pen = x * sc
+    f32 by = f32(iround(base * sc))
+    f32 cx0 = clip_x0 * sc
+    f32 cx1 = clip_x1 * sc
+    i32 prev = 0
+    i64 i = 0
+    for i < #len(s):
+        (i32 cp, i32 n) = utf8_at(s, i)
+        i += i64(n)
+        i32 g = gid_of(f, cp, st.tnum)
+        pen = pen + f32(kern_of(f, prev, g)) * m.scale
+        f32 adv = f32(adv_of(f, g)) * m.scale
+        if pen + adv >= cx0 && pen <= cx1 && cp != 32:
+            f32 fl = floorf(pen)
+            i32 sub = i32((pen - fl) * f32(nsub))
+            if sub >= nsub:
+                sub = nsub - 1
+            Glyph gl = glyph(f, st.face, m.scale, size_key, g, sub, nsub)
+            if gl.w > 0:
+                quad_px(fl + f32(gl.xoff), by + f32(gl.yoff), f32(gl.w), f32(gl.h),
+                        [f32(gl.x), f32(gl.y), f32(gl.w), f32(gl.h)], col)
+        pen = pen + adv + m.track_px
+        prev = g
+    return (pen - m.track_px) / sc
+
+// The baseline (dp) of a line whose line box starts at `top`.
+f32 baseline_in(Style st, f32 top):
+    if !g_fonts_ok:
+        return top + st.line * 0.75
+    ^Face f = face(st.face)
+    f32 asc = f32(f.ascent) / f32(f.upem) * st.size
+    f32 desc = f32(f.descent) / f32(f.upem) * st.size
+    f32 content = asc - desc
+    return top + (st.line - content) * 0.5 + asc
+
+// Draw one line in its line box (top-left at x, y). Answers the end x.
+f32 text(Style st, f32 x, f32 y, string8 s, [4]u8 col):
+    return text_baseline(st, x, baseline_in(st, y), s, col)
+
+const i32 ALIGN_START = 0
+const i32 ALIGN_CENTER = 1
+const i32 ALIGN_END = 2
+
+// One line inside `r`: vertically centred, aligned horizontally, shortened
+// with an ellipsis if it does not fit.
+void text_in(Rect r, Style st, string8 s, [4]u8 col, i32 align = 0):
+    f32 w = text_width(st, s)
+    f32 top = r.y + (r.h - st.line) * 0.5
+    if w <= r.w + 0.01:
+        f32 x = r.x
+        if align == ALIGN_CENTER:
+            x = r.x + (r.w - w) * 0.5
+        else if align == ALIGN_END:
+            x = r.x + r.w - w
+        _ = text(st, x, top, s, col)
+        return
+    i64 n = fit_prefix(st, s, r.w - text_width(st, "…"))
+    f32 x = text(st, r.x, top, s[0..<n], col)
+    _ = text(st, x, top, "…", col)
+
+// The longest prefix (byte length, on a code point boundary) that fits in w dp.
+i64 fit_prefix(Style st, string8 s, f32 w):
+    i64 best = 0
+    i64 i = 0
+    for i < #len(s):
+        i64 nx = utf8_next(s, i)
+        if text_width(st, s[0..<nx]) > w:
+            return best
+        best = nx
+        i = nx
+    return best
+
+// Word-wrapped text in `r` (top-aligned). Answers the height used (dp).
+f32 text_wrap(Rect r, Style st, string8 s, [4]u8 col, bool measure_only = false):
+    f32 y = r.y
+    i64 start = 0
+    i64 len = #len(s)
+    for start < len:
+        // take as many words as fit
+        i64 end = start
+        i64 last_break = -1
+        i64 i = start
+        bool hard = false
+        for i < len:
+            char8 c = s[i]
+            if c == '\n':
+                last_break = i
+                hard = true
+                break
+            if c == ' ':
+                if text_width(st, s[start..<i]) > r.w && last_break > start:
+                    break
+                last_break = i
+            i = utf8_next(s, i)
+        if i >= len && !hard:
+            if text_width(st, s[start..<len]) <= r.w || last_break < 0:
+                end = len
+            else:
+                end = last_break
+        else if hard:
+            end = last_break
+        else:
+            end = last_break if last_break > start else i
+        if !measure_only:
+            _ = text(st, r.x, y, s[start..<end], col)
+        y = y + st.line
+        start = end
+        if start < len && (s[start] == ' ' || s[start] == '\n'):
+            start += 1
+    return y - r.y

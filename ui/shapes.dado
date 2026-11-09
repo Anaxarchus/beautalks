@@ -1,0 +1,320 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Anti-aliased rounded rectangles, rings and soft shadows, built from tiles.
+//
+// A rounded rectangle is nine pieces: four corner tiles and five solid
+// rectangles. A corner tile is the exact pixel coverage of a quarter disc of
+// radius R device pixels (8x8 supersampled, so 64 coverage levels), cached in
+// the atlas once per radius and mirrored for the other corners. Corners land
+// on whole device pixels and are sampled texel for texel, so the edge is as
+// crisp as an analytic SDF and costs one quad.
+//
+// A shadow is a Gaussian-blurred rounded rectangle, computed on the CPU by
+// separable convolution of a supersampled mask: a "proxy" big enough that its
+// four corners do not interact is blurred once per (radius, sigma) and drawn
+// as a nine-slice (corners from the proxy, edges by stretching its middle
+// row and column, a solid centre). A shape too small for that gets an exact
+// blurred image of its own size, cached by size. The falloff is a true
+// Gaussian at 8-bit precision, so there is no banding from approximating it.
+package btui
+
+import "app:draw"
+import "core:math"
+
+const u64 TILE_CORNER = 1
+const u64 TILE_RING = 2
+const u64 TILE_SHADOW = 3
+const u64 TILE_SHADOW_EXACT = 4
+const u64 TILE_GLYPH = 5
+const u64 TILE_ICON = 6
+const u64 TILE_IMAGE = 7
+
+type Tile: (i32 x, i32 y, i32 w, i32 h)
+
+type TileE: (Tile t, i32 gen)
+
+private {u64: TileE} g_tiles
+
+u64 tile_key(u64 kind, i32 a, i32 b, i32 c, i32 d):
+    u64 hi = (kind << 60) | ((u64(a) & 0x7FFF) << 45) | ((u64(b) & 0x7FFF) << 30)
+    return hi | ((u64(c) & 0x7FFF) << 15) | (u64(d) & 0x7FFF)
+
+(Tile t, bool ok) tile_find(u64 key):
+    try TileE e = g_tiles[key] else:
+        return (Tile((0, 0, 0, 0)), false)
+    if e.gen != atlas_gen():
+        return (Tile((0, 0, 0, 0)), false)
+    return (e.t, true)
+
+void tile_store(u64 key, Tile t):
+    using keep():
+        g_tiles[key] = TileE((t, atlas_gen()))
+
+i32 tile_count():
+    return i32(#len(g_tiles))
+
+// ── Coverage ───────────────────────────────────────────────────────────────
+
+private const i32 SS = 8
+
+// Inside a rounded rectangle's top-left corner region: the rectangle starts at
+// (o, o) and has corner radius r. Points right of / below the corner circle's
+// centre are inside (the caller only asks about the corner tile).
+private bool in_corner(f32 x, f32 y, f32 o, f32 r):
+    if x < o || y < o:
+        return false
+    f32 c = o + r
+    if x >= c || y >= c:
+        return true
+    f32 dx = x - c
+    f32 dy = y - c
+    return dx * dx + dy * dy <= r * r
+
+private u8 coverage_ring(i32 px, i32 py, f32 r, f32 bw):
+    i32 hits = 0
+    f32 ri = maxf(0.0, r - bw)
+    for sy in 0..<SS:
+        for sx in 0..<SS:
+            f32 x = f32(px) + (f32(sx) + 0.5) / f32(SS)
+            f32 y = f32(py) + (f32(sy) + 0.5) / f32(SS)
+            bool outer = in_corner(x, y, 0.0, r)
+            if outer && bw > 0.0:
+                if in_corner(x, y, bw, ri):
+                    outer = false
+            if outer:
+                hits += 1
+    return u8((hits * 255 + (SS * SS) / 2) / (SS * SS))
+
+// The tile for a top-left corner of radius r px (filled when bw == 0, a ring
+// of width bw otherwise). Its side is max(r, bw).
+Tile corner_tile(i32 r, i32 bw):
+    u64 key = tile_key(TILE_CORNER if bw == 0 else TILE_RING, r, bw, 0, 0)
+    (Tile t, bool ok) = tile_find(key)
+    if ok:
+        return t
+    i32 side = maxi(r, bw)
+    (i32 x, i32 y, bool got) = atlas_alloc(side, side)
+    if !got:
+        return Tile((0, 0, 0, 0))
+    for py in 0..<side:
+        for px in 0..<side:
+            atlas_set(x + i32(px), y + i32(py), coverage_ring(i32(px), i32(py), f32(r), f32(bw)))
+    Tile nt = Tile((x, y, side, side))
+    tile_store(key, nt)
+    return nt
+
+// ── Drawing in device pixels ───────────────────────────────────────────────
+
+// One textured quad from the atlas. `src` is in atlas pixels; a negative
+// width or height mirrors.
+void quad_px(f32 x, f32 y, f32 w, f32 h, [4]f32 src, [4]u8 col):
+    if w <= 0.0 || h <= 0.0 || col[3] == 0:
+        return
+    draw.texture_rect_region(cur_item(), atlas_texture(), [x, y, w, h], src, col)
+    count_quad()
+
+void solid_px(f32 x, f32 y, f32 w, f32 h, [4]u8 col):
+    quad_px(x, y, w, h, white_src(), col)
+
+private void corner_px(Tile t, f32 x, f32 y, bool fx, bool fy, [4]u8 col):
+    f32 sx = f32(t.x)
+    f32 sy = f32(t.y)
+    f32 sw = f32(t.w)
+    f32 sh = f32(t.h)
+    if fx:
+        sx = sx + sw
+        sw = 0.0 - sw
+    if fy:
+        sy = sy + sh
+        sh = 0.0 - sh
+    quad_px(x, y, f32(t.w), f32(t.h), [sx, sy, sw, sh], col)
+
+// Clamp radii so neighbours never overlap (CSS scales them down together;
+// clamping each to half the short side is the common case and good enough).
+private i32 clamp_r(i32 r, i32 w, i32 h):
+    i32 m = mini(w, h) / 2
+    return clampi(r, 0, m)
+
+// A filled rounded rectangle, all in whole device pixels.
+void fill_rrect_px(i32 x0, i32 y0, i32 w, i32 h, i32 rtl, i32 rtr, i32 rbr, i32 rbl, [4]u8 col):
+    if w <= 0 || h <= 0 || col[3] == 0:
+        return
+    i32 a = clamp_r(rtl, w, h)
+    i32 b = clamp_r(rtr, w, h)
+    i32 c = clamp_r(rbr, w, h)
+    i32 d = clamp_r(rbl, w, h)
+    i32 x1 = x0 + w
+    i32 y1 = y0 + h
+    i32 ttop = maxi(a, b)
+    i32 tbot = maxi(c, d)
+    if a > 0:
+        corner_px(corner_tile(a, 0), f32(x0), f32(y0), false, false, col)
+    if b > 0:
+        corner_px(corner_tile(b, 0), f32(x1 - b), f32(y0), true, false, col)
+    if c > 0:
+        corner_px(corner_tile(c, 0), f32(x1 - c), f32(y1 - c), true, true, col)
+    if d > 0:
+        corner_px(corner_tile(d, 0), f32(x0), f32(y1 - d), false, true, col)
+    // top band
+    solid_px(f32(x0 + a), f32(y0), f32(w - a - b), f32(ttop), col)
+    if a < ttop:
+        solid_px(f32(x0), f32(y0 + a), f32(a), f32(ttop - a), col)
+    if b < ttop:
+        solid_px(f32(x1 - b), f32(y0 + b), f32(b), f32(ttop - b), col)
+    // bottom band
+    solid_px(f32(x0 + d), f32(y1 - tbot), f32(w - c - d), f32(tbot), col)
+    if d < tbot:
+        solid_px(f32(x0), f32(y1 - tbot), f32(d), f32(tbot - d), col)
+    if c < tbot:
+        solid_px(f32(x1 - c), f32(y1 - tbot), f32(c), f32(tbot - c), col)
+    // middle
+    solid_px(f32(x0), f32(y0 + ttop), f32(w), f32(h - ttop - tbot), col)
+
+// A rounded-rectangle outline of width bw px, inside the rectangle's edge
+// (CSS border-box).
+void stroke_rrect_px(i32 x0, i32 y0, i32 w, i32 h, i32 rtl, i32 rtr, i32 rbr, i32 rbl, i32 bw, [4]u8 col):
+    if w <= 0 || h <= 0 || bw <= 0 || col[3] == 0:
+        return
+    if bw * 2 >= w || bw * 2 >= h:
+        fill_rrect_px(x0, y0, w, h, rtl, rtr, rbr, rbl, col)
+        return
+    i32 a = clamp_r(rtl, w, h)
+    i32 b = clamp_r(rtr, w, h)
+    i32 c = clamp_r(rbr, w, h)
+    i32 d = clamp_r(rbl, w, h)
+    i32 sa = maxi(a, bw)
+    i32 sb = maxi(b, bw)
+    i32 sc = maxi(c, bw)
+    i32 sd = maxi(d, bw)
+    i32 x1 = x0 + w
+    i32 y1 = y0 + h
+    corner_px(corner_tile(a, bw), f32(x0), f32(y0), false, false, col)
+    corner_px(corner_tile(b, bw), f32(x1 - sb), f32(y0), true, false, col)
+    corner_px(corner_tile(c, bw), f32(x1 - sc), f32(y1 - sc), true, true, col)
+    corner_px(corner_tile(d, bw), f32(x0), f32(y1 - sd), false, true, col)
+    solid_px(f32(x0 + sa), f32(y0), f32(w - sa - sb), f32(bw), col)
+    solid_px(f32(x0 + sd), f32(y1 - bw), f32(w - sd - sc), f32(bw), col)
+    solid_px(f32(x0), f32(y0 + sa), f32(bw), f32(h - sa - sd), col)
+    solid_px(f32(x1 - bw), f32(y0 + sb), f32(bw), f32(h - sb - sc), col)
+
+// ── Shadows ────────────────────────────────────────────────────────────────
+
+// Blur `img` (w x h alpha, as f32) by a Gaussian of sigma px, in place.
+private void blur(^ref []f32 img, i32 w, i32 h, f32 sigma):
+    i32 k = i32(ceilf(sigma * 3.0))
+    if k < 1 || sigma <= 0.0:
+        return
+    ref []f32 kern = #make([]f32, i64(2 * k + 1))
+    defer #delete(kern)
+    f32 sum = 0.0
+    for i in 0..<(2 * k + 1):
+        f32 d = f32(i32(i) - k)
+        f32 v = f32(math.e_to(f64(0.0 - d * d / (2.0 * sigma * sigma))))
+        kern[i] = v
+        sum = sum + v
+    for i in 0..<(2 * k + 1):
+        kern[i] = kern[i] / sum
+    ref []f32 tmp = #make([]f32, i64(w) * i64(h))
+    defer #delete(tmp)
+    ref []f32 src = img^
+    for y in 0..<h:
+        for x in 0..<w:
+            f32 acc = 0.0
+            for i in 0..<(2 * k + 1):
+                i32 xx = i32(x) + i32(i) - k
+                if xx >= 0 && xx < w:
+                    acc = acc + src[i64(y) * i64(w) + i64(xx)] * kern[i]
+            tmp[i64(y) * i64(w) + i64(x)] = acc
+    for y in 0..<h:
+        for x in 0..<w:
+            f32 acc = 0.0
+            for i in 0..<(2 * k + 1):
+                i32 yy = i32(y) + i32(i) - k
+                if yy >= 0 && yy < h:
+                    acc = acc + tmp[i64(yy) * i64(w) + i64(x)] * kern[i]
+            src[i64(y) * i64(w) + i64(x)] = acc
+
+// Coverage of a rounded rectangle (x0, y0, w, h, radius r) at pixel (px, py),
+// 4x4 supersampled (the blur hides the rest).
+private f32 rrect_cov(i32 px, i32 py, f32 x0, f32 y0, f32 w, f32 h, f32 r):
+    i32 hits = 0
+    for sy in 0..<4:
+        for sx in 0..<4:
+            f32 x = f32(px) + (f32(sx) + 0.5) / 4.0 - x0
+            f32 y = f32(py) + (f32(sy) + 0.5) / 4.0 - y0
+            if x >= 0.0 && y >= 0.0 && x < w && y < h:
+                f32 qx = minf(x, w - x)
+                f32 qy = minf(y, h - y)
+                if in_corner(qx, qy, 0.0, r):
+                    hits += 1
+    return f32(hits) / 16.0
+
+// A blurred rounded rectangle of w x h px (radius r, sigma) with a margin of
+// ceil(3 sigma) on every side, written into the atlas.
+private Tile shadow_image(u64 key, i32 w, i32 h, i32 r, f32 sigma):
+    i32 k = i32(ceilf(sigma * 3.0))
+    i32 iw = w + 2 * k
+    i32 ih = h + 2 * k
+    (i32 ax, i32 ay, bool got) = atlas_alloc(iw, ih)
+    if !got:
+        return Tile((0, 0, 0, 0))
+    ref []f32 img = #make([]f32, i64(iw) * i64(ih))
+    defer #delete(img)
+    for y in 0..<ih:
+        for x in 0..<iw:
+            img[i64(y) * i64(iw) + i64(x)] = rrect_cov(i32(x), i32(y), f32(k), f32(k), f32(w), f32(h), f32(r))
+    blur(&img, iw, ih, sigma)
+    for y in 0..<ih:
+        for x in 0..<iw:
+            f32 v = clampf(img[i64(y) * i64(iw) + i64(x)], 0.0, 1.0)
+            atlas_set(ax + i32(x), ay + i32(y), u8(v * 255.0 + 0.5))
+    Tile t = Tile((ax, ay, iw, ih))
+    tile_store(key, t)
+    return t
+
+// A soft shadow of the rounded rectangle (x0, y0, w, h, radius r) in px,
+// Gaussian sigma px, tinted `col`.
+void shadow_px(i32 x0, i32 y0, i32 w, i32 h, i32 r, f32 sigma, [4]u8 col):
+    if w <= 0 || h <= 0 || col[3] == 0:
+        return
+    i32 rr = clamp_r(r, w, h)
+    if sigma <= 0.25:
+        fill_rrect_px(x0, y0, w, h, rr, rr, rr, rr, col)
+        return
+    i32 k = i32(ceilf(sigma * 3.0))
+    i32 s4 = iround(sigma * 4.0)
+    i32 cside = rr + 2 * k
+    if w >= 2 * rr + 2 * k + 1 && h >= 2 * rr + 2 * k + 1:
+        // nine-slice from the proxy (side 2C+1 including the margins)
+        u64 key = tile_key(TILE_SHADOW, rr, s4, 0, 0)
+        (Tile t, bool ok) = tile_find(key)
+        if !ok:
+            i32 side = 2 * (rr + k) + 1
+            t = shadow_image(key, side, side, rr, sigma)
+            if t.w == 0:
+                return
+        f32 X0 = f32(x0 - k)
+        f32 Y0 = f32(y0 - k)
+        f32 W = f32(w + 2 * k)
+        f32 H = f32(h + 2 * k)
+        f32 C = f32(cside)
+        f32 tx = f32(t.x)
+        f32 ty = f32(t.y)
+        quad_px(X0, Y0, C, C, [tx, ty, C, C], col)
+        quad_px(X0 + W - C, Y0, C, C, [tx + C + 1.0, ty, C, C], col)
+        quad_px(X0 + W - C, Y0 + H - C, C, C, [tx + C + 1.0, ty + C + 1.0, C, C], col)
+        quad_px(X0, Y0 + H - C, C, C, [tx, ty + C + 1.0, C, C], col)
+        quad_px(X0 + C, Y0, W - C - C, C, [tx + C + 0.5, ty, 0.0, C], col)
+        quad_px(X0 + C, Y0 + H - C, W - C - C, C, [tx + C + 0.5, ty + C + 1.0, 0.0, C], col)
+        quad_px(X0, Y0 + C, C, H - C - C, [tx, ty + C + 0.5, C, 0.0], col)
+        quad_px(X0 + W - C, Y0 + C, C, H - C - C, [tx + C + 1.0, ty + C + 0.5, C, 0.0], col)
+        solid_px(X0 + C, Y0 + C, W - C - C, H - C - C, col)
+        return
+    u64 key = tile_key(TILE_SHADOW_EXACT, w, h, rr, s4)
+    (Tile t, bool ok) = tile_find(key)
+    if !ok:
+        t = shadow_image(key, w, h, rr, sigma)
+        if t.w == 0:
+            return
+    quad_px(f32(x0 - k), f32(y0 - k), f32(t.w), f32(t.h), [f32(t.x), f32(t.y), f32(t.w), f32(t.h)], col)

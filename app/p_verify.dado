@@ -1,0 +1,242 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// "Verify this radio" (owner requirement): consent, read + backup with the
+// fingerprint and channels shown, the identical-copy write and byte
+// compare, the physical check after a power-cycle, a LOCAL record, and a
+// guided restore on failure. Each radio step is a radio/verify.dado call on
+// the worker thread.
+package main
+
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+const i32 VF_NONE = 0
+const i32 VF_INTRO = 1
+const i32 VF_READING = 2
+const i32 VF_CHANNELS = 3
+const i32 VF_WRITING = 4
+const i32 VF_POWER = 5
+const i32 VF_PASS = 6
+const i32 VF_FAIL = 7
+const i32 VF_RESTORING = 8
+const i32 VF_RESTORED = 9
+
+i32 g_vf
+bool g_vf_from_write
+bool g_vf_consent
+ref []char8 g_vf_report
+ref []char8 g_vf_why
+btui.Scroll g_vf_scroll
+
+bool verify_flow_active():
+    return g_vf != VF_NONE
+
+void verify_flow_close():
+    if job_busy():
+        return
+    g_vf = VF_NONE
+    job_drop_verification()
+
+void verify_flow_open(bool from_write):
+    g_vf = VF_INTRO
+    g_vf_from_write = from_write
+    g_vf_consent = false
+
+private void set_why(string8 s):
+    using app_keep():
+        #delete(g_vf_why)
+        g_vf_why = strings.clone(s)
+
+void verify_job_done(^Job j):
+    if j.kind == JOB_VERIFY_BEGIN:
+        if j.err != JERR_NONE:
+            radio.LinkError le = radio.LinkError(j.link_err)
+            if le == radio.LinkError.BAD_REPLY:
+                set_why("The radio is in an open programming session. Switch it off and on, then start again.")
+            else if le == radio.LinkError.BAD_MODEL:
+                set_why("The radio on the cable doesn't answer as this model. Plug in the radio you read, or read this one first.")
+            else if le == radio.LinkError.NO_ANSWER:
+                set_why("The radio didn't answer. Check it is on and the cable is in.")
+            else:
+                set_why(link_words(le))
+            g_vf = VF_FAIL
+            return
+        g_vf = VF_CHANNELS
+        return
+    if j.kind == JOB_VERIFY_WRITE:
+        if j.err != JERR_NONE:
+            if !j.ver_open:
+                // nothing was read or backed up: nothing to record
+                set_why("The check has to start again: the radio wasn't read first.")
+                g_vf = VF_FAIL
+                return
+            string8 why = link_words(radio.LinkError(j.link_err))
+            if j.err == JERR_LINK && j.ver.mismatch_at >= 0:
+                why = #format("The radio read back differently (from byte ", j.ver.mismatch_at, ").")
+            set_why(why)
+            _ = record(false)
+            g_vf = VF_FAIL
+            return
+        g_vf = VF_POWER
+        return
+    // restore
+    if j.err != JERR_NONE:
+        set_why(#format("The restore didn't finish: ", radio.link_error_message(radio.LinkError(j.link_err)), ". The backup is ", j.ver.backup_path))
+        g_vf = VF_FAIL
+        return
+    g_vf = VF_RESTORED
+
+// Record the outcome locally (radio.record_verification) and update the
+// open document's write status.
+private bool record(bool confirmed):
+    ^Job j = job()
+    if !j.ver_open:
+        return false
+    radio.TestedStore store = radio.open_tested(g_data_dir)
+    defer store.destroy()
+    bool pass = false
+    using app_keep():
+        pass = radio.record_verification(&j.ver, &store, confirmed, app_version())
+        _ = radio.save_tested(&store)
+        #delete(g_vf_report)
+        g_vf_report = strings.clone(j.ver.report_path)
+        if pass && g_doc.open:
+            radio.WriteStatus ws = radio.write_status(&j.ver.model, j.ver.fingerprint, &store)
+            doc_set_status(j.ver.fingerprint, i32(ws.by), ws.detail)
+    return pass
+
+private void vheader(btui.Rect body, string8 step, string8 title):
+    ^btui.Scheme t = btui.theme()
+    if !job_busy():
+        if btui.icon_button("close", btui.rect(body.x - 8.0, body.y - 4.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Close"):
+            verify_flow_close()
+    _ = btui.text(btui.LABEL_LARGE, body.x + 48.0, body.y - 2.0, #format("Verify this radio · ", step), t.primary)
+    _ = btui.text(btui.HEADLINE_SMALL, body.x + 48.0, body.y + 20.0, title, t.on_surface)
+
+void verify_flow_page(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 32.0)
+    btui.Rect c = btui.rect(body.x + 48.0, body.y + 84.0, minf2(body.w - 48.0, 820.0), btui.bottom(body) - body.y - 84.0)
+    if g_vf == VF_INTRO:
+        vheader(body, "1 of 4", "Check that writing works on your radio")
+        [5]string8 lines = ["beautalks reads the radio and keeps a backup.", "It writes back an IDENTICAL copy, reads it again and compares every byte.", "Then you switch the radio off and on, and check its channels.", "If all is well, writing to this model counts as tested on this computer, for this radio's firmware.", "Nothing is sent anywhere. If anything goes wrong, the backup is put back."]
+        for i in 0..<5:
+            btui.icon("check_circle", c.x, c.y + f32(i32(i)) * 36.0, 20.0, t.primary)
+            _ = btui.text(btui.BODY_LARGE, c.x + 32.0, c.y - 2.0 + f32(i32(i)) * 36.0, lines[i], t.on_surface)
+        string8 who = model_label(g_doc.mi) if g_doc.open else radio_title()
+        _ = btui.text(btui.BODY_MEDIUM, c.x, c.y + 200.0, #format("Radio: ", who, " on ", radio_port()), t.on_surface_variant)
+        _ = btui.checkbox("Go ahead: read, back up, and write the identical copy", c.x - 10.0, c.y + 232.0, &g_vf_consent)
+        f32 w = btui.button_width("Start", "chevron_right")
+        if btui.button("Start", btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "chevron_right", !g_vf_consent):
+            g_vf = VF_READING
+            start_verify_begin()
+        return
+    if g_vf == VF_READING || g_vf == VF_WRITING || g_vf == VF_RESTORING:
+        string8 step = "2 of 4" if g_vf == VF_READING else "3 of 4"
+        string8 title = "Reading the radio and saving a backup"
+        if g_vf == VF_WRITING:
+            title = "Writing the identical copy and comparing"
+        else if g_vf == VF_RESTORING:
+            step = "restore"
+            title = "Putting the backup back"
+        vheader(body, step, title)
+        (i32 ph, i64 done, i64 total) = job_progress()
+        g_last_phase_seen = ph
+        f32 v = -1.0
+        if total > 0:
+            v = btui.clampf(f32(done) / f32(total), 0.0, 1.0)
+        btui.progress_circular(c.x + 24.0, c.y + 24.0, 48.0, v)
+        _ = btui.text(btui.TITLE_MEDIUM, c.x + 72.0, c.y + 12.0, #format(phase_words(ph), "…"), t.on_surface)
+        btui.progress_linear(btui.rect(c.x, c.y + 76.0, c.w, 8.0), v)
+        _ = btui.text(btui.BODY_MEDIUM, c.x, c.y + 96.0, "Keep the radio on and the cable plugged in.", t.on_surface_variant)
+        return
+    ^Job j = job()
+    if g_vf == VF_CHANNELS:
+        vheader(body, "2 of 4", "Is this your radio?")
+        _ = btui.text(btui.BODY_MEDIUM, c.x, c.y, #format(j.ver.model.vendor, " ", j.ver.model.name, "  ·  ", #len(j.ver.channels.entries), " channels  ·  backup saved"), t.on_surface_variant)
+        _ = btui.text(btui.BODY_SMALL, c.x, c.y + 24.0, #format("Firmware / identity: ", j.ver.fingerprint), t.on_surface_variant)
+        btui.Rect lst = btui.rect(c.x, c.y + 56.0, c.w, minf2(c.h - 56.0 - 64.0, 340.0))
+        _ = btui.card(lst, btui.CARD_OUTLINED)
+        btui.Rect li = btui.inset(lst, 1.0)
+        i64 n = #len(j.ver.channels.entries)
+        _ = btui.scroll_update(li, &g_vf_scroll, f32(n) * 36.0 + 8.0)
+        btui.push_clip(li)
+        for i in 0..<n:
+            f32 y = li.y + 4.0 + f32(i32(i)) * 36.0 - g_vf_scroll.y
+            if y + 36.0 < li.y || y > btui.bottom(li):
+                continue
+            radio.Entry e = j.ver.channels.entries[i]
+            _ = btui.text(btui.tabular(btui.BODY_MEDIUM), li.x + 20.0, y + 8.0, #format(e.slot), t.on_surface_variant)
+            _ = btui.text(btui.BODY_MEDIUM, li.x + 80.0, y + 8.0, j.ver.channels.text(e.name), t.on_surface)
+            _ = btui.text(btui.tabular(btui.BODY_MEDIUM), li.x + 300.0, y + 8.0, mhz_text(e.rx_hz), t.on_surface)
+        btui.pop_clip()
+        btui.scrollbar("vflist", li, &g_vf_scroll)
+        f32 w = btui.button_width("Yes, write the copy", "upload")
+        if btui.button("Yes, write the copy", btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "upload"):
+            g_vf = VF_WRITING
+            start_verify_step(JOB_VERIFY_WRITE)
+        f32 nw = btui.button_width("No, stop here", "", btui.BTN_TEXT)
+        if btui.button("No, stop here", btui.rect(btui.right(body) - w - 8.0 - nw, btui.bottom(body) - 40.0, nw, 40.0), btui.BTN_TEXT):
+            verify_flow_close()
+            btui.snackbar_show("Stopped. Nothing was written; the backup is kept.")
+        return
+    if g_vf == VF_POWER:
+        vheader(body, "4 of 4", "Switch the radio off and on")
+        btui.fill_circle(c.x + 40.0, c.y + 40.0, 40.0, t.secondary_container)
+        btui.icon("refresh", c.x + 28.0, c.y + 28.0, 24.0, t.on_secondary_container)
+        _ = btui.text_wrap(btui.rect(c.x + 104.0, c.y, c.w - 104.0, 120.0), btui.BODY_LARGE, "The identical copy was written and every byte matched. Now switch the radio off, wait two seconds, and switch it on. Does it start normally and show the same channels as before?", t.on_surface)
+        f32 w = btui.button_width("Yes, it works", "check")
+        if btui.button("Yes, it works", btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "check"):
+            if record(true):
+                g_vf = VF_PASS
+            else:
+                set_why("The result could not be recorded.")
+                g_vf = VF_FAIL
+        f32 nw = btui.button_width("No, something's wrong", "", btui.BTN_OUTLINED)
+        if btui.button("No, something's wrong", btui.rect(btui.right(body) - w - 8.0 - nw, btui.bottom(body) - 40.0, nw, 40.0), btui.BTN_OUTLINED):
+            _ = record(false)
+            set_why("You said the radio doesn't work as before.")
+            g_vf = VF_FAIL
+        return
+    if g_vf == VF_PASS:
+        vheader(body, "done", "Verified on this computer")
+        btui.fill_circle(c.x + 28.0, c.y + 28.0, 28.0, t.success_container)
+        btui.icon("verified", c.x + 16.0, c.y + 16.0, 24.0, t.on_success_container, true)
+        _ = btui.text_wrap(btui.rect(c.x + 72.0, c.y, c.w - 72.0, 100.0), btui.BODY_LARGE, #format("Writing to the ", j.ver.model.name, " with this firmware now counts as tested on this computer. A report is in ", g_vf_report), t.on_surface)
+        string8 next = "Continue to write" if g_vf_from_write else "Done"
+        f32 w = btui.button_width(next, "chevron_right")
+        if btui.button(next, btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "chevron_right"):
+            bool back = g_vf_from_write
+            verify_flow_close()
+            if back && g_doc.open:
+                write_flow_open()
+                g_wf = WF_CONFIRM
+        return
+    if g_vf == VF_RESTORED:
+        vheader(body, "restored", "The backup is back on the radio")
+        _ = btui.text_wrap(btui.rect(c.x, c.y, c.w, 100.0), btui.BODY_LARGE, "The radio has its memory from before the check. Writing to this model is not recorded as tested.", t.on_surface)
+        f32 w = btui.button_width("Done")
+        if btui.button("Done", btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED):
+            verify_flow_close()
+        return
+    // VF_FAIL
+    vheader(body, "stopped", "The check didn't pass")
+    btui.fill_circle(c.x + 28.0, c.y + 28.0, 28.0, t.error_container)
+    btui.icon("priority_high", c.x + 16.0, c.y + 16.0, 24.0, t.on_error_container)
+    _ = btui.text_wrap(btui.rect(c.x + 72.0, c.y, c.w - 72.0, 60.0), btui.BODY_LARGE, g_vf_why, t.on_surface)
+    if #len(g_vf_report) > 0:
+        _ = btui.text(btui.BODY_SMALL, c.x + 72.0, c.y + 64.0, #format("Report: ", g_vf_report), t.on_surface_variant)
+    if j.ver_open && j.ver.state != radio.VerifyState.BEGUN:
+        f32 w = btui.button_width("Put the backup back", "settings_backup_restore")
+        if btui.button("Put the backup back", btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "settings_backup_restore"):
+            g_vf = VF_RESTORING
+            start_verify_step(JOB_VERIFY_RESTORE)
+        f32 cw = btui.button_width("Close", "", btui.BTN_TEXT)
+        if btui.button("Close", btui.rect(btui.right(body) - w - 8.0 - cw, btui.bottom(body) - 40.0, cw, 40.0), btui.BTN_TEXT):
+            verify_flow_close()
+    else:
+        f32 cw = btui.button_width("Close", "", btui.BTN_FILLED)
+        if btui.button("Close", btui.rect(btui.right(body) - cw, btui.bottom(body) - 40.0, cw, 40.0), btui.BTN_FILLED):
+            verify_flow_close()

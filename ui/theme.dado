@@ -1,0 +1,163 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Material 3 theme: colour roles (generated from the brand into
+// theme_gen.dado), state-layer opacities, elevation and the type scale.
+package btui
+
+import "core:io"
+import "core:os/proc"
+import "core:strings"
+
+type Scheme:
+    [4]u8 primary
+    [4]u8 on_primary
+    [4]u8 primary_container
+    [4]u8 on_primary_container
+    [4]u8 inverse_primary
+    [4]u8 secondary
+    [4]u8 on_secondary
+    [4]u8 secondary_container
+    [4]u8 on_secondary_container
+    [4]u8 tertiary
+    [4]u8 on_tertiary
+    [4]u8 tertiary_container
+    [4]u8 on_tertiary_container
+    [4]u8 error
+    [4]u8 on_error
+    [4]u8 error_container
+    [4]u8 on_error_container
+    [4]u8 background
+    [4]u8 on_background
+    [4]u8 surface
+    [4]u8 on_surface
+    [4]u8 surface_variant
+    [4]u8 on_surface_variant
+    [4]u8 surface_dim
+    [4]u8 surface_bright
+    [4]u8 surface_container_lowest
+    [4]u8 surface_container_low
+    [4]u8 surface_container
+    [4]u8 surface_container_high
+    [4]u8 surface_container_highest
+    [4]u8 inverse_surface
+    [4]u8 inverse_on_surface
+    [4]u8 outline
+    [4]u8 outline_variant
+    [4]u8 shadow
+    [4]u8 scrim
+    [4]u8 surface_tint
+    [4]u8 warning
+    [4]u8 on_warning
+    [4]u8 warning_container
+    [4]u8 on_warning_container
+    [4]u8 success
+    [4]u8 on_success
+    [4]u8 success_container
+    [4]u8 on_success_container
+    [4]u8 info
+    [4]u8 on_info
+    [4]u8 info_container
+    [4]u8 on_info_container
+
+private Scheme g_scheme
+private bool g_dark
+private bool g_scheme_ready
+
+// The current scheme. Read it every frame: a theme switch replaces it.
+^Scheme theme():
+    if !g_scheme_ready:
+        set_dark(false)
+    return &g_scheme
+
+bool is_dark():
+    return g_dark
+
+void set_dark(bool dark):
+    g_dark = dark
+    gen_scheme(&g_scheme, dark)
+    g_scheme_ready = true
+    request_frame()
+
+// ── State layers (M3 tokens) ───────────────────────────────────────────────
+const f32 HOVER_OPACITY = 0.08
+const f32 FOCUS_OPACITY = 0.10
+const f32 PRESS_OPACITY = 0.10
+const f32 DRAG_OPACITY = 0.16
+const f32 DISABLED_CONTENT = 0.38
+const f32 DISABLED_CONTAINER = 0.12
+
+// ── Motion (M3 duration tokens, seconds) ───────────────────────────────────
+const f32 SHORT2 = 0.100
+const f32 SHORT4 = 0.200
+const f32 MEDIUM2 = 0.300
+const f32 MEDIUM4 = 0.400
+const f32 LONG2 = 0.500
+
+// ── Type scale ─────────────────────────────────────────────────────────────
+// Material 3's scale (sizes and line heights in dp); the weights are Inter's
+// static Regular/Medium/SemiBold. Letter spacing follows Inter's own
+// "dynamic metrics" instead of M3's Roboto-tuned tracking.
+
+const i32 FACE_REGULAR = 0
+const i32 FACE_MEDIUM = 1
+const i32 FACE_SEMIBOLD = 2
+
+type Style: (i32 face, f32 size, f32 line, bool tnum)
+
+const Style DISPLAY_SMALL = Style((FACE_REGULAR, 36.0, 44.0, false))
+const Style HEADLINE_LARGE = Style((FACE_REGULAR, 32.0, 40.0, false))
+const Style HEADLINE_MEDIUM = Style((FACE_REGULAR, 28.0, 36.0, false))
+const Style HEADLINE_SMALL = Style((FACE_REGULAR, 24.0, 32.0, false))
+const Style TITLE_LARGE = Style((FACE_REGULAR, 22.0, 28.0, false))
+const Style TITLE_MEDIUM = Style((FACE_MEDIUM, 16.0, 24.0, false))
+const Style TITLE_SMALL = Style((FACE_MEDIUM, 14.0, 20.0, false))
+const Style BODY_LARGE = Style((FACE_REGULAR, 16.0, 24.0, false))
+const Style BODY_MEDIUM = Style((FACE_REGULAR, 14.0, 20.0, false))
+const Style BODY_SMALL = Style((FACE_REGULAR, 12.0, 16.0, false))
+const Style LABEL_LARGE = Style((FACE_MEDIUM, 14.0, 20.0, false))
+const Style LABEL_MEDIUM = Style((FACE_MEDIUM, 12.0, 16.0, false))
+const Style LABEL_SMALL = Style((FACE_MEDIUM, 11.0, 16.0, false))
+
+// A style with tabular (fixed-width) figures, for columns of numbers.
+Style tabular(Style s):
+    Style o = s
+    o.tnum = true
+    return o
+
+Style with_face(Style s, i32 face):
+    Style o = s
+    o.face = face
+    return o
+
+// ── Following the system appearance ────────────────────────────────────────
+// sokol_app does not report the OS light/dark setting, so ask the OS once:
+// macOS `defaults read -g AppleInterfaceStyle` ("Dark" when dark), GNOME
+// `gsettings get org.gnome.desktop.interface color-scheme` ('prefer-dark').
+// BTUI_THEME=dark|light overrides. Answers false when it cannot tell.
+bool system_prefers_dark():
+    string8 env = os_env("BTUI_THEME")
+    if env == "dark":
+        return true
+    if env == "light":
+        return false
+    if !proc.available():
+        return false
+    string8 cmd = "gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null"
+    when #OS == #DARWIN:
+        cmd = "defaults read -g AppleInterfaceStyle 2>/dev/null"
+    try ^io.FILE f = proc.read(cmd) else:
+        return false
+    [256]char8 buf
+    i64 n = 0
+    try n = proc.drain(f, buf[:], 1500) else:
+        n = 0
+    try _ = proc.close(f) else:
+        return false
+    []char8 got = buf[0..<n]
+    string8 out = string8(got)
+    return strings.contains(out, "Dark") || strings.contains(out, "dark")
+
+// Use the system's appearance (call once at startup).
+void follow_system_theme():
+    set_dark(system_prefers_dark())

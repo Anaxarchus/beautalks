@@ -1,0 +1,171 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Mock channel data for the gallery's Channels screen, read from the real
+// channel library (data/channels/*.csv). Nothing here talks to a radio.
+package main
+
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:strings/parse"
+import btui "../ui"
+
+type Chan:
+    ref []char8 name
+    f64 rx
+    f64 tx
+    ref []char8 mode
+    ref []char8 rx_tone
+    ref []char8 tx_tone
+    i32 power
+    bool scan
+    ref []char8 service
+    i32 tone
+    ref []char8 note
+    bool changed
+
+ref []Chan g_chans
+
+// Split one CSV line (quotes may hold commas; "" is a quote).
+private ref []ref []char8 csv_fields(string8 line):
+    ref []ref []char8 out = #make([]ref []char8, 0)
+    ref []char8 cur = #make([]char8, 0)
+    bool q = false
+    i64 i = 0
+    for i < #len(line):
+        char8 c = line[i]
+        if q:
+            if c == '"':
+                if i + 1 < #len(line) && line[i + 1] == '"':
+                    cur = #append(cur, '"')
+                    i += 1
+                else:
+                    q = false
+            else:
+                cur = #append(cur, c)
+        else if c == '"':
+            q = true
+        else if c == ',':
+            out = #append(out, cur)
+            cur = #make([]char8, 0)
+        else if c != '\r':
+            cur = #append(cur, c)
+        i += 1
+    out = #append(out, cur)
+    return out
+
+private f64 num(string8 s):
+    try f64 v = parse.to_f64(strings.trim(s)) else:
+        return 0.0
+    return v
+
+private void add(string8 name, f64 rx, f64 tx, string8 mode, string8 rxt, string8 txt, string8 service, i32 tone, string8 note):
+    Chan c
+    c.name = strings.clone(name)
+    c.rx = rx
+    c.tx = tx
+    c.mode = strings.clone(mode)
+    c.rx_tone = strings.clone(rxt)
+    c.tx_tone = strings.clone(txt)
+    c.power = 0 if tx > 0.0 else 2
+    c.scan = true
+    c.service = strings.clone(service)
+    c.tone = tone
+    c.note = strings.clone(note)
+    g_chans = #append(g_chans, c)
+
+// Load `limit` rows of one library file; `service`/`tone`/`note` label them.
+private void load_set(string8 dir, string8 file, i32 skip, i32 limit, string8 service, i32 tone, string8 note):
+    try ref []char8 text = fs.read_file(path.join(dir, file)) else:
+        return
+    strings.Splitter it = strings.splitter(text, "\n")
+    string8 ln
+    i32 row = -1
+    i32 taken = 0
+    for strings.split_next(&it, &ln):
+        row += 1
+        if row == 0 || #len(ln) < 5:
+            continue
+        if row - 1 < skip:
+            continue
+        if taken >= limit:
+            break
+        ref []ref []char8 f = csv_fields(ln)
+        if #len(f) >= 8:
+            add(f[1], num(f[3]), num(f[4]), f[5], f[6], f[7], service, tone, note)
+            taken += 1
+
+// About thirty realistic channels, plus two the validator flags.
+void load_channels(string8 data_dir):
+    using btui.keep():
+        g_chans = #make([]Chan, 0)
+        string8 d = path.join(data_dir, "channels")
+        // A ham's list: the national calling channels, then made-up example
+        // repeaters (fictional names and values, for the mock only; two of
+        // them give the validator something to say), then the licence-free
+        // and family services, then weather.
+        load_set(d, "us_ham_calling.csv", 0, 2, "Ham", btui.TONE_NEUTRAL, "Amateur licence")
+        add("CALL220", 223.5, 223.5, "FM", "", "", "Ham", btui.TONE_NEUTRAL, "Amateur licence")
+        add("EXAMPLE RPT", 146.94, 146.34, "FM", "", "100.0", "Ham", btui.TONE_NEUTRAL, "Amateur licence")
+        add("EXAMPLE 70CM", 444.0, 449.0, "FM", "", "88.5", "Ham", btui.TONE_NEUTRAL, "Amateur licence")
+        add("Example Long Name Repeater", 147.06, 147.66, "FM", "", "123.0", "Ham", btui.TONE_NEUTRAL, "Amateur licence")
+        load_set(d, "us_frs.csv", 0, 7, "FRS", btui.TONE_NEUTRAL, "Licence-free")
+        load_set(d, "us_gmrs.csv", 14, 6, "GMRS", btui.TONE_NEUTRAL, "GMRS licence")
+        load_set(d, "us_murs.csv", 0, 5, "MURS", btui.TONE_NEUTRAL, "Licence-free")
+        load_set(d, "us_noaa.csv", 0, 7, "NOAA", btui.TONE_INFO, "Receive only")
+        if #len(g_chans) == 0:
+            for i in 0..<30:
+                add(#format("CH", i + 1), 146.52 + f64(i) * 0.025, 146.52 + f64(i) * 0.025, "FM", "", "", "Ham", btui.TONE_PRIMARY, "Amateur licence")
+        if #len(g_chans) > 9:
+            g_chans[4].changed = true
+            g_chans[9].changed = true
+
+// ── Validation (the radio's rules, mocked for a UV-5RM) ────────────────────
+
+const i32 NAME_MAX = 12
+
+bool in_band(f64 mhz):
+    return (mhz >= 136.0 && mhz <= 174.0) || (mhz >= 400.0 && mhz <= 520.0)
+
+// Column indices of the Channels table.
+const i32 C_SLOT = 0
+const i32 C_NAME = 1
+const i32 C_RX = 2
+const i32 C_DUP = 3
+const i32 C_OFFSET = 4
+const i32 C_TXTONE = 5
+const i32 C_RXTONE = 6
+const i32 C_POWER = 7
+const i32 C_MODE = 8
+const i32 C_INFO = 9
+
+string8 dup_of(^Chan c):
+    if c.tx <= 0.0:
+        return "Off"
+    f64 d = c.tx - c.rx
+    if d > -0.0005 && d < 0.0005:
+        return "None"
+    if d > 0.0:
+        return "Plus"
+    return "Minus"
+
+string8 fmt_mhz(f64 v):
+    // 3..4 decimals, like a radio's display
+    i64 k = i64(v * 10000.0 + 0.5)
+    i64 whole = k / 10000
+    i64 frac = k % 10000
+    string8 fs4 = #format(frac)
+    for #len(fs4) < 4:
+        fs4 = #format("0", fs4)
+    return #format(whole, ".", fs4)
+
+string8 offset_of(^Chan c):
+    if c.tx <= 0.0:
+        return ""
+    f64 d = c.tx - c.rx
+    if d < 0.0:
+        d = 0.0 - d
+    if d < 0.0005:
+        return ""
+    return fmt_mhz(d)

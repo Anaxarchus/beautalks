@@ -7,6 +7,8 @@
 // It answers the image bytes on download and takes them on upload.
 package radio
 
+import "core:threads"
+
 // A byte pipe to the radio: a serial port, a pty in tests, or anything else.
 trait Link:
     // writes every byte of `data`
@@ -18,6 +20,14 @@ trait Link:
     void sleep_ms(^self, i32 ms)
     // throws away anything received and not yet read
     void discard(^self)
+
+// Identification retries. A radio that finished a download can still be in
+// programming mode and answer the next ident with something unexpected (or
+// nothing); the following ident works. So an ident is tried up to
+// IDENT_TRIES times, discarding input and waiting IDENT_RETRY_MS between.
+// (Provisional timing: to be confirmed against the owner's probe output.)
+const i32 IDENT_TRIES = 3
+const i32 IDENT_RETRY_MS = 500
 
 // Called as a transfer goes: `done` of `total` bytes, plus the context the
 // caller passed in. May be nil.
@@ -59,6 +69,8 @@ distinct enum i32 LinkError:
     BACKUP = 9,
     // the radio's memory read back after writing differs from the image
     VERIFY = 10,
+    // the user cancelled (request_cancel); see the cancel notes below
+    CANCELLED = 11,
 
 string8 link_error_message(LinkError e):
     switch e:
@@ -82,6 +94,8 @@ string8 link_error_message(LinkError e):
             return "the backup of the radio could not be saved; nothing was written"
         case LinkError.VERIFY:
             return "read-back after writing does not match the image"
+        case LinkError.CANCELLED:
+            return "cancelled"
         else:
             return "unknown error"
 
@@ -98,3 +112,33 @@ LinkError!void recv_exact(^Link link, []u8 into, i32 timeout_ms):
 LinkError!void send_all(^Link link, []u8 data):
     try link.send(data) else:
         fail LinkError.IO
+
+// ── cancelling a transfer ────────────────────────────────────────────────────
+//
+// request_cancel() (from any thread, e.g. the UI on Esc) makes the running
+// detection or transfer stop at its next block and fail CANCELLED; the
+// caller then closes the port. clear_cancel() before starting a job.
+// Where it is honoured, and the state the radio is left in:
+//  * detection: between handshakes. Nothing was written.
+//  * a download (or safe_write's backup and verify reads): between blocks.
+//    UV-17Pro: the radio stays in its programming session (reusable, or
+//    power-cycle). UV-5R: its clone session times out after a few seconds.
+//  * the write phase of an upload is NOT interrupted: stopping halfway would
+//    leave a half-written radio. The cancel takes effect after the write
+//    (at the verify read), so the radio holds the whole new image.
+private i32 g_cancel = 0
+
+void request_cancel():
+    threads.atomic_store(&g_cancel, 1)
+
+void clear_cancel():
+    threads.atomic_store(&g_cancel, 0)
+
+bool cancel_requested():
+    return threads.atomic_load(&g_cancel) != 0
+
+// Reports progress, then fails CANCELLED when a cancel was requested.
+LinkError!void step(Progress p, i64 done, i64 total):
+    report(p, done, total)
+    if cancel_requested():
+        fail LinkError.CANCELLED

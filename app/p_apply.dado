@@ -1,0 +1,384 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Apply a profile to the radio (UI_PLAN §1.5): the library places the
+// channels (radio.apply) and reports what it did (radio.Report); this page
+// shows the summary, a badge per channel, filters, and lets a channel be
+// fixed inline: name, frequency, power, mode, tone, and (keeping positions)
+// its slot. A fix is an edit to the profile, so the next apply is fixed too.
+// Continue puts the result into the Channels document and opens the write
+// flow.
+package main
+
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+btui.TableState g_at
+i32 g_ap_pack
+bool g_ap_fill
+btui.Field g_ap_start
+i32 g_ap_filter
+ref []u8 g_ap_img
+radio.Report g_ap_rep
+bool g_ap_have
+ref []i32 g_ap_view
+ref []i32 g_ap_sev
+ref []i32 g_ap_slot
+ref []btui.Column g_acols
+
+void apply_open():
+    if !g_doc.open:
+        btui.snackbar_show("Read your radio first: the profile is applied to the radio's channels.")
+        return
+    g_pf_mode = PF_APPLY
+    g_page = PAGE_PROFILES
+    write_flow_close()
+    btui.field_set(&g_ap_start, "")
+    apply_run()
+
+// Run the library's apply onto what is on the radio now.
+void apply_run():
+    using app_keep():
+        if g_ap_have:
+            g_ap_rep.destroy()
+        #delete(g_ap_img)
+        g_ap_img = radio.copy_image(g_doc.base)
+        radio.ChannelList l = g_prof.copy()
+        radio.ApplyOptions opt = radio.default_apply()
+        opt.keep_slots = g_ap_pack == 1
+        opt.fill_empty = g_ap_fill
+        i64 st = radio.parse_num(btui.field_text(&g_ap_start), -1)
+        if st > 0:
+            opt.start = i32(st)
+        radio.Report z
+        g_ap_rep = z
+        radio.apply(&l, doc_model(), g_ap_img, opt, &g_ap_rep)
+        l.destroy()
+        g_ap_have = true
+        // per entry: worst severity (licence notes and placements are info)
+        i64 n = #len(g_prof.entries)
+        #delete(g_ap_sev)
+        #delete(g_ap_slot)
+        g_ap_sev = #make([]i32, n)
+        g_ap_slot = #make([]i32, n)
+        for i in 0..<n:
+            g_ap_sev[i] = -1
+            g_ap_slot[i] = -1
+        for d in g_ap_rep.diags:
+            if d.entry < 0 || d.entry >= n:
+                continue
+            if d.code == radio.DiagCode.PLACED:
+                g_ap_slot[d.entry] = d.slot
+                if g_ap_sev[d.entry] < 0:
+                    g_ap_sev[d.entry] = 0
+                continue
+            if d.code == radio.DiagCode.LICENSE_NOTE:
+                continue
+            i32 sv = i32(d.severity)
+            if sv > g_ap_sev[d.entry]:
+                g_ap_sev[d.entry] = sv
+            if d.slot >= 0 && g_ap_slot[d.entry] < 0:
+                g_ap_slot[d.entry] = d.slot
+
+private void apply_view_build():
+    using app_keep():
+        if g_ap_view == nil:
+            g_ap_view = #make([]i32, 0)
+        g_ap_view = #resize(g_ap_view, 0)
+        // problems first (skipped, then changed), then the rest in order
+        for want in [2, 1, 0]:
+            for i in 0..<#len(g_prof.entries):
+                i32 sv = g_ap_sev[i]
+                if sv < 0:
+                    sv = 0
+                if sv != want:
+                    continue
+                bool keep = true
+                if g_ap_filter == 1:
+                    keep = sv >= 1
+                else if g_ap_filter == 2:
+                    keep = sv == 2
+                else if g_ap_filter == 3:
+                    keep = sv == 1
+                if keep:
+                    g_ap_view = #append(g_ap_view, i32(i))
+
+// One diagnostic as a sentence: the library's wording (it formats MHz and
+// bands itself), except a duplicate slot, which names the channel that has it.
+private void diag_words(radio.Diag d, i64 k, ^strings.Builder b):
+    radio.Entry e = g_prof.entries[k]
+    if d.code == radio.DiagCode.DUPLICATE_SLOT && g_ap_pack == 1:
+        // name the channel that has it
+        for j in 0..<#len(g_prof.entries):
+            if i64(j) != k && g_ap_slot[j] == e.slot && g_ap_sev[j] != 2:
+                string8 other = g_prof.text(g_prof.entries[j].name)
+                strings.append(b, #format("Channel ", e.slot, " is already taken by ", other, "; skipped. Give it another slot."))
+                return
+    radio.diag_message(&g_ap_rep, d, b)
+
+// The diagnostics of entry `k`, as one line (problems first).
+private string8 entry_diag(i32 k):
+    strings.Builder b = strings.builder(96)
+    i32 n = 0
+    for pass in 0..<2:
+        for d in g_ap_rep.diags:
+            if d.entry != i64(k) || d.code == radio.DiagCode.PLACED:
+                continue
+            bool problem = d.severity != radio.Severity.INFO
+            if (pass == 0) != problem:
+                continue
+            if n > 0:
+                strings.append(&b, "; ")
+            diag_words(d, i64(k), &b)
+            n += 1
+    string8 s = strings.text(b)
+    return s
+
+// Apply table columns (A_*); the fixable ones map to the profile editor's
+// columns (P_*), whose edit handler (papply) does the change.
+const i32 A_RES = 0
+const i32 A_SLOT = 1
+const i32 A_NAME = 2
+const i32 A_RX = 3
+const i32 A_POW = 4
+const i32 A_MODE = 5
+const i32 A_TXT = 6
+const i32 A_WHAT = 7
+
+private i32 a_to_p(i32 col):
+    if col == A_NAME:
+        return P_NAME
+    if col == A_RX:
+        return P_RX
+    if col == A_POW:
+        return P_POW
+    if col == A_MODE:
+        return P_MODE
+    if col == A_TXT:
+        return P_TXT
+    return -1
+
+private string8 atext(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_ap_view)):
+        return ""
+    i32 k = g_ap_view[row]
+    radio.Entry e = g_prof.entries[k]
+    i32 sv = g_ap_sev[k]
+    if col == A_RES:
+        if sv == 2:
+            return "Skipped"
+        if sv == 1:
+            return "Changed"
+        return "OK"
+    if col == A_SLOT:
+        if g_ap_pack == 1:
+            // keeping positions: the slot this channel asks for
+            if e.slot < 0:
+                return "next free"
+            return #format(e.slot)
+        if sv == 2 || g_ap_slot[k] < 0:
+            return "–"
+        return #format(g_ap_slot[k])
+    if col == A_NAME:
+        return #format(g_prof.text(e.name))
+    if col == A_RX:
+        return mhz_text(e.rx_hz)
+    if col == A_POW:
+        return LEVELS[clampi3(i32(e.power), 0, 3)]
+    if col == A_MODE:
+        return radio.mode_name(e.mode)
+    if col == A_TXT:
+        return tone_text(e.tx_tone)
+    if col == A_WHAT:
+        return entry_diag(k)
+    return ""
+
+// Which apply column a diagnostic is about (for the error/warning mark).
+private i32 diag_col(radio.Diag d):
+    if d.code == radio.DiagCode.RX_OUT_OF_BAND || d.code == radio.DiagCode.FREQ_ROUNDED:
+        return A_RX
+    if d.code == radio.DiagCode.NAME_TRUNCATED || d.code == radio.DiagCode.NAME_CHARS:
+        return A_NAME
+    if d.code == radio.DiagCode.POWER_MAPPED:
+        return A_POW
+    if d.code == radio.DiagCode.MODE_CHANGED:
+        return A_MODE
+    if d.code == radio.DiagCode.TONE_UNSUPPORTED:
+        return A_TXT
+    if d.code == radio.DiagCode.SLOT_OUT_OF_RANGE || d.code == radio.DiagCode.DUPLICATE_SLOT || d.code == radio.DiagCode.SLOT_OCCUPIED || d.code == radio.DiagCode.NO_FREE_SLOT:
+        return A_SLOT
+    return A_WHAT
+
+private i32 adeco(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_ap_view)):
+        return btui.DECO_NONE
+    i32 k = g_ap_view[row]
+    i32 sv = g_ap_sev[k]
+    radio.Entry e = g_prof.entries[k]
+    if col == A_RES:
+        if sv == 2:
+            return btui.DECO_TONE + btui.TONE_ERROR
+        if sv == 1:
+            return btui.DECO_TONE + btui.TONE_WARNING
+        return btui.DECO_TONE + btui.TONE_SUCCESS
+    if col == A_WHAT && sv == 2:
+        return btui.DECO_ERROR
+    if col == A_WHAT && sv == 1:
+        return btui.DECO_WARNING
+    // mark the cell the problem is about, so the fix is where the eye goes
+    if col != A_WHAT:
+        for d in g_ap_rep.diags:
+            if d.entry == i64(k) && d.severity != radio.Severity.INFO && diag_col(d) == col:
+                return btui.DECO_ERROR if d.severity == radio.Severity.ERROR else btui.DECO_WARNING
+    if col == A_TXT && e.tx_tone.kind == radio.ToneKind.OFF:
+        return btui.DECO_DIM
+    if sv == 2:
+        return btui.DECO_DIM
+    return btui.DECO_NONE
+
+private string8 amsg(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_ap_view)):
+        return ""
+    return entry_diag(g_ap_view[row])
+
+// Keeping positions: number the channels in list order from `first`.
+private void number_in_order(i32 first):
+    using app_keep():
+        for i in 0..<#len(g_prof.entries):
+            g_prof.entries[i].slot = first + i32(i)
+    g_prof_dirty = true
+    apply_run()
+
+void apply_view(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 24.0)
+    if btui.icon_button("arrow_back", btui.rect(body.x - 8.0, body.y - 4.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Back"):
+        g_pf_mode = PF_EDIT
+    string8 who = "the radio"
+    if #len(g_radio.nickname) > 0:
+        who = g_radio.nickname
+    _ = btui.text(btui.HEADLINE_SMALL, body.x + 48.0, body.y, #format("Apply \"", g_prof_name, "\" to ", who), t.on_surface)
+    ^const radio.Model m = doc_model()
+    _ = btui.text(btui.BODY_MEDIUM, body.x + 48.0, body.y + 36.0, #format(model_label(g_doc.mi), "  ·  ", m.layout.count, " channels  ·  names up to ", radio.name_width(m), " characters  ·  ", m.modes), t.on_surface_variant)
+    ref []char8 bands = model_bands_words(m)
+    string8 bs = bands
+    _ = btui.text(btui.BODY_SMALL, body.x + 48.0, body.y + 58.0, bs, t.on_surface_variant)
+    // placement
+    f32 y = body.y + 96.0
+    [2]string8 packs = ["Pack in order", "Keep positions"]
+    bool rerun = false
+    if btui.segmented("appack", btui.rect(body.x, y, 320.0, 40.0), packs[:], &g_ap_pack):
+        rerun = true
+    if btui.checkbox("Only fill empty channels", body.x + 336.0, y, &g_ap_fill):
+        rerun = true
+    f32 px = body.x + 620.0
+    if g_ap_pack == 0:
+        btui.FieldOpts so = btui.field_opts("Start at channel", btui.FIELD_OUTLINED)
+        so.numeric = true
+        so.placeholder = #format(m.layout.first)
+        so.behind = t.surface
+        btui.FieldOut fo = btui.text_field("apstart", btui.rect(px, y - 8.0, 170.0, 56.0), &g_ap_start, so)
+        if fo.changed:
+            rerun = true
+    else:
+        // each channel goes to the number in its Slot column (click to change)
+        f32 nw = btui.button_width("Number them in order", "format_list_numbered", btui.BTN_TONAL)
+        if btui.button("Number them in order", btui.rect(px, y, nw, 40.0), btui.BTN_TONAL, "format_list_numbered"):
+            i64 st = radio.parse_num(btui.field_text(&g_ap_start), -1)
+            number_in_order(i32(st) if st > 0 else m.layout.first)
+        _ = btui.text_wrap(btui.rect(px + nw + 16.0, y - 2.0, btui.right(body) - px - nw - 16.0, 44.0), btui.BODY_SMALL, "Each channel goes to the number in its Slot column; click a slot to change it. Channels without one take the next free channel.", t.on_surface_variant)
+    if rerun:
+        apply_run()
+    // summary chips: each sets the filter
+    y = y + 64.0
+    f32 x = body.x
+    i32 nchg = 0
+    i32 nskip = 0
+    for sv in g_ap_sev:
+        if sv == 2:
+            nskip += 1
+        else if sv == 1:
+            nchg += 1
+    x = x + btui.status_chip(x, y, #format(g_ap_rep.placed, " placed"), btui.TONE_SUCCESS, "check_circle") + 8.0
+    x = x + btui.status_chip(x, y, #format(nchg, " changed to fit"), btui.TONE_WARNING if nchg > 0 else btui.TONE_NEUTRAL, "warning") + 8.0
+    x = x + btui.status_chip(x, y, #format(nskip, " skipped"), btui.TONE_ERROR if nskip > 0 else btui.TONE_NEUTRAL, "error") + 16.0
+    [4]string8 filters = ["All", "Problems", "Skipped", "Changed"]
+    _ = btui.segmented("apfilter", btui.rect(btui.right(body) - 420.0, y - 4.0, 420.0, 40.0), filters[:], &g_ap_filter)
+    // the table
+    if g_acols == nil:
+        using app_keep():
+            g_acols = #append(g_acols, btui.column("Result", 108.0, btui.COL_STATUS, false, false))
+            g_acols = #append(g_acols, btui.column("Slot", 96.0, btui.COL_NUM, true, false))
+            g_acols = #append(g_acols, btui.column("Name", 168.0, btui.COL_TEXT))
+            g_acols = #append(g_acols, btui.column("RX (MHz)", 128.0, btui.COL_NUM))
+            btui.Column pc = btui.column("Power", 104.0, btui.COL_CHOICE)
+            pc.choices = LEVELS[:]
+            g_acols = #append(g_acols, pc)
+            btui.Column mc = btui.column("Mode", 88.0, btui.COL_CHOICE)
+            mc.choices = PMODES[:]
+            g_acols = #append(g_acols, mc)
+            g_acols = #append(g_acols, btui.column("TX tone", 100.0, btui.COL_CUSTOM))
+            g_acols = #append(g_acols, btui.column("What happened", 480.0, btui.COL_TEXT, false, false))
+    // the slot is a choice only when keeping positions
+    g_acols[A_SLOT].editable = g_ap_pack == 1
+    apply_view_build()
+    f32 detail_h = 52.0
+    btui.Rect tr = btui.rect(body.x, y + 52.0, body.w, btui.bottom(body) - y - 52.0 - 60.0 - detail_h)
+    btui.TableEvent ev = btui.table("apply", tr, g_acols[:], i32(#len(g_ap_view)), &g_at, atext, adeco, amsg)
+    if ev.row >= 0 && ev.row < i32(#len(g_ap_view)):
+        i32 k = g_ap_view[ev.row]
+        if ev.col == A_SLOT && ev.kind == btui.TEV_COMMIT:
+            string8 st = strings.trim(ev.text)
+            i64 v = radio.parse_num(st, -2)
+            if #len(st) == 0 || st == "next free":
+                v = -1
+            if v == -2:
+                btui.snackbar_show(#format("\"", st, "\" isn't a channel number"))
+            else:
+                g_prof.entries[k].slot = i32(v)
+                g_prof_dirty = true
+                apply_run()
+        else:
+            i32 pcol = a_to_p(ev.col)
+            if pcol >= 0 && (ev.kind == btui.TEV_COMMIT || ev.kind == btui.TEV_CHOICE || ev.kind == btui.TEV_CUSTOM):
+                // an inline fix is an edit to the profile; the library runs again
+                btui.TableEvent pe = ev
+                pe.row = k
+                pe.col = pcol
+                papply(pe)
+                if ev.kind != btui.TEV_CUSTOM:
+                    apply_run()
+    // the selected row's full story, always readable (not only on hover)
+    btui.Rect dr = btui.rect(body.x, btui.bottom(tr) + 8.0, body.w, detail_h - 8.0)
+    if g_at.cur_row >= 0 && g_at.cur_row < i32(#len(g_ap_view)):
+        i32 k = g_ap_view[g_at.cur_row]
+        string8 msg = entry_diag(k)
+        string8 nm = g_prof.text(g_prof.entries[k].name)
+        i32 sv = g_ap_sev[k]
+        if #len(msg) == 0:
+            msg = "Placed as it is."
+        string8 ic = "check_circle"
+        [4]u8 icc = t.success
+        if sv == 2:
+            ic = "error"
+            icc = t.error
+        else if sv == 1:
+            ic = "warning"
+            icc = t.warning
+        btui.icon(ic, dr.x + 4.0, dr.y + 2.0, 18.0, icc, true)
+        f32 nx = btui.text(btui.LABEL_LARGE, dr.x + 30.0, dr.y + 2.0, nm, t.on_surface)
+        _ = btui.text_wrap(btui.rect(nx + 12.0, dr.y + 2.0, btui.right(dr) - nx - 12.0, dr.h), btui.BODY_MEDIUM, msg, t.on_surface_variant)
+    string8 lbl = #format("Continue to write ", g_ap_rep.placed, " channels")
+    f32 w = btui.button_width(lbl, "chevron_right")
+    if btui.button(lbl, btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "chevron_right", g_ap_rep.placed == 0 || job_busy()):
+        if g_prof_dirty:
+            prof_save()
+        doc_take_rows(doc_model(), g_ap_img)
+        g_pf_mode = PF_EDIT
+        write_flow_open()
+    f32 ew = btui.button_width("Edit in Channels", "table_rows", btui.BTN_TEXT)
+    if btui.button("Edit in Channels", btui.rect(btui.right(body) - w - 8.0 - ew, btui.bottom(body) - 40.0, ew, 40.0), btui.BTN_TEXT, "table_rows", g_ap_rep.placed == 0):
+        doc_take_rows(doc_model(), g_ap_img)
+        g_pf_mode = PF_EDIT
+        g_page = PAGE_CHANNELS

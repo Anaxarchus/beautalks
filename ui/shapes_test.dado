@@ -1,0 +1,70 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Corner tiles and shadows: coverage is right, smooth and monotonic.
+package btui
+
+private void nothing():
+    return
+
+i32 test():
+    bool ok = #expect(headless_up(800.0, 600.0, 1.0, nothing), "headless up")
+    // a filled corner of radius 8: outside at the far corner, inside near the centre
+    Tile t = corner_tile(8, 0)
+    ok = #expect(t.w == 8 && t.h == 8, "corner tile is r x r") && ok
+    ok = #expect(atlas_alpha(t.x, t.y) == 0, "far corner is empty") && ok
+    ok = #expect(atlas_alpha(t.x + 7, t.y + 7) == 255, "near the centre is full") && ok
+    i32 partial = 0
+    for x in 0..<8:
+        u8 a = atlas_alpha(t.x + i32(x), t.y)
+        if a > 0 && a < 255:
+            partial += 1
+    ok = #expect(partial >= 2, "the edge is anti-aliased (partial pixels in the top row): ", partial) && ok
+    // monotonic along the diagonal, and symmetric
+    bool mono = true
+    bool sym = true
+    for k in 1..<8:
+        if atlas_alpha(t.x + i32(k), t.y + i32(k)) < atlas_alpha(t.x + i32(k) - 1, t.y + i32(k) - 1):
+            mono = false
+        for j in 0..<8:
+            if atlas_alpha(t.x + i32(k), t.y + i32(j)) != atlas_alpha(t.x + i32(j), t.y + i32(k)):
+                sym = false
+    ok = #expect(mono, "coverage grows towards the centre") && ok
+    ok = #expect(sym, "coverage is symmetric") && ok
+    // the same request is cached
+    Tile t2 = corner_tile(8, 0)
+    ok = #expect(t2.x == t.x && t2.y == t.y, "corner tiles are cached") && ok
+    // a ring of width 2: the inside is empty, the edge band full
+    Tile ring = corner_tile(8, 2)
+    ok = #expect(atlas_alpha(ring.x + 7, ring.y + 7) == 0, "ring centre empty") && ok
+    ok = #expect(atlas_alpha(ring.x + 7, ring.y + 0) == 255, "ring top band full") && ok
+    // a shadow: alpha rises smoothly from outside to inside
+    painter_begin()
+    shadow_px(100, 100, 200, 120, 12, 6.0, [0, 0, 0, 80])
+    (Tile st, bool found) = tile_find(tile_key(TILE_SHADOW, 12, 24, 0, 0))
+    ok = #expect(found, "shadow proxy cached") && ok
+    if found:
+        i32 mid = st.h / 2
+        bool rising = true
+        u8 last = 0
+        for x in 0..<(st.w / 2):
+            u8 a = atlas_alpha(st.x + i32(x), st.y + mid)
+            if a < last:
+                rising = false
+            last = a
+        ok = #expect(rising, "shadow profile is monotonic") && ok
+        ok = #expect(atlas_alpha(st.x, st.y + mid) < 4, "shadow fades to nothing: ", atlas_alpha(st.x, st.y + mid)) && ok
+        ok = #expect(atlas_alpha(st.x + st.w / 2, st.y + mid) > 250, "shadow centre is solid") && ok
+    // a small shape gets an exact image
+    shadow_px(10, 10, 20, 20, 4, 6.0, [0, 0, 0, 80])
+    (Tile se, bool f2) = tile_find(tile_key(TILE_SHADOW_EXACT, 20, 20, 4, 24))
+    ok = #expect(f2 && se.w == 20 + 2 * 18, "exact shadow image for a small shape") && ok
+    // quads were recorded: corners + bands, nine-slice
+    ok = #expect(quads() > 9, "shapes recorded quads: ", quads()) && ok
+    // atlas reset invalidates caches
+    i32 g = atlas_gen()
+    atlas_reset()
+    (Tile _, bool f3) = tile_find(tile_key(TILE_CORNER, 8, 0, 0, 0))
+    ok = #expect(atlas_gen() == g + 1 && !f3, "reset drops cached tiles") && ok
+    return 0 if ok else 1

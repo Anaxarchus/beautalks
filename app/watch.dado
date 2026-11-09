@@ -1,0 +1,133 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The serial-port watcher: a thread lists the ports every 1.5 s (on macOS
+// that runs `ioreg`, which must not stall the UI) and publishes a snapshot;
+// the UI picks up a new snapshot each frame and compares it with the last.
+//
+// Owner's rule: a NEW port whose USB IDs are a known programming-cable chip
+// (CH340/CH341, PL2303, FTDI, CP210x: radio.known_cable_chip) is detected
+// automatically; any other new port only gets a "Detect?" prompt. Nothing is
+// ever probed while a job runs.
+package main
+
+import "core:strings"
+import "core:threads"
+import "core:time"
+import btui "../ui"
+import "../radio"
+
+type PortSeen:
+    ref []char8 path
+    i32 vid
+    i32 pid
+    bool cable
+
+private threads.Mutex g_watch_mx
+private ref []PortSeen g_watch_snap
+private i64 g_watch_gen
+private i64 g_watch_taken
+private bool g_watch_on
+
+ref []PortSeen g_ports
+
+private ref []PortSeen list_now():
+    ref []PortSeen out = nil
+    radio.PortList pl = radio.list_ports()
+    defer pl.destroy()
+    for i in 0..<#len(pl.ports):
+        radio.PortInfo p = pl.ports[i]
+        PortSeen s
+        s.path = strings.clone(pl.path_of(i64(i)))
+        s.vid = p.vid
+        s.pid = p.pid
+        s.cable = radio.known_cable_chip(p.vid, p.pid)
+        out = #append(out, s)
+    return out
+
+private void free_ports(ref []PortSeen ps):
+    for p in ps:
+        #delete(p.path)
+    #delete(ps)
+
+private rawptr bt_watch_thread(rawptr arg):
+    using app_keep():
+        for g_watch_on:
+            ref []PortSeen now = list_now()
+            threads.lock(g_watch_mx)
+            free_ports(g_watch_snap)
+            g_watch_snap = now
+            g_watch_gen += 1
+            threads.unlock(g_watch_mx)
+            time.sleep(time.milliseconds(1500))
+    return nil
+
+void watch_start():
+    g_watch_mx = threads.mutex_new()
+    g_watch_on = true
+    _ = threads.spawn(bt_watch_thread, nil)
+
+// A port to act on this frame: (path, auto) where auto means "known cable,
+// detect now"; "" when nothing is new. Call once per frame.
+(string8 path, bool auto) watch_poll():
+    if !g_watch_on:
+        return ("", false)
+    threads.lock(g_watch_mx)
+    if g_watch_gen == g_watch_taken:
+        threads.unlock(g_watch_mx)
+        return ("", false)
+    g_watch_taken = g_watch_gen
+    ref []PortSeen fresh = nil
+    using app_keep():
+        for p in g_watch_snap:
+            PortSeen c = p
+            c.path = strings.clone(p.path)
+            fresh = #append(fresh, c)
+    threads.unlock(g_watch_mx)
+    bool first = g_ports == nil
+    string8 newp = ""
+    bool auto = false
+    for p in fresh:
+        bool seen = false
+        for q in g_ports:
+            if eq_s(q.path) == eq_s(p.path):
+                seen = true
+        if !seen && !first && #len(newp) == 0:
+            newp = p.path
+            auto = p.cable
+    free_ports(g_ports)
+    g_ports = fresh
+    btui.request_frame()
+    return (newp, auto)
+
+// Set the port list directly (tests, and when no watcher runs).
+void ports_set_one(string8 path, bool cable):
+    using app_keep():
+        free_ports(g_ports)
+        g_ports = nil
+        PortSeen s
+        s.path = strings.clone(path)
+        s.vid = -1
+        s.pid = -1
+        s.cable = cable
+        g_ports = #append(g_ports, s)
+
+// The port to use: the chosen one, else the one cable, else the only port.
+string8 best_port():
+    if #len(g_port_override) > 0:
+        return g_port_override
+    i64 cables = 0
+    string8 pick = ""
+    for p in g_ports:
+        if p.cable:
+            cables += 1
+            pick = p.path
+    if cables == 1:
+        return pick
+    if #len(g_ports) == 1:
+        return g_ports[0].path
+    for p in g_ports:
+        string8 s = p.path
+        if strings.contains(s, "usbserial") || strings.contains(s, "ttyUSB") || strings.contains(s, "wchusbserial"):
+            return s
+    return ""

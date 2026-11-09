@@ -2,213 +2,231 @@
   "format": 1,
   "driver_api": 1,
   "min_app": "0.1.0",
-  "release": "v0.1.0",
-  "serial": 1,
-  "created": "2026-11-08T23:45:22Z",
+  "release": "v0.1.0-dev",
+  "serial": 202611090149,
+  "created": "2026-11-09T01:49:46Z",
   "files": [
     {
       "path": "engines/uv17pro.dados",
       "asset": "engines.uv17pro.dados",
-      "sha256": "7686438ce6ce00a61a0b2554e11ac6c30ce152a43ec9e022f3e0a8af769b6360",
-      "size": 6708
+      "sha256": "97cac61e76d03c7a6f8da105b0d6287a8d63dbe7bca49e138a50324db6ae666d",
+      "size": 8455
     },
     {
       "path": "engines/uv17pro.js",
       "asset": "engines.uv17pro.js",
-      "sha256": "cdc7b19d2b4723616ddd8e6218d79701bb9848376d22342b1717634320dd50e0",
-      "size": 14185
+      "sha256": "c45c86e1c6261b30396d6b6016716425937cdf2492da9e85f540015da5feb38c",
+      "size": 17042
     },
     {
       "path": "models/bf-f8hp-pro.ini",
       "asset": "models.bf-f8hp-pro.ini",
-      "sha256": "83be5bfca89d56b836dbd0ee41d6e9e709c415bd11f94979aa47086b3474d846",
-      "size": 1280
+      "sha256": "1989ea3f4f63c429dd85848c470cb0c15ef19a7b39ce765c2815dc677d234ec0",
+      "size": 1276
     },
     {
       "path": "models/bf-f8hp.ini",
       "asset": "models.bf-f8hp.ini",
-      "sha256": "1876aebcf2a29cef9a1d9dd7475d3994a0759471c97b649bf33b630049bb0a49",
-      "size": 1103
+      "sha256": "269fff4832d5ec782a7dd5c8ace53163c7bfd26f7c09d0d43152783edebd4cb3",
+      "size": 1099
     },
     {
       "path": "models/f-11.ini",
       "asset": "models.f-11.ini",
-      "sha256": "5d25bc50261b7b04616faf802e1f18e6c0798a1b3c081f811af336b796dc1303",
-      "size": 962
+      "sha256": "88f2bb9193c64faaaa39907b46ccf046b6aaab1a48af0500069528ced16798f7",
+      "size": 958
+    },
+    {
+      "path": "models/gm-21.ini",
+      "asset": "models.gm-21.ini",
+      "sha256": "0eaae56b026d10d5fbb42cf32bfccb6a0ae3f53f0ef2f9a974280db6975c2777",
+      "size": 1323
+    },
+    {
+      "path": "models/gm-30-plus.ini",
+      "asset": "models.gm-30-plus.ini",
+      "sha256": "f74b51454af242af0d3216890bb5e3c66fe170b06e3670a70802ef552bdba905",
+      "size": 1345
+    },
+    {
+      "path": "models/gm-30-pro.ini",
+      "asset": "models.gm-30-pro.ini",
+      "sha256": "c51b27187b2207a8121719f659516ba575e4eef955162e25f1bd83270ed3e2dc",
+      "size": 1342
     },
     {
       "path": "models/gm-5rh.ini",
       "asset": "models.gm-5rh.ini",
-      "sha256": "cff0716de3263eff0dea7e39074da57471e6f0bac42cfb92665c0823133f2aea",
-      "size": 1144
+      "sha256": "1bb8067d356d01b50562157fe5237d7469619e0d9eed8a61432bd90b1a824b1e",
+      "size": 1140
     },
     {
       "path": "models/gt-5r.ini",
       "asset": "models.gt-5r.ini",
-      "sha256": "f4360a5267167ae3bfb3046e4facf4938d5da004b51ec7e13ee58cb938d05879",
-      "size": 1114
+      "sha256": "6af0e330f466d9c3baa297bc982eb101463375ad5a4598e3ef18476223c3dbde",
+      "size": 1123
     },
     {
       "path": "models/k5-plus.ini",
       "asset": "models.k5-plus.ini",
-      "sha256": "be4c465c5405d17d8a448f6f5cc69d6f1cab5801b18d77e1cc7c27d742a07a04",
-      "size": 1209
+      "sha256": "60d866559f1f055580b7c3a841c2ad2fb3d96efab3afab5557d0fc74d36915c3",
+      "size": 1205
     },
     {
       "path": "models/k6.ini",
       "asset": "models.k6.ini",
-      "sha256": "4119626b41e8ac384e6563613593280a06c5e2c01b18bac573b6c8c936f29df6",
-      "size": 1123
+      "sha256": "c16d334b45ccd0ed421711cdc4e86beb5ae064f9ee055f488c8fec38ea088451",
+      "size": 1119
     },
     {
       "path": "models/kt-980hp.ini",
       "asset": "models.kt-980hp.ini",
-      "sha256": "f42f61b67776ab5b6c074e979ff46c1ef18b44a92815e1e1d5e126a01e0c7e5e",
-      "size": 977
+      "sha256": "ab40031c780b3545ed7d885fbf3e1251eba880601e8ecf4d43ba0a4efecec514",
+      "size": 973
     },
     {
       "path": "models/maxtalker-mt-5rm.ini",
       "asset": "models.maxtalker-mt-5rm.ini",
-      "sha256": "f1244aa8b05fc8e88dcf1439181abe26b1f4813ceb481560fba8d24ee594c43d",
-      "size": 1222
+      "sha256": "d7263722c5deb329e628a0b460510b821f9e2449a1aa1d22f1ea3b9565dae35b",
+      "size": 1218
     },
     {
       "path": "models/maxtalker-p15.ini",
       "asset": "models.maxtalker-p15.ini",
-      "sha256": "a89747d375886a5bc926460e4c53f24cc21b1164d1631463612eb454797c7e0c",
-      "size": 1215
+      "sha256": "b5c1e77d83419fe0b380061ede7cbf8154b1a18591645b17205f9df94ff2941f",
+      "size": 1211
     },
     {
       "path": "models/uv-17pro.ini",
       "asset": "models.uv-17pro.ini",
-      "sha256": "ee3695e6d4bfd234b4374b33d990d5f634dbd71ede04b2884459791403a76290",
-      "size": 1137
+      "sha256": "dbefbf07cca0a8696b0a74a4ff2c36d1a5d650fe5b3ad2a06f29ae4a22a6ca4f",
+      "size": 1133
     },
     {
       "path": "models/uv-17progps.ini",
       "asset": "models.uv-17progps.ini",
-      "sha256": "56d9ec78543c5835c3e68f7e5efa8e2097b7634e5516a0e6cb7697656823011c",
-      "size": 1205
+      "sha256": "41e22ac896a05370baa298650f1332abf4967228aacd5a9b1bd41147e1a05a33",
+      "size": 1201
     },
     {
       "path": "models/uv-17r-plus.ini",
       "asset": "models.uv-17r-plus.ini",
-      "sha256": "1e5f6d33532b7b987aded4353f253b0ae14ed246eeb03eabcf76a4230737a9b5",
-      "size": 1204
+      "sha256": "a60bdc269e7862088ae21239b5014720f2bb2d3d8de965f46996f54238244e9c",
+      "size": 1200
     },
     {
       "path": "models/uv-21progps.ini",
       "asset": "models.uv-21progps.ini",
-      "sha256": "a74d114632f5e4ecdc3b94b06bbd3ba9a25902a662051a998a5c6963cacbf1e2",
-      "size": 1219
+      "sha256": "b0e48a65e4b6e6e116e2438a079fa3fc08173db169a8b4cb34b7f5aafc7f4fec",
+      "size": 1215
     },
     {
       "path": "models/uv-21prov2.ini",
       "asset": "models.uv-21prov2.ini",
-      "sha256": "8d478b9b246da505bc6972d89fb67623b285dc94d1748e3ac558522b11399687",
-      "size": 1217
+      "sha256": "b358ee0fdfc809f83e5bd7d0e8a04ceeb2987cdf0aa9f81dbe89012b12403a69",
+      "size": 1213
     },
     {
       "path": "models/uv-25.ini",
       "asset": "models.uv-25.ini",
-      "sha256": "4a4fdac25489eff90890368be18b7e7eac50ba019bc97de400d852839da52e51",
-      "size": 1128
+      "sha256": "20425d12090219b5b17c0e52c0bd2bd4c9e1c644fcecfddee6315c3cdfddd851",
+      "size": 1124
     },
     {
       "path": "models/uv-28plus.ini",
       "asset": "models.uv-28plus.ini",
-      "sha256": "325e2cc31cf36cabcc1b2dd68fb3ee0d9d7f3da336686673baf6fbe751b7b200",
-      "size": 1225
+      "sha256": "42e0a70152e6d42307f6a905e5030b866b0c3394873c447b3c32790bec2495ba",
+      "size": 1221
     },
     {
       "path": "models/uv-32.ini",
       "asset": "models.uv-32.ini",
-      "sha256": "b4e1c480527e1c861e1a47d71c85847cc051b93aa33e9f77a1936b632c60333f",
-      "size": 1199
+      "sha256": "4e3e818b9a92d4d9d527850409cca97b6ff69807ccf3b5c904e88b6f4e46be1c",
+      "size": 1195
     },
     {
       "path": "models/uv-5g-mini.ini",
       "asset": "models.uv-5g-mini.ini",
-      "sha256": "18d180e9fa145272831162707240bf70ffcc999ce4e3caf3309cdd68c730b0ae",
-      "size": 1187
+      "sha256": "86d540baa6a3a9e5241f389acd25f0d14a8f651c5a11f523cbccdcb6c80c7752",
+      "size": 1305
     },
     {
       "path": "models/uv-5g-plus.ini",
       "asset": "models.uv-5g-plus.ini",
-      "sha256": "1bd6e340d7fb28837ebfde781bb51781cd291310ab88c17d206b1e3b0b769a56",
-      "size": 1157
+      "sha256": "9d52706e0aafd1855896fb5a08b33f43e52fee512b50ac9b5d726d260ef8585c",
+      "size": 1153
     },
     {
       "path": "models/uv-5g-pro.ini",
       "asset": "models.uv-5g-pro.ini",
-      "sha256": "fab173bb7803445a62ea52faac2cc509d8e5cce206a347b0a63e70ab9ae463d1",
-      "size": 1076
+      "sha256": "1b6e295327880b8fc596469d5f9043315edeb66f0e77b67b47cabaaeca0543b0",
+      "size": 1072
     },
     {
       "path": "models/uv-5g.ini",
       "asset": "models.uv-5g.ini",
-      "sha256": "8239fa37c41b35467ce4f7d73aa153295efbfe604f3e7235bbaceb20e88f3f34",
-      "size": 1006
+      "sha256": "b754c7f1803504cba0eff995296fad9c5299dd32348bb6658c3661a3a3b34cc5",
+      "size": 1002
     },
     {
       "path": "models/uv-5r-mini.ini",
       "asset": "models.uv-5r-mini.ini",
-      "sha256": "a89be122726f49c320efb6dcb1125cdea0dd1cac1521527faf56d5da26b46817",
-      "size": 1170
+      "sha256": "cb2a714c2cba29def628109765537ab77fe4f7d831d7f8b30e75578a780f5ce0",
+      "size": 1166
     },
     {
       "path": "models/uv-5r.ini",
       "asset": "models.uv-5r.ini",
-      "sha256": "899e5e1fd2b36f3a5d406e70744ed515d1ff0414c1344c9e6befc8c1b6ed3412",
-      "size": 1179
+      "sha256": "a421bc15515db56aa0079032b56d3532c0e8b344b9aa9ea163c2b87137db9ddc",
+      "size": 1282
     },
     {
       "path": "models/uv-5rh.ini",
       "asset": "models.uv-5rh.ini",
-      "sha256": "74ffa65babebb369e038bf170523f24b49ba61f7d60ea66a95ff0663189d02df",
-      "size": 1203
+      "sha256": "9c0ee01babfc68139e5b82ced900c5726e210f9443b4f8cee9a335b7f3c2ffd9",
+      "size": 1199
     },
     {
       "path": "models/uv-5rm-plus.ini",
       "asset": "models.uv-5rm-plus.ini",
-      "sha256": "9e1ec9d1d5292c465595641ffa9d510f6413454f362b26e5a03e70f132982d29",
-      "size": 1229
+      "sha256": "4e800d2fe7b4809ac409d05a0a64a90fc36b88e79569069e6372dbe511a75f04",
+      "size": 1225
     },
     {
       "path": "models/uv-5rm.ini",
       "asset": "models.uv-5rm.ini",
-      "sha256": "14a1785643d54b8b7d6164d0931eed0329ac0405d360ec1e4ee2d3e89971a05e",
-      "size": 1289
+      "sha256": "79d6a1d47f778b66355058b298179cb2e12419fafff808167fc15770610ff5ef",
+      "size": 1336
     },
     {
       "path": "models/uv-5rx3.ini",
       "asset": "models.uv-5rx3.ini",
-      "sha256": "390c1fce82e76f325af8dc87abdc53bdcd81b05f066871e1230ff44090ad513a",
-      "size": 1031
+      "sha256": "530ad64e698ad6f8cf3e82b8de59a034201d491adce2a33bb72619f64fcd82e3",
+      "size": 1027
     },
     {
       "path": "models/uv-6.ini",
       "asset": "models.uv-6.ini",
-      "sha256": "ba6abb4921f99a1ab0de5feb4c6254d1ead9835f932cda5c4aa06d56ba701fde",
-      "size": 989
+      "sha256": "110e9cca3142b4149c10c010cf76f303bfcbd19539a52df5b19ac4ff51847302",
+      "size": 985
     },
     {
       "path": "models/uv-82.ini",
       "asset": "models.uv-82.ini",
-      "sha256": "891260f77cc8aa52e5f7f1f23f180c7fbed0454119857f19d18f793843a12539",
-      "size": 1021
+      "sha256": "0a12a5a172ab5a9caf9aad1980b41de6055faaafc1d338a0ba59efad570eac4c",
+      "size": 1017
     },
     {
       "path": "models/uv-82hp.ini",
       "asset": "models.uv-82hp.ini",
-      "sha256": "19b4064e6fb80b8884e0e52eafd2c583e32e23c8f43bae31c813c4aa26f7d09e",
-      "size": 1027
+      "sha256": "d8eef253cc775d6e14a6c45e3f3a1d35bfec4e931e2799ac93da905efd14fadf",
+      "size": 1023
     },
     {
       "path": "models/uv-82x3.ini",
       "asset": "models.uv-82x3.ini",
-      "sha256": "05d014b3f2f5a1c76c751e83c4448682a5b1d150ddcc9ad9b1c672f2fa09eb9d",
-      "size": 1013
+      "sha256": "9415c0e11698d81537f5f1a25c62537e521a6380771926256d960a4b63fa81a3",
+      "size": 1009
     }
   ]
 }

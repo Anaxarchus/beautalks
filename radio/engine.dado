@@ -5,7 +5,11 @@
 // every write goes through: back up the radio, write, read back, compare.
 package radio
 
+import "core:hash"
 import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:time"
 
 bool engine_known(^const Model m):
     return m^.engine == "uv17pro" || m^.engine == "uv5r"
@@ -61,18 +65,19 @@ type PhaseFn: void(rawptr, WritePhase)
 // an adapter. `upload` is only ever called by safe_write_with, after the
 // tested/override check and the backup.
 trait Engine:
-    LinkError!ref []u8 download(^self, ^const Model m, Progress pr)
-    LinkError!void upload(^self, ^const Model m, []u8 img, Progress pr)
+    // failures are LinkError numbers (plain `!`: see docs/DADO_NOTES.md)
+    !ref []u8 download(^self, ^const Model m, Progress pr)
+    !void upload(^self, ^const Model m, []u8 img, Progress pr)
     void pause(^self, i32 ms)
 
 // The built-in engines over a Link.
 type BuiltinEngine using Engine:
     Link link
 
-    LinkError!ref []u8 download(^self, ^const Model m, Progress pr):
+    !ref []u8 download(^self, ^const Model m, Progress pr):
         return download(&self.link, m, pr)
 
-    LinkError!void upload(^self, ^const Model m, []u8 img, Progress pr):
+    !void upload(^self, ^const Model m, []u8 img, Progress pr):
         // the gate already ran in safe_write_with; the engine re-checks it
         try upload(&self.link, m, img, true, pr)
 
@@ -84,35 +89,106 @@ type BuiltinEngine using Engine:
 // again and compare. `allow_untested` is the user's explicit confirmation
 // for a model not marked tested = write; backup and verify always run and
 // cannot be skipped. `pause_ms` waits between the three sessions.
+// Without a detection there is no fingerprint, so only a shipped `tested =
+// write` definition passes the gate (gate.dado); otherwise the override.
 LinkError!void safe_write_with(^Engine eng, ^const Model m, []u8 img, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
-    if m^.tested != Tested.WRITE && !allow_untested:
+    WriteStatus st
+    if !gate_allows(m, "", nil, allow_untested, &st):
         fail LinkError.UNTESTED
     if #len(img) != m^.image_size:
         fail LinkError.IMAGE_SIZE
     if phase != nil:
         phase(ctx, WritePhase.BACKUP)
-    try ref []u8 before = eng.download(m, pr)
-    try fs.write_bytes(backup_path, before) else:
-        #delete(before)
-        fail LinkError.BACKUP
+    try ref []u8 before = eng.download(m, pr) else code:
+        fail LinkError(code)
+    bool saved = save_backup(backup_path, m, before)
     #delete(before)
-    if !fs.exists(backup_path):
+    if !saved:
         fail LinkError.BACKUP
     eng.pause(pause_ms)
     if phase != nil:
         phase(ctx, WritePhase.WRITE)
-    try eng.upload(m, img, pr)
+    try eng.upload(m, img, pr) else code:
+        fail LinkError(code)
     eng.pause(pause_ms)
     if phase != nil:
         phase(ctx, WritePhase.VERIFY)
-    try ref []u8 after = eng.download(m, pr)
+    try ref []u8 after = eng.download(m, pr) else code:
+        fail LinkError(code)
     i64 bad = verify_mismatch(m, img, after)
     #delete(after)
     if bad >= 0:
         fail LinkError.VERIFY
 
-// safe_write_with the built-in engine for the model.
+// A new backup file name for model `m`: <data_dir>/backups/<model id>/
+// <UTC stamp>.img (the directories are made). The caller #deletes it; nil
+// when the directory cannot be made.
+ref []char8 new_backup_path(string8 data_dir, ^const Model m):
+    ref []char8 dir = path.join(data_dir, "backups", m^.id)
+    try fs.make_dirs(dir) else:
+        #delete(dir)
+        return nil
+    time.DateTime t = time.utc(time.unix_nanos())
+    strings.Builder b = strings.builder(32)
+    append_padded(&b, t.year, 4)
+    append_padded(&b, i64(t.month), 2)
+    append_padded(&b, i64(t.day), 2)
+    strings.append_char(&b, 'T')
+    append_padded(&b, i64(t.hour), 2)
+    append_padded(&b, i64(t.minute), 2)
+    append_padded(&b, i64(t.second), 2)
+    strings.append(&b, "Z.img")
+    ref []char8 out = path.join(dir, strings.text(b))
+    #delete(b)
+    #delete(dir)
+    return out
+
+// Writes a backup image to `backup_path` and a `.txt` sidecar beside it
+// (model, engine, size, SHA-256, UTC time). False when the image is not on
+// disk afterwards (the sidecar is best effort). Used by every write path.
+bool save_backup(string8 backup_path, ^const Model m, []u8 img):
+    try fs.write_bytes(backup_path, img) else:
+        return false
+    if !fs.exists(backup_path):
+        return false
+    strings.Builder b = strings.builder(256)
+    strings.append(&b, "beautalks backup\nmodel = ")
+    strings.append(&b, m^.id)
+    strings.append(&b, "\nradio = ")
+    strings.append(&b, m^.vendor)
+    strings.append(&b, " ")
+    strings.append(&b, m^.name)
+    strings.append(&b, "\nengine = ")
+    strings.append(&b, m^.engine)
+    strings.append(&b, "\nbytes = ")
+    append_int(&b, #len(img))
+    strings.append(&b, "\nsha256 = ")
+    hash.Sha256Digest dg = hash.sha256(img)
+    ref []char8 hx = hash.hex(dg)
+    strings.append(&b, hx)
+    #delete(hx)
+    strings.append(&b, "\nsaved_unix = ")
+    append_int(&b, time.unix())
+    strings.append(&b, "\n")
+    ref []char8 side = strings.concat(strings.trim_suffix(backup_path, ".img"), ".txt")
+    try fs.write_file(side, strings.text(b)) else:
+        _ = 0
+    #delete(side)
+    #delete(b)
+    return true
+
+// The safe write with the built-in engine for the model. One session in
+// both families: uv5r explicitly (uv5r_safe_session); uv17pro because
+// every phase finds the session the first one opened and reuses it.
 LinkError!void safe_write(^Link link, ^const Model m, []u8 img, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    if m^.engine == "uv5r":
+        WriteStatus st
+        if !gate_allows(m, "", nil, allow_untested, &st):
+            fail LinkError.UNTESTED
+        if #len(img) != m^.image_size:
+            fail LinkError.IMAGE_SIZE
+        try uv5r_safe_session(link, m, img, backup_path, pause_ms, phase, ctx, pr)
+        return
     BuiltinEngine eng
     eng.link = link
     try safe_write_with(&eng, m, img, allow_untested, backup_path, pause_ms, phase, ctx, pr)

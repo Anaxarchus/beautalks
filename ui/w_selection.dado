@@ -1,0 +1,266 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Selection controls (checkbox, switch, radio button), chips and badges.
+// Each control takes a pointer to the app's own value and answers true on the
+// frame it changed it.
+package btui
+
+// ── Checkbox ───────────────────────────────────────────────────────────────
+
+// An 18 dp checkbox in a 40 dp touch target at (x, y), with an optional
+// label to its right (the label is clickable too). `error` draws it in the
+// error colour.
+bool checkbox(string8 label, f32 x, f32 y, ^bool value, bool disabled = false, bool error = false, string8 key = ""):
+    ^Scheme t = theme()
+    u64 uid = id(#format(key if #len(key) > 0 else label, "#cb"))
+    f32 lw = 0.0
+    if #len(label) > 0:
+        lw = text_width(BODY_LARGE, label) + 8.0
+    Rect target = Rect((x, y, 40.0, 40.0))
+    Rect hit = Rect((x, y, 40.0 + lw, 40.0))
+    Interact it = interact(uid, hit, true, disabled)
+    bool changed = false
+    if it.clicked:
+        value^ = !value^
+        changed = true
+    bool on = value^
+    f32 k = animate(uid ~ u64(0xC4EC), 1.0 if on else 0.0, 0.15)
+    [4]u8 accent = t.error if error else t.primary
+    [4]u8 off_col = t.error if error else t.on_surface_variant
+    // state layer: a 40 dp circle
+    [4]u8 sl = accent if on else t.on_surface
+    Interact it2 = it
+    it2.hover = it.hover
+    state_layer(uid, target, 20.0, sl, it2)
+    focus_ring(center_in(target, 40.0, 40.0), 20.0, it.focused)
+    Rect box = center_in(target, 18.0, 18.0)
+    if disabled:
+        accent = alpha(t.on_surface, DISABLED_CONTENT)
+        off_col = alpha(t.on_surface, DISABLED_CONTENT)
+    if k < 0.999:
+        stroke_rrect(box, 2.0, 2.0, off_col)
+    if k > 0.001:
+        fill_rrect(box, 2.0, alpha(accent, k))
+        // the check mark draws itself on
+        [4]u8 mk = t.on_error if error else t.on_primary
+        if disabled:
+            mk = t.surface
+        f32 p = clampf(k * 1.4 - 0.2, 0.0, 1.0)
+        [2]f32 a = [box.x + 4.0, box.y + 9.3]
+        [2]f32 b = [box.x + 7.4, box.y + 12.6]
+        [2]f32 c = [box.x + 14.0, box.y + 5.8]
+        if p > 0.0:
+            if p < 0.35:
+                f32 u = p / 0.35
+                [2][2]f32 pts = [a, [lerpf(a[0], b[0], u), lerpf(a[1], b[1], u)]]
+                stroke_path(pts[:], 2.0, mk, false)
+            else:
+                f32 u = (p - 0.35) / 0.65
+                [3][2]f32 pts = [a, b, [lerpf(b[0], c[0], u), lerpf(b[1], c[1], u)]]
+                stroke_path(pts[:], 2.0, mk, false)
+    if #len(label) > 0:
+        [4]u8 lc = t.on_surface if !disabled else alpha(t.on_surface, DISABLED_CONTENT)
+        _ = text(BODY_LARGE, x + 40.0 + 4.0, y + 8.0, label, lc)
+    return changed
+
+// ── Switch ─────────────────────────────────────────────────────────────────
+
+// A 52 x 32 dp switch at (x, y). The thumb grows from 16 to 24 dp when on
+// (28 while pressed) and shows a check icon.
+bool switch_(string8 key, f32 x, f32 y, ^bool value, bool disabled = false):
+    ^Scheme t = theme()
+    u64 uid = id(#format(key, "#sw"))
+    Rect track = Rect((x, y, 52.0, 32.0))
+    Interact it = interact(uid, track, true, disabled)
+    bool changed = false
+    if it.clicked:
+        value^ = !value^
+        changed = true
+    bool on = value^
+    f32 k = animate(uid ~ u64(0x5717), 1.0 if on else 0.0, 0.25)
+    f32 press = animate(uid ~ u64(0x9E55), 1.0 if it.down else 0.0, 0.1)
+    [4]u8 track_off = t.surface_container_highest
+    [4]u8 track_on = t.primary
+    [4]u8 thumb_off = t.outline
+    [4]u8 thumb_on = t.on_primary
+    if disabled:
+        track_off = alpha(t.surface_container_highest, DISABLED_CONTAINER)
+        track_on = alpha(t.on_surface, DISABLED_CONTAINER)
+        thumb_off = alpha(t.on_surface, DISABLED_CONTENT)
+        thumb_on = t.surface
+    fill_rrect(track, 16.0, mix(track_off, track_on, k))
+    if k < 0.999:
+        stroke_rrect(track, 16.0, 2.0, alpha(thumb_off, 1.0 - k))
+    f32 d = lerpf(16.0, 24.0, k)
+    d = lerpf(d, 28.0, press)
+    f32 tx = lerpf(x + 16.0, x + 36.0, k)
+    f32 ty = y + 16.0
+    // the state layer is a 40 dp circle around the thumb
+    Rect hal = Rect((tx - 20.0, ty - 20.0, 40.0, 40.0))
+    state_layer(uid, hal, 20.0, t.primary if on else t.on_surface, it)
+    fill_circle(tx, ty, d * 0.5, mix(thumb_off, thumb_on, k))
+    if k > 0.5:
+        icon("check", tx - 8.0, ty - 8.0, 16.0, alpha(t.on_primary_container, (k - 0.5) * 2.0), false)
+    focus_ring(track, 16.0, it.focused)
+    return changed
+
+// ── Radio button ───────────────────────────────────────────────────────────
+
+// A radio button for `option` of the group stored in `value`, with a label.
+bool radio(string8 label, f32 x, f32 y, ^i32 value, i32 option, bool disabled = false, string8 key = ""):
+    ^Scheme t = theme()
+    u64 uid = id(#format(key if #len(key) > 0 else label, "#rb", option))
+    f32 lw = 0.0
+    if #len(label) > 0:
+        lw = text_width(BODY_LARGE, label) + 8.0
+    Rect target = Rect((x, y, 40.0, 40.0))
+    Interact it = interact(uid, Rect((x, y, 40.0 + lw, 40.0)), true, disabled)
+    bool changed = false
+    if it.clicked && value^ != option:
+        value^ = option
+        changed = true
+    bool on = value^ == option
+    f32 k = animate(uid ~ u64(0x7AD1), 1.0 if on else 0.0, 0.2)
+    [4]u8 c = mix(t.on_surface_variant, t.primary, k)
+    if disabled:
+        c = alpha(t.on_surface, DISABLED_CONTENT)
+    state_layer(uid, target, 20.0, t.primary if on else t.on_surface, it)
+    focus_ring(target, 20.0, it.focused)
+    stroke_circle(cx(target), cy(target), 10.0, 2.0, c)
+    if k > 0.01:
+        fill_circle(cx(target), cy(target), 5.0 * k, c)
+    if #len(label) > 0:
+        [4]u8 lc = t.on_surface if !disabled else alpha(t.on_surface, DISABLED_CONTENT)
+        _ = text(BODY_LARGE, x + 44.0, y + 8.0, label, lc)
+    return changed
+
+// ── Chips ──────────────────────────────────────────────────────────────────
+
+const i32 CHIP_ASSIST = 0
+const i32 CHIP_FILTER = 1
+const i32 CHIP_INPUT = 2
+const i32 CHIP_SUGGESTION = 3
+
+f32 chip_width(string8 label, string8 icon_name = "", bool selected = false, bool trailing = false):
+    f32 w = text_width(LABEL_LARGE, label) + 32.0
+    if #len(icon_name) > 0 || selected:
+        w = w + 18.0 + 8.0 - 8.0
+    if trailing:
+        w = w + 18.0 + 8.0 - 8.0
+    return ceilf(w)
+
+// A 32 dp chip. Filter chips toggle `selected` (pass a pointer; others may
+// pass nil) and show a check when on. Input chips have a trailing close icon;
+// answers true when clicked (for an input chip: when its close was clicked).
+bool chip(string8 label, Rect r, i32 kind = 0, string8 icon_name = "", ^bool selected = nil, bool elevated = false, bool disabled = false):
+    ^Scheme t = theme()
+    u64 uid = id(#format(label, "#chip", kind))
+    Interact it = interact(uid, r, true, disabled)
+    bool on = selected != nil && selected^
+    if it.clicked && kind == CHIP_FILTER && selected != nil:
+        selected^ = !selected^
+        on = selected^
+    [4]u8 fg = t.on_surface_variant
+    [4]u8 icol = t.primary
+    if on:
+        fill_rrect(r, 8.0, t.secondary_container)
+        fg = t.on_secondary_container
+        icol = t.on_secondary_container
+    else if elevated:
+        shadow(r, 8.0, 1)
+        fill_rrect(r, 8.0, t.surface_container_low)
+    else:
+        stroke_rrect(r, 8.0, 1.0, t.outline_variant if !(it.focused && focus_visible()) else t.on_surface_variant)
+    if kind == CHIP_ASSIST:
+        fg = t.on_surface
+    if disabled:
+        fg = alpha(t.on_surface, DISABLED_CONTENT)
+        icol = fg
+    state_layer(uid, r, 8.0, fg, it)
+    focus_ring(r, 8.0, it.focused)
+    f32 x = r.x + 16.0
+    if on && kind == CHIP_FILTER:
+        x = r.x + 8.0
+        icon("check", x, cy(r) - 9.0, 18.0, icol)
+        x = x + 26.0
+    else if #len(icon_name) > 0:
+        x = r.x + 8.0
+        icon(icon_name, x, cy(r) - 9.0, 18.0, icol)
+        x = x + 26.0
+    _ = text(LABEL_LARGE, x, cy(r) - 10.0, label, fg)
+    if kind == CHIP_INPUT:
+        icon("close", right(r) - 26.0, cy(r) - 9.0, 18.0, fg)
+    return it.clicked
+
+// A chip laid out at (x, y); answers (clicked, width).
+(bool, f32) chip_at(f32 x, f32 y, string8 label, i32 kind = 0, string8 icon_name = "", ^bool selected = nil):
+    bool sel = selected != nil && selected^
+    f32 w = chip_width(label, icon_name, sel && kind == CHIP_FILTER, kind == CHIP_INPUT)
+    bool c = chip(label, Rect((x, y, w, 32.0)), kind, icon_name, selected)
+    return (c, w)
+
+// Status tones for `status_chip`.
+const i32 TONE_NEUTRAL = 0
+const i32 TONE_SUCCESS = 1
+const i32 TONE_WARNING = 2
+const i32 TONE_ERROR = 3
+const i32 TONE_INFO = 4
+const i32 TONE_PRIMARY = 5
+
+([4]u8 bg, [4]u8 fg) tone_colors(i32 tone):
+    ^Scheme t = theme()
+    if tone == TONE_SUCCESS:
+        return (t.success_container, t.on_success_container)
+    if tone == TONE_WARNING:
+        return (t.warning_container, t.on_warning_container)
+    if tone == TONE_ERROR:
+        return (t.error_container, t.on_error_container)
+    if tone == TONE_INFO:
+        return (t.info_container, t.on_info_container)
+    if tone == TONE_PRIMARY:
+        return (t.primary_container, t.on_primary_container)
+    return (t.surface_container_highest, t.on_surface_variant)
+
+f32 status_chip_width(string8 label, string8 icon_name = "", bool small = false):
+    Style st = LABEL_MEDIUM if small else LABEL_LARGE
+    f32 w = text_width(st, label) + (16.0 if small else 24.0)
+    if #len(icon_name) > 0:
+        w = w + (14.0 + 4.0 if small else 18.0 + 6.0) - (2.0 if small else 4.0)
+    return ceilf(w)
+
+// A non-interactive tonal status pill ("Tested · write OK", "Licence
+// required"). `small` is 24 dp tall with label-medium text, else 32 dp.
+f32 status_chip(f32 x, f32 y, string8 label, i32 tone, string8 icon_name = "", bool small = false):
+    ([4]u8 bg, [4]u8 fg) = tone_colors(tone)
+    Style st = LABEL_MEDIUM if small else LABEL_LARGE
+    f32 h = 24.0 if small else 32.0
+    f32 w = status_chip_width(label, icon_name, small)
+    Rect r = Rect((x, y, w, h))
+    fill_rrect(r, h * 0.5 if small else 8.0, bg)
+    f32 tx = x + (8.0 if small else 12.0)
+    if #len(icon_name) > 0:
+        f32 isz = 14.0 if small else 18.0
+        icon(icon_name, tx - 2.0, cy(r) - isz * 0.5, isz, fg, true)
+        tx = tx + isz + (2.0 if small else 2.0)
+    _ = text(st, tx, cy(r) - st.line * 0.5, label, fg)
+    return w
+
+// ── Badge ──────────────────────────────────────────────────────────────────
+
+// A badge anchored at the top-right corner of an icon at (ix, iy, 24 dp).
+// An empty label draws the 6 dp dot.
+void badge(f32 ix, f32 iy, string8 label):
+    ^Scheme t = theme()
+    if #len(label) == 0:
+        fill_circle(ix + 21.0, iy + 3.0, 3.0, t.error)
+        return
+    f32 w = maxf(16.0, text_width(LABEL_SMALL, label) + 8.0)
+    Rect r = Rect((ix + 14.0, iy - 4.0, w, 16.0))
+    fill_rrect(r, 8.0, t.error)
+    text_in(r, LABEL_SMALL, label, t.on_error, ALIGN_CENTER)
+
+// ── Divider ────────────────────────────────────────────────────────────────
+
+void divider(f32 x0, f32 x1, f32 y):
+    hline(x0, x1, y, 1.0, theme().outline_variant)

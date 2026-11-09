@@ -1,0 +1,144 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Guided verification on the emulator: the "yes" path makes a local test
+// record that counts only for that fingerprint and survives a reload; the
+// "no" path records a failure, writes a report, and the restore puts the
+// backup back on the radio.
+package radio
+
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+// Starts the emulator for `model_ini` serving `image`; `dump` receives its
+// memory after every write.
+bool start_emu(string8 model_ini, string8 image, string8 dump, string8 port_file, ^Emu out):
+    if fs.exists(port_file):
+        try fs.remove_file(port_file) else:
+            return false
+    [13]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--dump", dump, "--port-file", port_file, "--stats", "build/ver.stats", "")
+    try out^.d = proc.duplex(argv[0..<12]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists(port_file):
+            try out^.port = fs.read_file(port_file) else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+// A counter from the emulator's --stats file, -1 when unreadable.
+i64 emu_count(string8 key):
+    try ref []char8 t = fs.read_file("build/ver.stats") else:
+        return -1
+    defer #delete(t)
+    string8 s = t
+    string8 piece
+    strings.Splitter it = strings.splitter(s, "\n")
+    for strings.split_next(&it, &piece):
+        (string8 k, string8 v, bool found) = strings.split_first(piece, " ")
+        if found && k == key:
+            return parse_num(v, -1)
+    return -1
+
+void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        _ = 0
+    #delete(e^.port)
+
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    bool ok = true
+    string8 data = "build/ver_data"
+    if fs.exists(data):
+        try fs.remove_all(data) else:
+            return 1
+    ^const Model shipped = &models[find_model(models, "UV-5RM")]
+    ^const Model u17 = &models[find_model(models, "UV-17Pro")]
+    ^const Model ux3 = &models[find_model(models, "UV-5RX3")]
+    ok = #expect(write_status(shipped, "", nil).by == TestedBy.SHIPPED, "UV-5RM is shipped tested") && ok
+    ok = #expect(u17^.tested == Tested.UNTESTED && ux3^.tested == Tested.UNTESTED, "test models are untested") && ok
+    Registry reg = open_registry(data)
+    defer reg.destroy()
+    TestedStore store = open_tested(data)
+
+    // ── yes: an untested UV-17Pro (same protocol as the 5RM fixture)
+    Emu e
+    if !start_emu("models/uv-17pro.ini", "testdata/uv5rm.img", "build/ver_dump.img", "build/ver.port", &e):
+        return 1
+    try Verification v = verify_begin(e.port, models, "uv-17pro", &reg, data, no_progress()) else why:
+        stop_emu(&e)
+        _ = #expect(false, "begin: ", link_error_message(why))
+        return 1
+    string8 fp = v.fingerprint
+    ok = #expect(v.state == VerifyState.BEGUN && #len(v.channels.entries) == 49 && strings.starts_with(fp, "uv17pro:F=") && fs.exists(v.backup_path), "begin: read, fingerprint, backup") && ok
+    ok = #expect(write_status(u17, fp, &store).by == TestedBy.NONE, "not tested before") && ok
+    try SerialLink l = open_serial(e.port, 115200) else:
+        return 1
+    try verify_write(&v, &l, 100, nil, nil, no_progress()) else why:
+        ok = #expect(false, "verify write: ", link_error_message(why)) && ok
+    ok = #expect(v.state == VerifyState.WRITTEN && v.mismatch_at < 0, "identical write verified byte for byte") && ok
+    ok = #expect(record_verification(&v, &store, true, "0.1.0"), "confirmed") && ok
+    ok = #expect(write_status(u17, fp, &store).by == TestedBy.LOCAL, "now tested locally") && ok
+    ok = #expect(write_status(u17, "uv17pro:F=00 M=00", &store).by == TestedBy.NONE, "another fingerprint does not count") && ok
+    ok = #expect(write_status(shipped, "uv17pro:F=00 M=00", &store).by == TestedBy.SHIPPED, "shipped still counts") && ok
+    ok = #expect(save_tested(&store), "records saved") && ok
+    TestedStore again = open_tested(data)
+    ok = #expect(write_status(u17, fp, &again).by == TestedBy.LOCAL, "record survives a reload") && ok
+    TestedList tl = list_tested(&again)
+    ok = #expect(#len(tl.records) == 1 && tl.text(tl.records[0].result) == "ok" && tl.text(tl.records[0].app_version) == "0.1.0", "listed") && ok
+    tl.destroy()
+    again.destroy()
+    close_serial(&l)
+    v.destroy()
+    stop_emu(&e)
+
+    // ── no: an untested UV-5R-family model, then restore
+    if !start_emu("models/uv-5rx3.ini", "testdata/uv5re.img", "build/ver_dump.img", "build/ver.port", &e):
+        return 1
+    try Verification w = verify_begin(e.port, models, "uv-5rx3", &reg, data, no_progress()) else why:
+        stop_emu(&e)
+        _ = #expect(false, "begin 5rx3: ", link_error_message(why))
+        return 1
+    string8 fw = w.fingerprint
+    ok = #expect(strings.contains(fw, "ident=AA30760400052") && strings.contains(fw, "fw=HN5RV011"), "UV-5R fingerprint: ", fw) && ok
+    try SerialLink l2 = open_serial(e.port, 9600) else:
+        return 1
+    try verify_write(&w, &l2, 100, nil, nil, no_progress()) else why:
+        ok = #expect(false, "verify write 5rx3: ", link_error_message(why)) && ok
+    ok = #expect(w.state == VerifyState.WRITTEN, "5rx3 written") && ok
+    ok = #expect(!record_verification(&w, &store, false, "0.1.0"), "user said no") && ok
+    ok = #expect(w.state == VerifyState.FAILED && w.report_path != nil && fs.exists(w.report_path), "report written") && ok
+    ok = #expect(write_status(ux3, fw, &store).by == TestedBy.NONE, "a 'no' does not count as tested") && ok
+    // something changed the radio meanwhile; the restore puts the backup back
+    try ref []u8 changed = load_image("testdata/uv5re.img") else:
+        return 1
+    try Channel c = decode_channel(ux3, changed, 1) else:
+        return 1
+    set_channel_name(&c, "CHANGED")
+    try encode_channel(ux3, changed, &c) else:
+        return 1
+    try upload(&l2, ux3, changed, true, no_progress()) else why:
+        ok = #expect(false, "changing the radio: ", link_error_message(why)) && ok
+    #delete(changed)
+    try verify_restore(&w, &l2, 100, nil, nil, no_progress()) else why:
+        ok = #expect(false, "restore: ", link_error_message(why)) && ok
+    ok = #expect(w.state == VerifyState.RESTORED, "restored") && ok
+    try ref []u8 radio_now = load_image("build/ver_dump.img") else:
+        return 1
+    ok = #expect(verify_mismatch(ux3, w.image, radio_now) < 0, "the radio holds the backup again") && ok
+    #delete(radio_now)
+    close_serial(&l2)
+    w.destroy()
+    stop_emu(&e)
+    store.destroy()
+    return 0 if ok else 1

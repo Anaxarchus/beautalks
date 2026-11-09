@@ -28,4 +28,17 @@ i32 test():
                 total += region_at(m, r).len
                 r += 1
             ok = #expect(total == m^.image_size && total % i64(m^.block) == 0, m^.id, ": regions") && ok
+        // nothing sent outside a write may hold 0x57 ('W'): a radio in an
+        // open session would parse it as the start of a write frame
+        string8 lists2 = m^.magics
+        for k in 0..<word_count(lists2):
+            [64]u8 mb
+            (i64 n, i64 _) = magic_at(lists2, k, mb[:])
+            for j in 0..<n:
+                ok = #expect(mb[j] != 0x57, m^.id, ": magic ", k, " holds 0x57") && ok
+        for k in 0..<word_count(m^.ident):
+            [64]u8 ib
+            i64 n = decode_bytes(word_at(m^.ident, k), ib[:])
+            for j in 0..<n:
+                ok = #expect(ib[j] != 0x57, m^.id, ": ident holds 0x57") && ok
     return 0 if ok else 1

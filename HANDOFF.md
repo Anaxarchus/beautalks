@@ -76,7 +76,7 @@ index+0x6A, index into DCS_CODES (CHIRP DTCS_CODES + 645, sorted, 105 codes). Im
 
 ## Code so far
 - `serial/serial.dado` — termios serial port (open/close/write/read_into with timeout/
-  discard_input/set_lines/pause). `dado check serial` passes. Untested on hardware.
+  discard_input/set_lines/pause). Used on hardware (CH340, macOS): settles 200 ms after open.
 - `radio/codec.dado` — byte codecs + tones. Passes check.
 - `radio/profile.dado` — INI model profiles + field-spec layouts. **Does not check yet**
   (LNT0613 pass-by-pointer lints, fs.Listing API misuse — see `dado api core:os/fs`).
@@ -111,3 +111,15 @@ empty_at,empty_byte,blank(hex),rx,tx,rx_tone,tx_tone,power,wide,scan,bcl,name (f
 ## CSV (our own, simple; CHIRP CSV import later)
 `number,name,rx_mhz,tx_mhz,rx_tone,tx_tone,power,mode,scan,bcl` — tone `""`|`69.3`|`D023N`|
 `D023I`; tx_mhz empty = TX off; mode `FM`|`NFM`; scan/bcl `yes`/`no`.
+
+## Hardware-verified writes (2026-11-08)
+- UV-5RM (`models/uv-5rm.ini`, `tested = write`): read → safe write (backup, 526 W blocks all
+  acked, verify) → read, back to back without power-cycling, all identical; the write and the
+  second read reused the open programming session (0 idents). After a fresh power-on the radio
+  ignored the first two idents and answered the third (~3.5 s): the ident retries
+  (`radio.IDENT_TRIES` = 3, 500 ms apart, 1 s reply timeout) cover it, including detection's
+  remembered fast path.
+- UV-5RE (`models/uv-5r.ini`, `tested = write`; firmware HN5RV011): read → guarded safe write
+  (6432 B, CHIRP default ranges) → read, identical; detection right after the write took one
+  attempt, 7.3 s (waited out the ~6 s clone-session quiet time).
+- Both radios worked normally afterwards. Session behaviour per family: `radio.session_info`.

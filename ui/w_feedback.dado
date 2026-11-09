@@ -1,0 +1,268 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Feedback: tooltips, snackbars, progress indicators and dialogs.
+package btui
+
+import "core:strings"
+
+// ── Tooltip ────────────────────────────────────────────────────────────────
+
+private u64 g_tip_uid
+private f64 g_tip_t0
+private bool g_tip_seen
+
+// A plain tooltip for `uid` (whose shape is `anchor`), shown after the
+// pointer has rested on it for half a second. Call it every frame with
+// whether the widget is hovered.
+void tooltip(u64 uid, Rect anchor, string8 tip, bool hover):
+    if !hover:
+        if g_tip_uid == uid:
+            g_tip_uid = 0
+        return
+    if g_tip_uid != uid:
+        g_tip_uid = uid
+        g_tip_t0 = now()
+    f64 waited = now() - g_tip_t0
+    if waited < 0.5:
+        animating()
+        return
+    f32 k = clampf(f32((waited - 0.5) / 0.15), 0.0, 1.0)
+    if k < 1.0:
+        animating()
+    ^Scheme t = theme()
+    // one line when it fits in 420 dp, otherwise wrapped (a long reason is
+    // shown whole, never cut)
+    f32 tw = text_width(BODY_SMALL, tip)
+    bool wrap = tw > 420.0
+    f32 w = (420.0 if wrap else tw) + 16.0
+    f32 h = 24.0
+    if wrap:
+        h = text_wrap(Rect((0.0, 0.0, 420.0, 0.0)), BODY_SMALL, tip, t.inverse_on_surface, true) + 8.0
+    f32 x = clampf(cx(anchor) - w * 0.5, 4.0, view_w() - w - 4.0)
+    f32 y = bottom(anchor) + 4.0
+    if y + h > view_h() - 4.0:
+        y = anchor.y - h - 4.0
+    i32 old = set_layer(LAYER_TOOLTIP)
+    Rect r = Rect((x, y, w, h))
+    fill_rrect(r, 4.0, alpha(t.inverse_surface, k))
+    if wrap:
+        _ = text_wrap(Rect((x + 8.0, y + 4.0, 420.0, h - 8.0)), BODY_SMALL, tip, alpha(t.inverse_on_surface, k))
+    else:
+        text_in(r, BODY_SMALL, tip, alpha(t.inverse_on_surface, k), ALIGN_CENTER)
+    _ = set_layer(old)
+
+// ── Snackbar ───────────────────────────────────────────────────────────────
+
+private ref []char8 g_snack_text
+private ref []char8 g_snack_action
+private f64 g_snack_t0
+private f64 g_snack_until
+private bool g_snack_on
+
+// Show a snackbar (replacing any other) for `secs` seconds (0: until closed).
+void snackbar_show(string8 msg, string8 action = "", f64 secs = 6.0):
+    #delete(g_snack_text)
+    #delete(g_snack_action)
+    using keep():
+        g_snack_text = strings.clone(msg)
+        g_snack_action = strings.clone(action)
+    g_snack_t0 = now()
+    g_snack_until = now() + secs if secs > 0.0 else 1.0e12
+    g_snack_on = true
+    request_frame()
+
+void snackbar_hide():
+    g_snack_on = false
+
+bool snackbar_visible():
+    return g_snack_on
+
+// Draw the snackbar, bottom-centre of `area`. Answers true on the frame its
+// action was clicked.
+bool snackbar(Rect area):
+    if !g_snack_on:
+        return false
+    ^Scheme t = theme()
+    f64 tnow = now()
+    f32 inn = clampf(f32((tnow - g_snack_t0) / 0.25), 0.0, 1.0)
+    f32 out = clampf(f32((tnow - g_snack_until) / 0.15), 0.0, 1.0)
+    if out >= 1.0:
+        g_snack_on = false
+        return false
+    animating()
+    f32 k = ease_emphasized_decel(inn) * (1.0 - out)
+    i32 old = set_layer(LAYER_SNACK)
+    f32 aw = 0.0
+    if #len(g_snack_action) > 0:
+        aw = button_width(g_snack_action, "", BTN_TEXT) + 8.0
+    f32 w = minf(area.w - 32.0, maxf(344.0, text_width(BODY_MEDIUM, g_snack_text) + 32.0 + aw + 40.0))
+    f32 h = 48.0
+    f32 x = area.x + (area.w - w) * 0.5
+    f32 y = bottom(area) - h - 16.0 + (1.0 - k) * 24.0
+    Rect r = Rect((x, y, w, h))
+    block(r)
+    shadow(r, 4.0, 3, k)
+    fill_rrect(r, 4.0, alpha(t.inverse_surface, k))
+    text_in(Rect((x + 16.0, y, w - 32.0 - aw - 40.0, h)), BODY_MEDIUM, g_snack_text, alpha(t.inverse_on_surface, k))
+    bool clicked = false
+    // the action, in inverse primary
+    if #len(g_snack_action) > 0:
+        Rect ar = Rect((right(r) - aw - 40.0, y + 4.0, aw - 8.0, 40.0))
+        u64 uid = id("snack#action")
+        Interact it = interact(uid, ar, true, false)
+        state_layer(uid, ar, 20.0, t.inverse_primary, it)
+        text_in(ar, LABEL_LARGE, g_snack_action, alpha(t.inverse_primary, k), ALIGN_CENTER)
+        if it.clicked:
+            clicked = true
+            g_snack_until = tnow
+    Rect cr = Rect((right(r) - 44.0, y + 4.0, 40.0, 40.0))
+    u64 cid = id("snack#close")
+    Interact ci = interact(cid, cr, true, false)
+    state_layer(cid, cr, 20.0, t.inverse_on_surface, ci)
+    icon_in(cr, "close", 24.0, alpha(t.inverse_on_surface, k))
+    if ci.clicked:
+        g_snack_until = tnow
+    _ = set_layer(old)
+    return clicked
+
+// ── Progress ───────────────────────────────────────────────────────────────
+
+// A 4 dp linear progress bar. `value` < 0 is indeterminate. M3's current
+// style: the track and the indicator are separated by a 4 dp gap, with a
+// stop dot at the end of a determinate track.
+void progress_linear(Rect r, f32 value):
+    ^Scheme t = theme()
+    f32 h = 4.0
+    Rect b = Rect((r.x, cy(r) - h * 0.5, r.w, h))
+    if value >= 0.0:
+        f32 v = clampf(value, 0.0, 1.0)
+        f32 iw = b.w * v
+        f32 gap = 4.0 if v > 0.0 && v < 1.0 else 0.0
+        if iw > 0.0:
+            fill_rrect(Rect((b.x, b.y, iw, h)), 2.0, t.primary)
+        if iw + gap < b.w:
+            fill_rrect(Rect((b.x + iw + gap, b.y, b.w - iw - gap, h)), 2.0, t.secondary_container)
+            fill_circle(right(b) - 2.0, cy(b), 2.0, t.primary)
+        return
+    animating()
+    f32 period = 1.8
+    f32 ph = f32(now() / f64(period) - f64(i64(now() / f64(period))))
+    // two segments chasing each other, eased
+    f32 h1 = ease_standard(clampf(ph / 0.75, 0.0, 1.0))
+    f32 t1 = ease_standard(clampf((ph - 0.2) / 0.75, 0.0, 1.0))
+    f32 a0 = b.x + b.w * t1
+    f32 a1 = b.x + b.w * h1
+    fill_rrect(b, 2.0, t.secondary_container)
+    if a1 - a0 > 0.5:
+        fill_rrect(Rect((a0, b.y, a1 - a0, h)), 2.0, t.primary)
+
+// A circular progress indicator of diameter `size` (48 dp default track 4 dp).
+// `value` < 0 is indeterminate (a spinning, breathing arc).
+void progress_circular(f32 cxd, f32 cyd, f32 size, f32 value, f32 width = 4.0):
+    ^Scheme t = theme()
+    f32 r = size * 0.5 - width * 0.5
+    f32 top = 0.0 - PI * 0.5
+    if value >= 0.0:
+        f32 v = clampf(value, 0.0, 1.0)
+        f32 gap = 0.30 * 4.0 / r
+        if v > 0.0:
+            stroke_arc(cxd, cyd, r, top, top + 2.0 * PI * v, width, t.primary)
+        if v < 1.0:
+            f32 s0 = top + 2.0 * PI * v + (gap + width / r if v > 0.0 else 0.0)
+            f32 s1 = top + 2.0 * PI - (gap + width / r if v > 0.0 else 0.0)
+            if s1 > s0:
+                stroke_arc(cxd, cyd, r, s0, s1, width, t.secondary_container)
+        return
+    animating()
+    f64 tt = now()
+    f32 rot = f32(tt * 4.0 - f64(i64(tt * 4.0 / 6.2831853)) * 6.2831853)
+    f32 ph = f32(tt / 1.333 - f64(i64(tt / 1.333)))
+    f32 grow = ease_standard(ph * 2.0) if ph < 0.5 else 1.0 - ease_standard((ph - 0.5) * 2.0)
+    f32 span = 0.45 + grow * 3.9
+    f32 s = rot + ph * 3.0
+    stroke_arc(cxd, cyd, r, s, s + span, width, t.primary)
+
+// ── Dialog ─────────────────────────────────────────────────────────────────
+
+private u64 g_dialog_open
+private f64 g_dialog_t0
+private i32 g_dialog_prev_layer
+private u64 g_dialog_prev_focus
+
+// Open the dialog `key`. Keyboard focus leaves the page (so a focused field
+// under the scrim cannot take keys) and comes back when it closes.
+void dialog_open(string8 key):
+    if g_dialog_open == 0:
+        g_dialog_prev_focus = focus_id()
+    g_dialog_open = gid(key)
+    g_dialog_t0 = now()
+    clear_focus()
+    request_frame()
+
+void dialog_close():
+    g_dialog_open = 0
+    if g_dialog_prev_focus != 0:
+        set_focus(g_dialog_prev_focus)
+        g_dialog_prev_focus = 0
+    request_frame()
+
+bool dialog_is_open(string8 key):
+    return g_dialog_open == gid(key)
+
+bool any_dialog_open():
+    return g_dialog_open != 0
+
+// Begin a basic dialog: scrim, a surface-container-high card (28 dp corners),
+// an optional hero icon and the headline. Answers the body rectangle (where
+// the caller puts the supporting text and content) and false if the dialog
+// is not open. Esc and a click on the scrim close it. Always pair with
+// dialog_end when it answers true; put the actions with dialog_actions.
+(Rect, bool) dialog_begin(string8 key, string8 title, f32 width, f32 body_h, string8 icon_name = ""):
+    if g_dialog_open != gid(key):
+        return (Rect((0.0, 0.0, 0.0, 0.0)), false)
+    ^Scheme t = theme()
+    g_dialog_prev_layer = set_layer(LAYER_MODAL)
+    f32 k = clampf(f32((now() - g_dialog_t0) / 0.25), 0.0, 1.0)
+    if k < 1.0:
+        animating()
+    f32 e = ease_emphasized_decel(k)
+    Rect vp = viewport()
+    fill_rect(vp, alpha(t.scrim, 0.32 * e))
+    block(vp)
+    f32 head = 24.0
+    if #len(icon_name) > 0:
+        head = head + 24.0 + 16.0
+    head = head + text_wrap(Rect((0.0, 0.0, width - 48.0, 1000.0)), HEADLINE_SMALL, title, t.on_surface, true) + 16.0
+    f32 h = head + body_h + 24.0 + 40.0 + 24.0
+    f32 x = (vp.w - width) * 0.5
+    f32 y = (vp.h - h) * 0.5 + (1.0 - e) * 24.0
+    Rect card = Rect((x, y, width, h))
+    // a click outside the card closes it (but not the frame it opened)
+    if mouse_pressed(0) && !contains(card, mouse_x(), mouse_y()) && now() - g_dialog_t0 > 0.05:
+        dialog_close()
+    if take_key(KEY_ESCAPE):
+        dialog_close()
+    shadow(card, 28.0, 3, e)
+    fill_rrect(card, 28.0, alpha(t.surface_container_high, e))
+    f32 cy0 = y + 24.0
+    if #len(icon_name) > 0:
+        icon(icon_name, x + (width - 24.0) * 0.5, cy0, 24.0, t.secondary)
+        cy0 = cy0 + 24.0 + 16.0
+        // centred headline under a hero icon
+        f32 tw = text_width(HEADLINE_SMALL, title)
+        _ = text(HEADLINE_SMALL, x + (width - tw) * 0.5, cy0, title, t.on_surface)
+        cy0 = cy0 + HEADLINE_SMALL.line + 16.0
+    else:
+        cy0 = cy0 + text_wrap(Rect((x + 24.0, cy0, width - 48.0, 1000.0)), HEADLINE_SMALL, title, t.on_surface) + 16.0
+    push_id(id(key))
+    return (Rect((x + 24.0, cy0, width - 48.0, body_h)), true)
+
+// The action row at the bottom right of the open dialog; answers the
+// rectangle (40 dp tall) to lay buttons into from the right.
+Rect dialog_actions(Rect body):
+    return Rect((body.x, bottom(body) + 24.0, body.w, 40.0))
+
+void dialog_end():
+    pop_id()
+    _ = set_layer(g_dialog_prev_layer)

@@ -1,0 +1,607 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The data table: sticky header, frozen first column, row hover and
+// selection, sortable columns, virtual scrolling (only the visible rows are
+// asked for and drawn, so 1000 rows cost what 20 do), keyboard cell cursor,
+// inline editing (text, numeric, choice) and per-cell error / warning / info
+// decoration with a tooltip giving the reason.
+//
+// The table holds no data. Each frame it asks the app, through three
+// functions, for the text of a visible cell, its decoration level and its
+// message; edits come back as a TableEvent the app validates and applies.
+package btui
+
+const i32 COL_TEXT = 0
+const i32 COL_NUM = 1
+const i32 COL_CHOICE = 2
+const i32 COL_STATUS = 3
+const i32 COL_INDEX = 4
+// a yes/no cell: text "1" is on; click or Space toggles (TEV_TOGGLE)
+const i32 COL_CHECK = 5
+// the app's own editor (a picker dialog): Enter, Space, a double-click or a
+// click on the current cell emits TEV_CUSTOM
+const i32 COL_CUSTOM = 6
+
+const i32 DECO_NONE = 0
+const i32 DECO_INFO = 1
+const i32 DECO_WARNING = 2
+const i32 DECO_ERROR = 3
+const i32 DECO_CHANGED = 4
+const i32 DECO_DIM = 5
+// For COL_STATUS cells the decoration is the chip's tone + 16.
+const i32 DECO_TONE = 16
+
+type Column:
+    string8 title
+    f32 width
+    i32 kind
+    bool sortable
+    bool editable
+    []string8 choices
+
+Column column(string8 title, f32 width, i32 kind = 0, bool editable = true, bool sortable = true):
+    Column c
+    c.title = title
+    c.width = width
+    c.kind = kind
+    c.editable = editable
+    c.sortable = sortable
+    return c
+
+type CellTextFn: string8(i32, i32)
+type CellDecoFn: i32(i32, i32)
+type CellMsgFn: string8(i32, i32)
+
+type TableState:
+    Scroll scroll
+    i32 cur_row
+    i32 cur_col
+    i32 anchor_row
+    ref []bool sel
+    i32 sort_col
+    bool sort_desc
+    bool editing
+    i32 edit_row
+    i32 edit_col
+    Field edit
+    i32 hover_row
+    bool menu_for_edit
+    i32 frozen
+    i32 edit_choice
+    bool footer
+
+TableState table_state():
+    TableState s
+    s.sort_col = -1
+    s.cur_col = 1
+    s.frozen = 1
+    return s
+
+const i32 TEV_NONE = 0
+const i32 TEV_COMMIT = 1
+const i32 TEV_CHOICE = 2
+const i32 TEV_SORT = 3
+const i32 TEV_CLEAR = 4
+const i32 TEV_SELECT = 5
+const i32 TEV_TOGGLE = 6
+const i32 TEV_CUSTOM = 7
+
+type TableEvent: (i32 kind, i32 row, i32 col, string8 text, i32 choice)
+
+const f32 ROW_H = 44.0
+const f32 HEAD_H = 48.0
+const f32 FOOT_H = 40.0
+
+bool table_row_selected(^TableState s, i32 row):
+    return row >= 0 && row < i32(#len(s.sel)) && s.sel[row]
+
+i32 table_selected_count(^TableState s):
+    i32 n = 0
+    for i in 0..<#len(s.sel):
+        if s.sel[i]:
+            n += 1
+    return n
+
+private void sel_size(^TableState s, i32 n):
+    if i32(#len(s.sel)) != n:
+        using keep():
+            if s.sel == nil:
+                s.sel = #make([]bool, 0)
+            i64 old = #len(s.sel)
+            s.sel = #resize(s.sel, i64(n))
+            for i in old..<i64(n):
+                s.sel[i] = false
+
+private void sel_only(^TableState s, i32 row):
+    for i in 0..<#len(s.sel):
+        s.sel[i] = false
+    if row >= 0 && row < i32(#len(s.sel)):
+        s.sel[row] = true
+
+private void sel_range(^TableState s, i32 a, i32 b):
+    for i in 0..<#len(s.sel):
+        s.sel[i] = false
+    i32 lo = mini(a, b)
+    i32 hi = maxi(a, b)
+    for i in lo..=hi:
+        if i >= 0 && i < i32(#len(s.sel)):
+            s.sel[i] = true
+
+private bool col_editable(Column c):
+    return c.editable && c.kind != COL_INDEX && c.kind != COL_STATUS
+
+private void begin_edit(^TableState s, []Column cols, i32 row, i32 col, string8 initial, bool select_all, Rect cell):
+    s.editing = true
+    s.edit_row = row
+    s.edit_col = col
+    field_set(&s.edit, initial)
+    if select_all:
+        field_select_all(&s.edit)
+    s.edit.blink_t0 = now()
+    if cols[col].kind == COL_CHOICE:
+        i32 cur = -1
+        for i in 0..<#len(cols[col].choices):
+            if cols[col].choices[i] == initial:
+                cur = i32(i)
+        s.edit_choice = cur
+        menu_open("table#choice", cell, cur if cur >= 0 else 0)
+    request_frame()
+
+// Draw and run the table in `r`. Answers this frame's event (an edit to
+// commit, a sort request, a clear) or TEV_NONE.
+TableEvent table(string8 key, Rect r, []Column cols, i32 nrows, ^TableState s, CellTextFn cell_text, CellDecoFn cell_deco, CellMsgFn cell_msg):
+    ^Scheme t = theme()
+    TableEvent ev = TableEvent((TEV_NONE, -1, -1, "", -1))
+    i32 nc = i32(#len(cols))
+    if nc == 0:
+        return ev
+    sel_size(s, nrows)
+    s.cur_row = clampi(s.cur_row, 0, maxi(0, nrows - 1))
+    s.cur_col = clampi(s.cur_col, 0, nc - 1)
+    u64 uid = id(key)
+    push_id(uid)
+    // geometry: the first `s.frozen` columns stay put; the rest scroll
+    // horizontally under them
+    i32 nf = clampi(s.frozen, 0, nc - 1)
+    f32 frozen = 0.0
+    for i in 0..<nf:
+        frozen = frozen + cols[i].width
+    f32 total = 0.0
+    for i in 0..<nc:
+        total = total + cols[i].width
+    // the last column stretches to fill
+    f32 extra = maxf(0.0, r.w - total)
+    f32 foot_h = FOOT_H if s.footer else 0.0
+    Rect body = Rect((r.x, r.y + HEAD_H, r.w, r.h - HEAD_H - foot_h))
+    f32 content_h = f32(nrows) * ROW_H
+    bool moved = scroll_update(body, &s.scroll, content_h, total)
+    _ = moved
+    f32 sy = s.scroll.y
+    f32 sx = s.scroll.x
+    // focus and the whole-table interaction (rows are hit-tested below)
+    register_focus(uid)
+    bool focused = has_focus(uid)
+    bool over = hovering(body)
+    // container
+    fill_rrect(r, 12.0, t.surface_container_lowest if !is_dark() else t.surface_container_low)
+    // ── keyboard: every press this frame, in order ──
+    if focused && !s.editing && nrows > 0:
+        i32 page = maxi(1, i32(body.h / ROW_H) - 1)
+        for ki in 0..<key_count():
+            KeyEv k = key_at(ki)
+            if k.taken || s.editing:
+                continue
+            bool shift = (k.mods & MOD_SHIFT) != 0
+            bool cmdk = is_cmd(k.mods)
+            i32 old_row = s.cur_row
+            bool nav = true
+            if k.key == KEY_DOWN:
+                s.cur_row = mini(nrows - 1, s.cur_row + 1)
+            else if k.key == KEY_UP:
+                s.cur_row = maxi(0, s.cur_row - 1)
+            else if k.key == KEY_PAGE_DOWN:
+                s.cur_row = mini(nrows - 1, s.cur_row + page)
+            else if k.key == KEY_PAGE_UP:
+                s.cur_row = maxi(0, s.cur_row - page)
+            else if k.key == KEY_HOME && cmdk:
+                s.cur_row = 0
+            else if k.key == KEY_END && cmdk:
+                s.cur_row = nrows - 1
+            else if k.key == KEY_RIGHT:
+                s.cur_col = mini(nc - 1, s.cur_col + 1)
+            else if k.key == KEY_LEFT:
+                s.cur_col = maxi(0, s.cur_col - 1)
+            else if k.key == KEY_HOME:
+                s.cur_col = 0
+            else if k.key == KEY_END:
+                s.cur_col = nc - 1
+            else:
+                nav = false
+            if nav:
+                take_key_at(ki)
+                show_focus_ring()
+                if shift && s.cur_row != old_row:
+                    sel_range(s, s.anchor_row, s.cur_row)
+                else if s.cur_row != old_row:
+                    sel_only(s, s.cur_row)
+                    s.anchor_row = s.cur_row
+                scroll_to_show(&s.scroll, f32(s.cur_row) * ROW_H, f32(s.cur_row + 1) * ROW_H, body.h)
+                ensure_col_visible(s, cols, body.w)
+                continue
+            if k.key == KEY_A && cmdk:
+                take_key_at(ki)
+                for i in 0..<#len(s.sel):
+                    s.sel[i] = true
+                ev = TableEvent((TEV_SELECT, -1, -1, "", -1))
+                continue
+            Column cc = cols[s.cur_col]
+            if !col_editable(cc) || cmdk:
+                continue
+            Rect cell = cell_rect(r, cols, s, s.cur_row, s.cur_col, extra)
+            if cc.kind == COL_CHECK && (k.key == KEY_SPACE || k.key == KEY_ENTER):
+                take_key_at(ki)
+                ev = TableEvent((TEV_TOGGLE, s.cur_row, s.cur_col, "", -1))
+                continue
+            if cc.kind == COL_CUSTOM && (k.key == KEY_SPACE || k.key == KEY_ENTER || k.key == KEY_F2):
+                take_key_at(ki)
+                ev = TableEvent((TEV_CUSTOM, s.cur_row, s.cur_col, "", -1))
+                continue
+            if k.key == KEY_ENTER || k.key == KEY_F2 || k.key == KEY_KP_ENTER || (cc.kind == COL_CHOICE && k.key == KEY_SPACE):
+                take_key_at(ki)
+                begin_edit(s, cols, s.cur_row, s.cur_col, cell_text(s.cur_row, s.cur_col), false, cell)
+            else if k.key == KEY_DELETE || k.key == KEY_BACKSPACE:
+                take_key_at(ki)
+                ev = TableEvent((TEV_CLEAR, s.cur_row, s.cur_col, "", -1))
+        // typing replaces the value, spreadsheet style
+        if !s.editing && text_count() > 0:
+            Column cc = cols[s.cur_col]
+            if col_editable(cc) && cc.kind != COL_CHOICE && cc.kind != COL_CHECK && cc.kind != COL_CUSTOM:
+                begin_edit(s, cols, s.cur_row, s.cur_col, "", false, cell_rect(r, cols, s, s.cur_row, s.cur_col, extra))
+    // ── header (sticky) ──
+    Rect head = Rect((r.x, r.y, r.w, HEAD_H))
+    fill_rrect4(head, Radii((12.0, 12.0, 0.0, 0.0)), t.surface_container if !is_dark() else t.surface_container_high)
+    f32 hx = r.x
+    for c in 0..<nc:
+        f32 cw = cols[c].width + (extra if c == nc - 1 else 0.0)
+        f32 x = hx if i32(c) < nf else hx - sx
+        Rect hr = Rect((x, r.y, cw, HEAD_H))
+        if i32(c) == nf:
+            push_clip(Rect((r.x + frozen, r.y, r.w - frozen, HEAD_H)))
+        u64 hid = idn("head", i64(c))
+        bool sortable = cols[c].sortable
+        Interact hi = interact(hid, hr, false, !sortable)
+        if hi.clicked && sortable:
+            if s.sort_col == i32(c):
+                s.sort_desc = !s.sort_desc
+            else:
+                s.sort_col = i32(c)
+                s.sort_desc = false
+            ev = TableEvent((TEV_SORT, -1, i32(c), "", -1))
+        if hi.hover:
+            fill_rect(hr, alpha(t.on_surface, HOVER_OPACITY))
+        bool sorted = s.sort_col == i32(c)
+        [4]u8 hc = t.on_surface if sorted else t.on_surface_variant
+        bool right_al = cols[c].kind == COL_NUM
+        f32 tw = text_width(TITLE_SMALL, cols[c].title)
+        f32 tx = hr.x + 16.0
+        if right_al:
+            tx = right(hr) - 16.0 - tw
+        if sorted || (hi.hover && sortable):
+            f32 ax = tx + tw + 4.0
+            if right_al:
+                ax = tx - 22.0
+            icon("arrow_downward" if s.sort_desc else "arrow_upward", ax, cy(hr) - 9.0, 18.0, hc if sorted else alpha(t.on_surface_variant, 0.6))
+        _ = text(TITLE_SMALL, tx, cy(hr) - 10.0, cols[c].title, hc)
+        hx = hx + cw
+    if nf < nc:
+        pop_clip()
+    hline(r.x, right(r), r.y + HEAD_H - 1.0, 1.0, t.outline_variant)
+    // ── body: only the visible rows ──
+    // Two passes so the scissor changes twice per frame, not twice per row
+    // (each change is a draw call): row backgrounds, dividers and the frozen
+    // column first, then every scrolled cell under one clip.
+    i32 first = clampi(i32(sy / ROW_H), 0, maxi(0, nrows - 1))
+    i32 last = clampi(i32((sy + body.h) / ROW_H) + 1, 0, nrows)
+    push_clip(body)
+    s.hover_row = -1
+    for row in first..<last:
+        f32 ry = body.y + f32(row) * ROW_H - sy
+        Rect rr = Rect((r.x, ry, r.w, ROW_H))
+        if table_row_selected(s, i32(row)):
+            fill_rect(rr, t.secondary_container)
+        if over && hovering(rr):
+            s.hover_row = i32(row)
+            fill_rect(rr, alpha(t.on_surface, HOVER_OPACITY))
+        hline(r.x, right(r), ry + ROW_H - 1.0, 1.0, alpha(t.outline_variant, 0.7))
+        f32 fx = r.x
+        for c in 0..<nf:
+            Rect cr = Rect((fx, ry, cols[c].width, ROW_H))
+            draw_cell(cols[c], cr, i32(row), i32(c), s, focused, cell_text, cell_deco, cell_msg)
+            TableEvent e0 = cell_mouse(uid, cols, s, i32(row), i32(c), cr, body, cell_text)
+            if e0.kind != TEV_NONE:
+                ev = e0
+            fx = fx + cols[c].width
+    push_clip(Rect((r.x + frozen, body.y, body.w - frozen, body.h)))
+    for row in first..<last:
+        f32 ry = body.y + f32(row) * ROW_H - sy
+        f32 x = r.x - sx + frozen
+        for c in nf..<nc:
+            f32 cw = cols[c].width + (extra if c == nc - 1 else 0.0)
+            Rect cr = Rect((x, ry, cw, ROW_H))
+            if right(cr) > r.x + frozen && cr.x < right(r):
+                draw_cell(cols[c], cr, i32(row), i32(c), s, focused, cell_text, cell_deco, cell_msg)
+                TableEvent e1 = cell_mouse(uid, cols, s, i32(row), i32(c), cr, body, cell_text)
+                if e1.kind != TEV_NONE:
+                    ev = e1
+            x = x + cw
+    pop_clip()
+    // the frozen column's edge, when scrolled sideways
+    if sx > 0.5:
+        vline(r.x + frozen - 1.0, body.y, bottom(body), 1.0, t.outline_variant)
+    pop_clip()
+    // ── the inline editor ──
+    if s.editing:
+        TableEvent e2 = run_editor(r, cols, s, extra, body)
+        if e2.kind != TEV_NONE:
+            ev = e2
+    if nrows == 0:
+        text_in(body, BODY_MEDIUM, "No channels", t.on_surface_variant, ALIGN_CENTER)
+    scrollbar(#format(key, "#v"), body, &s.scroll)
+    if s.footer:
+        draw_footer(Rect((r.x, bottom(body), r.w, foot_h)), cols, nrows, s, focused, cell_deco, cell_msg)
+    scrollbar_h(#format(key, "#h"), Rect((r.x + frozen, body.y, body.w - frozen, body.h)), &s.scroll, frozen)
+    // the container's outline over everything
+    stroke_rrect(r, 12.0, 1.0, t.outline_variant)
+    pop_id()
+    return ev
+
+// The status line under the rows (TableState.footer): the reason for the
+// cursor cell's error or warning, so it is reachable from the keyboard and
+// not only by hovering; otherwise the cursor's position.
+private void draw_footer(Rect f, []Column cols, i32 nrows, ^TableState s, bool focused, CellDecoFn cell_deco, CellMsgFn cell_msg):
+    ^Scheme t = theme()
+    fill_rrect4(f, Radii((0.0, 0.0, 12.0, 12.0)), t.surface_container_low)
+    hline(f.x, right(f), f.y, 1.0, t.outline_variant)
+    Rect ib = inset4(f, 16.0, 0.0, 16.0, 0.0)
+    if nrows == 0:
+        return
+    i32 row = s.cur_row
+    i32 col = s.cur_col
+    i32 d = cell_deco(row, col)
+    string8 where = #format("Row ", row + 1, " · ", cols[col].title)
+    if d == DECO_ERROR || d == DECO_WARNING:
+        [4]u8 ic = t.error if d == DECO_ERROR else t.warning
+        icon("error" if d == DECO_ERROR else "warning", ib.x, cy(f) - 9.0, 18.0, ic, true)
+        f32 x = text(LABEL_LARGE, ib.x + 26.0, cy(f) - 10.0, where, t.on_surface)
+        text_in(Rect((x + 12.0, f.y, right(ib) - x - 12.0, f.h)), BODY_MEDIUM, cell_msg(row, col), t.on_surface_variant)
+        return
+    if focused:
+        _ = text(BODY_MEDIUM, ib.x, cy(f) - 10.0, #format(where, "  ·  Enter to edit, arrows to move"), t.on_surface_variant)
+    else:
+        _ = text(BODY_MEDIUM, ib.x, cy(f) - 10.0, #format(nrows, " rows"), t.on_surface_variant)
+
+// A press on a cell: focus the table, move the cursor, select, and start an
+// edit on a double-click (or a click on the current choice cell).
+private TableEvent cell_mouse(u64 uid, []Column cols, ^TableState s, i32 row, i32 c, Rect cr, Rect body, CellTextFn cell_text):
+    TableEvent ev = TableEvent((TEV_NONE, -1, -1, "", -1))
+    u64 cid = idn("cell", i64(row) * 64 + i64(c))
+    Interact ci = interact(cid, intersect(cr, body), false, false)
+    if !ci.pressed:
+        return ev
+    set_focus(uid)
+    if s.editing && !(s.edit_row == row && s.edit_col == c):
+        ev = commit_edit(s, cols)
+    bool was_cur = s.cur_row == row && s.cur_col == c
+    if shift_down():
+        sel_range(s, s.anchor_row, row)
+    else if cmd_down():
+        s.sel[row] = !s.sel[row]
+        s.anchor_row = row
+    else:
+        sel_only(s, row)
+        s.anchor_row = row
+    s.cur_row = row
+    s.cur_col = c
+    if cols[c].kind == COL_CHECK && cols[c].editable && !shift_down() && !cmd_down():
+        return TableEvent((TEV_TOGGLE, row, c, "", -1))
+    if cols[c].kind == COL_CUSTOM && cols[c].editable && (click_count() >= 2 || was_cur):
+        return TableEvent((TEV_CUSTOM, row, c, "", -1))
+    if col_editable(cols[c]) && cols[c].kind != COL_CHECK && cols[c].kind != COL_CUSTOM && !s.editing:
+        if click_count() >= 2 || (cols[c].kind == COL_CHOICE && was_cur):
+            begin_edit(s, cols, row, c, cell_text(row, c), click_count() < 2, cr)
+    return ev
+
+private void ensure_col_visible(^TableState s, []Column cols, f32 view_w):
+    i32 nf = clampi(s.frozen, 0, i32(#len(cols)) - 1)
+    if s.cur_col < nf:
+        return
+    f32 frozen = 0.0
+    for i in 0..<nf:
+        frozen = frozen + cols[i].width
+    f32 x0 = 0.0
+    for i in nf..<s.cur_col:
+        x0 = x0 + cols[i].width
+    f32 x1 = x0 + cols[s.cur_col].width
+    f32 vis = view_w - frozen
+    if x0 < s.scroll.target_x:
+        s.scroll.target_x = x0
+    else if x1 > s.scroll.target_x + vis:
+        s.scroll.target_x = x1 - vis
+
+private Rect cell_rect(Rect r, []Column cols, ^TableState s, i32 row, i32 col, f32 extra):
+    f32 x = r.x
+    for i in 0..<col:
+        x = x + cols[i].width
+    if col >= s.frozen:
+        x = x - s.scroll.x
+    f32 w = cols[col].width + (extra if col == i32(#len(cols)) - 1 else 0.0)
+    f32 y = r.y + HEAD_H + f32(row) * ROW_H - s.scroll.y
+    return Rect((x, y, w, ROW_H))
+
+private void draw_cell(Column c, Rect cr, i32 row, i32 col, ^TableState s, bool focused, CellTextFn cell_text, CellDecoFn cell_deco, CellMsgFn cell_msg):
+    ^Scheme t = theme()
+    i32 deco = cell_deco(row, col)
+    bool editing_here = s.editing && s.edit_row == row && s.edit_col == col
+    string8 txt = cell_text(row, col)
+    Rect inner = inset4(cr, 16.0, 0.0, 16.0, 0.0)
+    [4]u8 tc = t.on_surface
+    Style st = BODY_MEDIUM
+    if c.kind == COL_NUM || c.kind == COL_INDEX:
+        st = tabular(BODY_MEDIUM)
+    if c.kind == COL_INDEX:
+        tc = t.on_surface_variant
+    if deco == DECO_ERROR:
+        fill_rect(inset(cr, 1.0), alpha(t.error_container, 0.6 if is_dark() else 0.85))
+        tc = t.on_error_container
+    else if deco == DECO_WARNING:
+        fill_rect(inset(cr, 1.0), alpha(t.warning_container, 0.6 if is_dark() else 0.85))
+        tc = t.on_warning_container
+    else if deco == DECO_DIM:
+        tc = alpha(t.on_surface_variant, 0.6)
+    else if deco == DECO_CHANGED:
+        fill_rrect(Rect((cr.x + 4.0, cr.y + 10.0, 4.0, cr.h - 20.0)), 2.0, t.tertiary)
+    if c.kind == COL_STATUS:
+        if #len(txt) > 0:
+            i32 tone = deco - DECO_TONE if deco >= DECO_TONE else TONE_NEUTRAL
+            string8 ic = ""
+            if tone == TONE_INFO:
+                ic = "info"
+            else if tone == TONE_WARNING:
+                ic = "warning"
+            else if tone == TONE_ERROR:
+                ic = "error"
+            else if tone == TONE_SUCCESS:
+                ic = "check_circle"
+            _ = status_chip(inner.x - 4.0, cy(cr) - 12.0, txt, tone, ic, true)
+            // a chip's longer text (e.g. the full licence), on hover
+            if hovering(cr):
+                string8 more = cell_msg(row, col)
+                if #len(more) > 0:
+                    tooltip(idn("tip", i64(row) * 64 + i64(col)), cr, more, true)
+        return
+    if editing_here && c.kind != COL_CHOICE:
+        return
+    if c.kind == COL_CHECK:
+        if #len(txt) > 0:
+            bool on = txt == "1"
+            [4]u8 cc2 = t.primary if on else t.on_surface_variant
+            if deco == DECO_DIM:
+                cc2 = alpha(t.on_surface_variant, 0.5)
+            icon("check_box" if on else "check_box_outline_blank", inner.x - 2.0, cy(cr) - 10.0, 20.0, cc2, on)
+        if focused && s.cur_row == row && s.cur_col == col && !s.editing:
+            stroke_rrect(inset(cr, 1.0), 4.0, 2.0, t.primary)
+        return
+    // decoration icon at the cell's end
+    f32 iw = 0.0
+    if deco == DECO_ERROR || deco == DECO_WARNING:
+        iw = 22.0
+        string8 ic = "error" if deco == DECO_ERROR else "warning"
+        [4]u8 icc = t.error if deco == DECO_ERROR else t.warning
+        f32 ix = right(cr) - 12.0 - 18.0
+        icon(ic, ix, cy(cr) - 9.0, 18.0, icc, true)
+        // the reason, on hover
+        u64 tid = idn("tip", i64(row) * 64 + i64(col))
+        bool hv = hovering(cr)
+        tooltip(tid, cr, cell_msg(row, col), hv)
+    bool row_hot = s.hover_row == row || (focused && s.cur_row == row)
+    if (c.kind == COL_CHOICE || c.kind == COL_CUSTOM) && row_hot && c.editable:
+        iw = iw + 20.0
+        icon("arrow_drop_down", right(cr) - 12.0 - 20.0 - (22.0 if deco == DECO_ERROR || deco == DECO_WARNING else 0.0), cy(cr) - 10.0, 20.0, alpha(t.on_surface_variant, 0.7))
+    i32 al = ALIGN_END if c.kind == COL_NUM else ALIGN_START
+    text_in(Rect((inner.x, cr.y, inner.w - iw, cr.h)), st, txt, tc, al)
+    // the cell cursor
+    if focused && s.cur_row == row && s.cur_col == col && !s.editing:
+        stroke_rrect(inset(cr, 1.0), 4.0, 2.0, t.primary)
+
+private TableEvent commit_edit(^TableState s, []Column cols):
+    TableEvent ev = TableEvent((TEV_NONE, -1, -1, "", -1))
+    if !s.editing:
+        return ev
+    s.editing = false
+    if cols[s.edit_col].kind == COL_CHOICE:
+        menu_close()
+        return ev
+    string8 txt = #format(field_text(&s.edit))
+    return TableEvent((TEV_COMMIT, s.edit_row, s.edit_col, txt, -1))
+
+private TableEvent run_editor(Rect r, []Column cols, ^TableState s, f32 extra, Rect body):
+    ^Scheme t = theme()
+    TableEvent ev = TableEvent((TEV_NONE, -1, -1, "", -1))
+    Column c = cols[s.edit_col]
+    Rect cr = cell_rect(r, cols, s, s.edit_row, s.edit_col, extra)
+    if c.kind == COL_CHOICE:
+        if !menu_is_open("table#choice"):
+            menu_open("table#choice", cr, 0)
+        i32 ch = menu("table#choice", c.choices, s.edit_choice, cr.w, nil, true)
+        // the cell being chosen for keeps its outline
+        stroke_rrect(inset(cr, 1.0), 4.0, 2.0, t.primary)
+        if ch >= 0:
+            ev = TableEvent((TEV_CHOICE, s.edit_row, s.edit_col, c.choices[ch], ch))
+            s.editing = false
+        else if !menu_is_open("table#choice"):
+            s.editing = false
+        return ev
+    // a text editor drawn over the cell
+    Rect er = intersect(inset(cr, 1.0), body)
+    fill_rect(er, t.surface_container_highest)
+    stroke_rrect(inset(cr, 1.0), 4.0, 2.0, t.primary)
+    bool(i32) acc = nil
+    Style st = BODY_MEDIUM
+    if c.kind == COL_NUM:
+        acc = accept_number
+        st = tabular(BODY_MEDIUM)
+    bool commit = false
+    i32 move = 0
+    if take_key(KEY_ESCAPE):
+        s.editing = false
+        return ev
+    if take_key(KEY_ENTER) || take_key(KEY_KP_ENTER):
+        commit = true
+        move = 1
+    else if take_key(KEY_TAB):
+        commit = true
+        move = 2
+    else if take_key(KEY_TAB, MOD_SHIFT):
+        commit = true
+        move = 3
+    _ = field_keys(&s.edit, acc)
+    string8 txt = field_text(&s.edit)
+    Rect inner = inset4(cr, 16.0, 0.0, 16.0, 0.0)
+    push_clip(er)
+    f32 w = text_width(st, txt)
+    f32 x0 = inner.x
+    if c.kind == COL_NUM:
+        x0 = right(inner) - w
+    f32 top = cy(cr) - st.line * 0.5
+    if field_has_selection(&s.edit):
+        (i64 a, i64 b) = field_selection(&s.edit)
+        f32 sa = text_x_at(st, txt, a)
+        f32 sb = text_x_at(st, txt, b)
+        fill_rect(Rect((x0 + sa, top, sb - sa, st.line)), alpha(t.primary, 0.28))
+    _ = text(st, x0, top, txt, t.on_surface)
+    f64 ph = now() - s.edit.blink_t0
+    animating()
+    if ph < 0.5 || (i64(ph * 2.0) % 2) == 0:
+        f32 cxp = text_x_at(st, txt, s.edit.caret)
+        fill_rect(Rect((x0 + cxp - 1.0, top + 1.0, 2.0, st.line - 2.0)), t.primary)
+    pop_clip()
+    if commit:
+        ev = commit_edit(s, cols)
+        i32 nc = i32(#len(cols))
+        if move == 1:
+            s.cur_row = s.cur_row + 1
+        else if move == 2:
+            s.cur_col = s.cur_col + 1
+            if s.cur_col >= nc:
+                s.cur_col = 1
+                s.cur_row = s.cur_row + 1
+        else if move == 3:
+            s.cur_col = s.cur_col - 1
+            if s.cur_col < 1:
+                s.cur_col = nc - 1
+                s.cur_row = maxi(0, s.cur_row - 1)
+        sel_only(s, s.cur_row)
+        s.anchor_row = s.cur_row
+        scroll_to_show(&s.scroll, f32(s.cur_row) * ROW_H, f32(s.cur_row + 1) * ROW_H, body.h)
+    return ev

@@ -1,0 +1,158 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The btui component gallery: every widget in both themes, and a mock
+// "Channels" screen, for the owner to judge the look and feel.
+//
+//   dado build gallery -o build/gallery && ./build/gallery
+//   options: --page channels|components|forms   --dark   --rows1000
+//            --dialog  --menu  --snackbar  --edit  --problems  --perf
+//   BTUI_SCALE=2 renders at 2x on a 1x screen (Retina check).
+package main
+
+import "core:fmt"
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings/parse"
+import btui "../ui"
+
+const i32 PAGE_CHANNELS = 0
+const i32 PAGE_COMPONENTS = 1
+const i32 PAGE_FORMS = 2
+
+i32 g_page
+bool g_perf
+bool g_want_dialog
+bool g_want_menu
+bool g_want_snack
+bool g_want_edit
+bool g_theme_forced
+bool g_autoscroll
+bool g_want_cursor_error
+f32 g_start_scroll
+i32 g_startup_frames
+
+private void init():
+    if !btui.load_assets():
+        fmt.println("gallery: assets missing (run from the project root, or set BEAUTALKS_ASSETS)")
+    string8 data = "data"
+    if !fs.is_dir("data/channels"):
+        data = path.join(btui.exe_dir(), "../data")
+    if !g_theme_forced:
+        btui.follow_system_theme()
+    load_channels(data)
+    channels_init()
+    forms_init()
+
+private void frame():
+    ^btui.Scheme t = btui.theme()
+    btui.Rect vp = btui.viewport()
+    btui.fill_rect(vp, t.surface)
+    // navigation rail
+    btui.Rect area = vp
+    btui.Rect rail = btui.cut_left(&area, 80.0)
+    btui.fill_rect(rail, t.surface_container_low if g_page == PAGE_CHANNELS else t.surface)
+    _ = btui.image("appicon", rail.x + 20.0, 16.0, 40.0)
+    f32 y = 88.0
+    if btui.rail_item("cell_tower", "Channels", rail.x, y, g_page == PAGE_CHANNELS, "1", true):
+        g_page = PAGE_CHANNELS
+    y = y + 72.0
+    if btui.rail_item("widgets", "Components", rail.x, y, g_page == PAGE_COMPONENTS):
+        g_page = PAGE_COMPONENTS
+    y = y + 72.0
+    if btui.rail_item("edit_note", "Forms", rail.x, y, g_page == PAGE_FORMS):
+        g_page = PAGE_FORMS
+    y = y + 72.0
+    _ = btui.rail_item("library_books", "Library", rail.x, y, false)
+    y = y + 72.0
+    _ = btui.rail_item("history", "Backups", rail.x, y, false)
+    // theme toggle at the bottom of the rail
+    if btui.icon_button("dark_mode" if !btui.is_dark() else "light_mode", btui.rect(rail.x + 16.0, vp.h - 64.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Switch to dark theme" if !btui.is_dark() else "Switch to light theme"):
+        btui.set_dark(!btui.is_dark())
+    if g_page == PAGE_CHANNELS:
+        channels_page(area)
+    else if g_page == PAGE_COMPONENTS:
+        components_page(area)
+    else:
+        forms_page(area)
+    // global shortcuts nobody took
+    if btui.take_key(btui.KEY_D, btui.MOD_CTRL):
+        btui.set_dark(!btui.is_dark())
+    if btui.snackbar(area):
+        btui.snackbar_show("Restored the previous channel list")
+    if g_perf:
+        btui.animating()
+        if btui.frames_built() % 120 == 0:
+            fmt.eprintln("perf: build avg ", btui.avg_build_ms(), " ms, last ", btui.last_build_ms(), " ms, quads ", btui.quads(), ", draw calls ", btui.gpu_draw_calls(), ", frame ", btui.frame_seconds() * 1000.0, " ms")
+        string8 p = #format("build ", f64(i64(btui.avg_build_ms() * 100.0)) / 100.0, " ms · ", btui.quads(), " quads")
+        btui.Rect pr = btui.rect(vp.w - 260.0, vp.h - 28.0, 252.0, 20.0)
+        btui.text_in(pr, btui.LABEL_SMALL, p, t.on_surface_variant, btui.ALIGN_END)
+    // scripted states for screenshots, once things have settled
+    g_startup_frames += 1
+    if g_startup_frames < 4:
+        btui.animating()
+    if g_startup_frames == 3:
+        startup_states()
+
+private void startup_states():
+    if g_start_scroll > 0.0:
+        g_comp_scroll.target = g_start_scroll
+        g_comp_scroll.y = g_start_scroll
+        g_table.scroll.target = g_start_scroll
+        g_table.scroll.y = g_start_scroll
+    if g_want_snack:
+        btui.snackbar_show("Backup saved: UV-5RM, 8 Nov 2026 14:02", "Undo", 0.0)
+    if g_want_dialog:
+        if g_page == PAGE_CHANNELS:
+            btui.dialog_open("write")
+        else:
+            btui.dialog_open("confirm")
+    if g_want_menu:
+        forms_open_menu()
+    if g_want_edit:
+        channels_start_edit()
+    if g_want_cursor_error:
+        channels_cursor_error()
+
+i32 main(i32 argc, ^rawptr argv):
+    []string8 args = os.args(argc, argv)
+    for i in 1..<#len(args):
+        string8 a = args[i]
+        if a == "--dark":
+            btui.set_dark(true)
+            g_theme_forced = true
+        else if a == "--light":
+            btui.set_dark(false)
+            g_theme_forced = true
+        else if a == "--autoscroll":
+            g_autoscroll = true
+        else if a == "--scroll" && i + 1 < #len(args):
+            f32 v = 0.0
+            try v = parse.to_f32(args[i + 1]) else:
+                v = 0.0
+            g_start_scroll = v
+        else if a == "--perf":
+            g_perf = true
+        else if a == "--rows1000":
+            g_show_all = true
+        else if a == "--dialog":
+            g_want_dialog = true
+        else if a == "--menu":
+            g_want_menu = true
+        else if a == "--snackbar":
+            g_want_snack = true
+        else if a == "--cursor-error":
+            g_want_cursor_error = true
+        else if a == "--edit":
+            g_want_edit = true
+        else if a == "--problems":
+            g_filter_problems = true
+        else if a == "--page" && i + 1 < #len(args):
+            string8 p = args[i + 1]
+            if p == "components":
+                g_page = PAGE_COMPONENTS
+            else if p == "forms":
+                g_page = PAGE_FORMS
+    btui.run(1440, 900, "beautalks — btui gallery", init, frame)
+    return 0

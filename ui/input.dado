@@ -1,0 +1,406 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Input: sokol_app events are queued as they arrive and handed to the UI at
+// the start of the next frame as this frame's input (mouse in dp, key
+// presses, typed text, wheel). Widgets consume key presses (`take_key`), so a
+// key the focused widget does not want reaches the window's own shortcuts.
+//
+// The command modifier is Cmd on macOS and Ctrl elsewhere (`cmd_down`).
+package btui
+
+import "core:strings"
+import "vendor:sokol/sokol_app"
+
+// Key codes (sokol_app's, which are GLFW's).
+const i32 KEY_SPACE = 32
+const i32 KEY_A = 65
+const i32 KEY_C = 67
+const i32 KEY_D = 68
+const i32 KEY_F = 70
+const i32 KEY_S = 83
+const i32 KEY_V = 86
+const i32 KEY_X = 88
+const i32 KEY_Y = 89
+const i32 KEY_Z = 90
+const i32 KEY_ESCAPE = 256
+const i32 KEY_ENTER = 257
+const i32 KEY_TAB = 258
+const i32 KEY_BACKSPACE = 259
+const i32 KEY_DELETE = 261
+const i32 KEY_RIGHT = 262
+const i32 KEY_LEFT = 263
+const i32 KEY_DOWN = 264
+const i32 KEY_UP = 265
+const i32 KEY_PAGE_UP = 266
+const i32 KEY_PAGE_DOWN = 267
+const i32 KEY_HOME = 268
+const i32 KEY_END = 269
+const i32 KEY_F2 = 291
+const i32 KEY_KP_ENTER = 335
+
+const u32 MOD_SHIFT = 0x1
+const u32 MOD_CTRL = 0x2
+const u32 MOD_ALT = 0x4
+const u32 MOD_SUPER = 0x8
+
+type KeyEv: (i32 key, u32 mods, bool repeat, bool taken)
+
+private const i32 QMAX = 128
+
+// Queued between frames.
+private [QMAX]KeyEv g_qkeys
+private i32 g_nqkeys
+private [QMAX]i32 g_qchars
+private i32 g_nqchars
+private f32 g_qwheel_x
+private f32 g_qwheel_y
+private bool g_qwheel_fine
+private [3]bool g_qpress
+private [3]bool g_qrelease
+private [3]bool g_qdown
+private f32 g_qmx = -1000.0
+private f32 g_qmy = -1000.0
+private bool g_qmoved
+private u32 g_qmods
+private bool g_qevents
+private bool g_qleft
+private bool g_qquit
+
+// This frame's.
+private [QMAX]KeyEv g_keys
+private i32 g_nkeys
+private [QMAX]i32 g_chars
+private i32 g_nchars
+private f32 g_wheel_x
+private f32 g_wheel_y
+private bool g_wheel_fine
+private [3]bool g_press
+private [3]bool g_release
+private [3]bool g_down
+private f32 g_mx = -1000.0
+private f32 g_my = -1000.0
+private f32 g_px_x
+private f32 g_px_y
+private u32 g_mods
+private i32 g_clicks
+private f64 g_last_click_t
+private f32 g_last_click_x
+private f32 g_last_click_y
+private bool g_mouse_in = true
+private bool g_moved
+
+bool has_events():
+    return g_qevents
+
+private void note():
+    g_qevents = true
+
+// sokol_app event -> queue (runs between frames, on the main thread).
+void decode_event(^const sokol_app.sapp_event ev):
+    sokol_app.sapp_event e = ev^
+    f32 s = scale()
+    if s <= 0.0:
+        s = 1.0
+    g_qmods = e.modifiers
+    switch e.type_:
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_KEY_DOWN:
+            push_key(i32(e.key_code), e.modifiers, e.key_repeat)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_CHAR:
+            push_char(i32(e.char_code), e.modifiers)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_DOWN:
+            push_mouse_button(i32(e.mouse_button), true, e.mouse_x / s, e.mouse_y / s)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_UP:
+            push_mouse_button(i32(e.mouse_button), false, e.mouse_x / s, e.mouse_y / s)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_MOVE:
+            push_mouse_move(e.mouse_x / s, e.mouse_y / s)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_SCROLL:
+            push_wheel(e.scroll_x, e.scroll_y)
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_LEAVE:
+            g_qleft = true
+            note()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_MOUSE_ENTER:
+            note()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_RESIZED:
+            note()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_FOCUSED:
+            note()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_UNFOCUSED:
+            for i in 0..<3:
+                g_qdown[i] = false
+            note()
+        case sokol_app.sapp_event_type.SAPP_EVENTTYPE_QUIT_REQUESTED:
+            g_qquit = true
+            note()
+        else:
+            return
+
+// ── Pushing input (the decoder above, and tests) ───────────────────────────
+
+void push_key(i32 key, u32 mods, bool repeat = false):
+    if g_nqkeys < QMAX:
+        g_qkeys[g_nqkeys] = KeyEv((key, mods, repeat, false))
+        g_nqkeys += 1
+    g_qmods = mods
+    note()
+
+void push_char(i32 cp, u32 mods = 0):
+    // Text typed with the command modifier is a shortcut, not text.
+    if (mods & (MOD_CTRL | MOD_SUPER)) != 0:
+        return
+    if cp < 32 || cp == 127:
+        return
+    if g_nqchars < QMAX:
+        g_qchars[g_nqchars] = cp
+        g_nqchars += 1
+    note()
+
+// Type a whole string (tests).
+void push_text(string8 s):
+    i64 i = 0
+    for i < #len(s):
+        (i32 cp, i32 n) = utf8_at(s, i)
+        push_char(cp, 0)
+        i += i64(n)
+
+void push_mouse_move(f32 x, f32 y):
+    g_qmx = x
+    g_qmy = y
+    g_qmoved = true
+    note()
+
+// button: 0 left, 1 right, 2 middle.
+void push_mouse_button(i32 button, bool down, f32 x, f32 y):
+    g_qmx = x
+    g_qmy = y
+    if button >= 0 && button < 3:
+        if down:
+            g_qpress[button] = true
+            g_qdown[button] = true
+        else:
+            g_qrelease[button] = true
+            g_qdown[button] = false
+    note()
+
+// A click (press and release) at (x, y) dp (tests).
+void push_click(f32 x, f32 y):
+    push_mouse_button(0, true, x, y)
+    push_mouse_button(0, false, x, y)
+
+// Wheel / trackpad: positive y scrolls content up (towards the start), as
+// sokol reports it. A fractional amount is a trackpad's precise scrolling.
+void push_wheel(f32 dx, f32 dy):
+    g_qwheel_x += dx
+    g_qwheel_y += dy
+    if dx != floorf(dx) || dy != floorf(dy):
+        g_qwheel_fine = true
+    note()
+
+// Move the queue into this frame's input. Called at the start of a frame.
+void input_begin_frame():
+    // A press that arrives together with a move to a new place waits one
+    // frame: hover is decided at the end of a frame, so the widget under the
+    // pointer must have seen it first (a fast click after a move would
+    // otherwise be lost).
+    bool buttons = g_qpress[0] || g_qpress[1] || g_qpress[2] || g_qrelease[0] || g_qrelease[1] || g_qrelease[2]
+    if buttons && (absf(g_qmx - g_mx) > 0.5 || absf(g_qmy - g_my) > 0.5):
+        g_moved = true
+        g_mx = g_qmx
+        g_my = g_qmy
+        g_qmoved = false
+        g_nkeys = 0
+        g_nchars = 0
+        g_wheel_x = 0.0
+        g_wheel_y = 0.0
+        for i in 0..<3:
+            g_press[i] = false
+            g_release[i] = false
+        g_qevents = true
+        return
+    for i in 0..<g_nqkeys:
+        g_keys[i] = g_qkeys[i]
+    g_nkeys = g_nqkeys
+    g_nqkeys = 0
+    for i in 0..<g_nqchars:
+        g_chars[i] = g_qchars[i]
+    g_nchars = g_nqchars
+    g_nqchars = 0
+    g_wheel_x = g_qwheel_x
+    g_wheel_y = g_qwheel_y
+    g_wheel_fine = g_qwheel_fine
+    g_qwheel_x = 0.0
+    g_qwheel_y = 0.0
+    g_qwheel_fine = false
+    for i in 0..<3:
+        g_press[i] = g_qpress[i]
+        g_release[i] = g_qrelease[i]
+        g_down[i] = g_qdown[i]
+        g_qpress[i] = false
+        g_qrelease[i] = false
+    g_moved = g_qmoved
+    g_qmoved = false
+    g_mx = g_qmx
+    g_my = g_qmy
+    if g_qleft && !g_qdown[0]:
+        g_mx = -1000.0
+        g_my = -1000.0
+        g_qmx = g_mx
+        g_qmy = g_my
+    g_qleft = false
+    g_mods = g_qmods
+    g_qevents = false
+    if g_press[0]:
+        f64 t = now()
+        if t - g_last_click_t < 0.45 && absf(g_mx - g_last_click_x) < 5.0 && absf(g_my - g_last_click_y) < 5.0:
+            g_clicks += 1
+        else:
+            g_clicks = 1
+        g_last_click_t = t
+        g_last_click_x = g_mx
+        g_last_click_y = g_my
+
+bool quit_requested():
+    bool q = g_qquit
+    g_qquit = false
+    return q
+
+// ── Reading this frame's input ─────────────────────────────────────────────
+
+f32 mouse_x():
+    return g_mx
+
+f32 mouse_y():
+    return g_my
+
+bool mouse_pressed(i32 button = 0):
+    return g_press[button]
+
+bool mouse_released(i32 button = 0):
+    return g_release[button]
+
+bool mouse_down(i32 button = 0):
+    return g_down[button] || (g_press[button] && !g_release[button])
+
+// 1 for a single click, 2 for a double click, 3 for a triple click.
+i32 click_count():
+    return g_clicks
+
+u32 mods():
+    return g_mods
+
+bool shift_down():
+    return (g_mods & MOD_SHIFT) != 0
+
+// Cmd on macOS, Ctrl elsewhere.
+bool cmd_down():
+    return is_cmd(g_mods)
+
+bool is_cmd(u32 m):
+    when #OS == #DARWIN:
+        return (m & MOD_SUPER) != 0
+    else:
+        return (m & MOD_CTRL) != 0
+
+// The label for the command modifier in menus and tooltips.
+string8 cmd_label():
+    when #OS == #DARWIN:
+        return "⌘"
+    else:
+        return "Ctrl+"
+
+// Wheel this frame in "lines" (sokol units); see push_wheel.
+f32 wheel_x():
+    return g_wheel_x
+
+f32 wheel_y():
+    return g_wheel_y
+
+bool wheel_fine():
+    return g_wheel_fine
+
+// Swallow the wheel (a scroll area that used it).
+void take_wheel():
+    g_wheel_x = 0.0
+    g_wheel_y = 0.0
+
+i32 key_count():
+    return g_nkeys
+
+KeyEv key_at(i32 i):
+    return g_keys[i]
+
+// Was `key` pressed this frame (and not yet taken)? Takes it. `want` are the
+// modifiers that must be down (shift/alt/command); others are ignored except
+// that the command modifier must match exactly.
+bool take_key(i32 key, u32 want = 0):
+    for i in 0..<g_nkeys:
+        KeyEv k = g_keys[i]
+        if k.taken || k.key != key:
+            continue
+        if !mods_match(k.mods, want):
+            continue
+        g_keys[i].taken = true
+        return true
+    return false
+
+// Take the i-th key press of this frame (the editing core walks them).
+void take_key_at(i32 i):
+    if i >= 0 && i < g_nkeys:
+        g_keys[i].taken = true
+
+// Did the pointer move this frame?
+bool mouse_moved():
+    return g_moved
+
+// Like take_key but leaves the press for others.
+bool peek_key(i32 key, u32 want = 0):
+    for i in 0..<g_nkeys:
+        KeyEv k = g_keys[i]
+        if !k.taken && k.key == key && mods_match(k.mods, want):
+            return true
+    return false
+
+// `want` uses MOD_CTRL to mean "the command modifier".
+private bool mods_match(u32 have, u32 want):
+    bool cmd_have = is_cmd(have)
+    bool cmd_want = (want & MOD_CTRL) != 0
+    if cmd_have != cmd_want:
+        return false
+    if ((have & MOD_SHIFT) != 0) != ((want & MOD_SHIFT) != 0):
+        return false
+    if ((have & MOD_ALT) != 0) != ((want & MOD_ALT) != 0):
+        return false
+    return true
+
+// Typed text this frame (code points), consumed by `take_text`.
+i32 text_count():
+    return g_nchars
+
+i32 text_at(i32 i):
+    return g_chars[i]
+
+void take_text():
+    g_nchars = 0
+
+// ── Clipboard ──────────────────────────────────────────────────────────────
+
+private ref []char8 g_fake_clip
+
+void clipboard_set(string8 s):
+    if headless():
+        #delete(g_fake_clip)
+        using keep():
+            g_fake_clip = strings.clone(s)
+        return
+    using keep():
+        ref []char8 c = strings.clone_to_cstring(s)
+        sokol_app.sapp_set_clipboard_string(cstring(c))
+        #delete(c)
+
+string8 clipboard_get():
+    if headless():
+        return g_fake_clip
+    cstring c = sokol_app.sapp_get_clipboard_string()
+    if c == nil:
+        return ""
+    return strings.borrow_from_cstring(c)

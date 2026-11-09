@@ -16,3 +16,10 @@ __pycache__/
 
 # supervisor sync staging
 /.sync/
+
+# release output
+/dist/
+
+# serial traces contain radio memory: never commit
+/trace*.txt
+*.trace

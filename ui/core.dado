@@ -1,0 +1,413 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The immediate-mode core: widget identity, hover/press/focus, keyboard
+// focus order, input blocking between layers, animation and ripples.
+//
+// Why immediate mode. A widget is a function call made every frame with the
+// app's own data (`if btui.button(...)`), so there is no widget tree to keep
+// in step with the model, no callbacks and no closures, which Dado does not
+// have. What a widget must remember between frames (an animation, a ripple,
+// a text caret) lives in small maps keyed by the widget's id, or in a state
+// value the app owns (a text field's buffer, a table's scroll position). The
+// retained half is app:draw's canvas, which is why an idle frame is free.
+//
+// Hover is decided one frame late on purpose: the last widget drawn under
+// the mouse wins (it is on top), and only after the whole frame has been
+// drawn is that known; with redraw-on-input the second frame shows it.
+package btui
+
+import "core:hash"
+import "vendor:sokol/sokol_app"
+
+// ── Identity ───────────────────────────────────────────────────────────────
+
+private [32]u64 g_idstack
+private i32 g_idn
+
+private u64 fnv(u64 seed, string8 s):
+    u64 h = seed
+    for i in 0..<#len(s):
+        h = (h ~ u64(u8(s[i]))) * u64(1099511628211)
+    return h
+
+// An id for `label` under the current id scope.
+u64 id(string8 label):
+    u64 seed = u64(14695981039346656037)
+    if g_idn > 0:
+        seed = g_idstack[g_idn - 1]
+    u64 h = fnv(seed, label)
+    if h == 0:
+        h = 1
+    return h
+
+// An id for the n-th of something (rows, cells).
+u64 idn(string8 label, i64 n):
+    u64 h = id(label)
+    h = (h ~ u64(n)) * u64(1099511628211)
+    h = (h ~ (u64(n) >> 32)) * u64(1099511628211)
+    return h if h != 0 else 1
+
+// An id that ignores the id scope: for things opened in one place and drawn
+// in another (menus, dialogs).
+u64 gid(string8 label):
+    u64 h = fnv(u64(14695981039346656037), label)
+    return h if h != 0 else 1
+
+void push_id(u64 i):
+    if g_idn < 32:
+        g_idstack[g_idn] = i
+        g_idn += 1
+
+void pop_id():
+    if g_idn > 0:
+        g_idn -= 1
+
+// ── Hover, press, focus ────────────────────────────────────────────────────
+
+private u64 g_hot
+private u64 g_hot_next
+private u64 g_active
+private bool g_active_seen
+private u64 g_focus
+private u64 g_focus_next
+private bool g_focus_set_this_frame
+private bool g_focus_visible
+private u64 g_focus_seen_any
+
+// Blocking rectangles: what a popup or a dialog covers. A widget on a lower
+// layer cannot be hovered where a higher layer blocks (last frame's list).
+type Blocker: (Rect r, i32 layer)
+private [32]Blocker g_blk
+private i32 g_nblk
+private [32]Blocker g_blk_prev
+private i32 g_nblk_prev
+
+// Focus order: every focusable widget registers each frame.
+type FocusEntry: (u64 id, i32 layer)
+private [512]FocusEntry g_order
+private i32 g_norder
+private [512]FocusEntry g_order_prev
+private i32 g_norder_prev
+
+private i32 g_cursor
+private i32 g_cursor_applied = -1
+
+const i32 CURSOR_DEFAULT = 0
+const i32 CURSOR_POINTER = 1
+const i32 CURSOR_IBEAM = 2
+const i32 CURSOR_RESIZE_EW = 3
+
+void block(Rect r):
+    if g_nblk < 32:
+        g_blk[g_nblk] = Blocker((r, layer()))
+        g_nblk += 1
+
+private bool blocked(f32 x, f32 y):
+    i32 l = layer()
+    for i in 0..<g_nblk_prev:
+        if g_blk_prev[i].layer > l && contains(g_blk_prev[i].r, x, y):
+            return true
+    return false
+
+// Is the mouse over `r`, inside the current clip, and not under a higher layer?
+bool hovering(Rect r):
+    f32 x = mouse_x()
+    f32 y = mouse_y()
+    if !contains(r, x, y):
+        return false
+    if !contains(clip_rect(), x, y):
+        return false
+    return !blocked(x, y)
+
+type Interact: (bool hover, bool pressed, bool down, bool clicked, bool focused)
+
+// The standard button-like interaction for `uid` over `r`: hovered, pressed
+// this frame, held, clicked (released over it), keyboard-focused. A focused
+// widget is also clicked by Space or Enter.
+Interact interact(u64 uid, Rect r, bool focusable = true, bool disabled = false):
+    Interact it
+    if disabled:
+        return it
+    if focusable:
+        register_focus(uid)
+    bool over = hovering(r)
+    if over && (g_active == 0 || g_active == uid):
+        g_hot_next = uid
+    it.hover = g_hot == uid && over
+    if it.hover && mouse_pressed(0):
+        g_active = uid
+        it.pressed = true
+        if focusable:
+            set_focus(uid)
+            g_focus_visible = false
+        else:
+            // A click elsewhere takes focus away from a text field.
+            clear_focus_soon()
+        ripple_start(uid, mouse_x() - r.x, mouse_y() - r.y)
+    if g_active == uid:
+        g_active_seen = true
+        it.down = mouse_down(0)
+        if mouse_released(0):
+            if it.hover || contains(r, mouse_x(), mouse_y()):
+                it.clicked = true
+            g_active = 0
+            it.down = false
+            ripple_release(uid)
+    it.focused = g_focus == uid
+    if it.focused && focusable:
+        if take_key(KEY_SPACE) || take_key(KEY_ENTER) || take_key(KEY_KP_ENTER):
+            it.clicked = true
+            ripple_start(uid, r.w * 0.5, r.h * 0.5)
+            ripple_release(uid)
+    if it.hover:
+        set_cursor(CURSOR_POINTER)
+    return it
+
+// Plain hover/press tracking with no focus and no keyboard (rows, scrims).
+Interact interact_plain(u64 uid, Rect r):
+    return interact(uid, r, false, false)
+
+u64 active_id():
+    return g_active
+
+void set_active(u64 uid):
+    g_active = uid
+
+bool is_active(u64 uid):
+    return g_active == uid
+
+bool is_hot(u64 uid):
+    return g_hot == uid
+
+void register_focus(u64 uid):
+    if g_norder < 512:
+        g_order[g_norder] = FocusEntry((uid, layer()))
+        g_norder += 1
+    if uid == g_focus:
+        g_focus_seen_any = uid
+
+void set_focus(u64 uid):
+    g_focus = uid
+    g_focus_next = uid
+    g_focus_set_this_frame = true
+    request_frame()
+
+private bool g_clear_focus
+
+private void clear_focus_soon():
+    g_clear_focus = true
+
+void clear_focus():
+    g_focus = 0
+    g_focus_next = 0
+
+u64 focus_id():
+    return g_focus
+
+bool has_focus(u64 uid):
+    return g_focus == uid
+
+// Whether the focus ring should show (after keyboard navigation, as in a
+// browser's :focus-visible).
+bool focus_visible():
+    return g_focus_visible
+
+void show_focus_ring():
+    g_focus_visible = true
+
+void set_cursor(i32 c):
+    g_cursor = c
+
+// ── Frame ──────────────────────────────────────────────────────────────────
+
+void ui_begin_frame():
+    input_begin_frame()
+    painter_begin()
+    g_hot_next = 0
+    g_active_seen = false
+    g_nblk = 0
+    g_norder = 0
+    g_focus_seen_any = 0
+    g_focus_set_this_frame = false
+    g_clear_focus = false
+    g_cursor = CURSOR_DEFAULT
+    g_idn = 0
+    anim_begin_frame()
+    if mouse_pressed(0):
+        g_focus_visible = false
+
+void ui_end_frame():
+    if g_clear_focus && !g_focus_set_this_frame:
+        g_focus = 0
+    // A focused widget that was not drawn this frame loses focus.
+    if g_focus != 0 && g_focus_seen_any != g_focus && !g_focus_set_this_frame:
+        g_focus = 0
+    // Tab / Shift+Tab move focus through this frame's focusable widgets, on
+    // the topmost layer that has any (a dialog traps focus).
+    for true:
+        bool back = take_key(KEY_TAB, MOD_SHIFT)
+        bool fwd = !back && take_key(KEY_TAB)
+        if !fwd && !back:
+            break
+        move_focus(back)
+        g_focus_visible = true
+    if g_active != 0 && !g_active_seen:
+        g_active = 0
+    if g_hot != g_hot_next:
+        g_hot = g_hot_next
+        request_frame()
+    for i in 0..<g_nblk:
+        g_blk_prev[i] = g_blk[i]
+    g_nblk_prev = g_nblk
+    for i in 0..<g_norder:
+        g_order_prev[i] = g_order[i]
+    g_norder_prev = g_norder
+
+private void move_focus(bool back):
+    if g_norder == 0:
+        return
+    i32 top = 0
+    for i in 0..<g_norder:
+        top = maxi(top, g_order[i].layer)
+    // the list of candidates on the top layer, in order
+    i32 cur = -1
+    i32 n = 0
+    [512]u64 cand
+    for i in 0..<g_norder:
+        if g_order[i].layer == top:
+            if g_order[i].id == g_focus:
+                cur = n
+            cand[n] = g_order[i].id
+            n += 1
+    if n == 0:
+        return
+    i32 next = 0
+    if cur < 0:
+        next = n - 1 if back else 0
+    else if back:
+        next = (cur + n - 1) % n
+    else:
+        next = (cur + 1) % n
+    g_focus = cand[next]
+    request_frame()
+
+void apply_cursor():
+    if g_cursor == g_cursor_applied:
+        return
+    g_cursor_applied = g_cursor
+    u32 c = 0
+    if g_cursor == CURSOR_POINTER:
+        c = 4
+    else if g_cursor == CURSOR_IBEAM:
+        c = 2
+    else if g_cursor == CURSOR_RESIZE_EW:
+        c = 5
+    sokol_app.sapp_set_mouse_cursor(sokol_app.sapp_mouse_cursor(c))
+
+// ── Animation ──────────────────────────────────────────────────────────────
+
+type Anim: (f32 from, f32 to, f64 t0, f32 dur, f32 value)
+
+private {u64: Anim} g_anims
+private bool g_anim_active
+private bool g_anim_active_next
+
+bool anim_active():
+    return g_anim_active
+
+private void anim_begin_frame():
+    g_anim_active = g_anim_active_next
+    g_anim_active_next = false
+
+// Keep frames coming (a spinner, a blinking caret).
+void animating():
+    g_anim_active_next = true
+    g_anim_active = true
+
+// The eased value of `uid`'s animation towards `target` over `dur` seconds
+// (M3 standard easing). The first call snaps to the target.
+f32 animate(u64 uid, f32 target, f32 dur):
+    try Anim a = g_anims[uid] else:
+        using keep():
+            g_anims[uid] = Anim((target, target, now(), dur, target))
+        return target
+    if a.to != target:
+        a.from = a.value
+        a.to = target
+        a.t0 = now()
+        a.dur = dur
+    f32 t = 1.0
+    if a.dur > 0.0:
+        t = clampf(f32((now() - a.t0) / f64(a.dur)), 0.0, 1.0)
+    a.value = lerpf(a.from, a.to, ease_standard(t))
+    if t < 1.0:
+        g_anim_active_next = true
+    g_anims[uid] = a
+    return a.value
+
+// Snap an animation to a value with no transition.
+void anim_set(u64 uid, f32 v):
+    using keep():
+        g_anims[uid] = Anim((v, v, now(), 0.0, v))
+
+// ── Ripples ────────────────────────────────────────────────────────────────
+// A press spreads a state layer from the pointer over the component and
+// fades it out after release (Material's ripple). It is drawn as a rounded
+// rectangle growing from the press point and clipped to the component's own
+// rounded shape (see `draw_ripple`), so it never leaks past rounded corners.
+
+type Ripple: (f32 x, f32 y, f64 t0, f64 t_up, bool up)
+
+private {u64: Ripple} g_ripples
+
+void ripple_start(u64 uid, f32 x, f32 y):
+    using keep():
+        g_ripples[uid] = Ripple((x, y, now(), 0.0, false))
+    g_anim_active_next = true
+
+void ripple_release(u64 uid):
+    try Ripple r = g_ripples[uid] else:
+        return
+    if !r.up:
+        r.up = true
+        r.t_up = now()
+        g_ripples[uid] = r
+
+// Draw `uid`'s ripple, if any, inside `r` (radius `rad`), in `col`.
+void draw_ripple(u64 uid, Rect r, f32 rad, [4]u8 col):
+    try Ripple rp = g_ripples[uid] else:
+        return
+    f64 t = now()
+    f32 grow = clampf(f32((t - rp.t0) / 0.30), 0.0, 1.0)
+    f32 fade = 1.0
+    if rp.up:
+        // the fade waits for the spread to be most of the way there
+        f64 start = rp.t_up
+        f64 min_start = rp.t0 + 0.12
+        if start < min_start:
+            start = min_start
+        fade = 1.0 - clampf(f32((t - start) / 0.20), 0.0, 1.0)
+    if fade <= 0.0:
+        #delete(g_ripples, uid)
+        return
+    g_anim_active_next = true
+    f32 maxr = sqrtf(r.w * r.w + r.h * r.h)
+    f32 rr = lerpf(maxf(r.w, r.h) * 0.2, maxr, ease_standard(grow))
+    f32 cx0 = r.x + lerpf(rp.x, r.w * 0.5, ease_standard(grow) * 0.5)
+    f32 cy0 = r.y + lerpf(rp.y, r.h * 0.5, ease_standard(grow) * 0.5)
+    Rect circle = Rect((cx0 - rr, cy0 - rr, rr * 2.0, rr * 2.0))
+    Rect c = intersect(circle, r)
+    if c.w <= 0.0 || c.h <= 0.0:
+        return
+    // Corners: where the clamped box meets the component's corner, take the
+    // component's radius; elsewhere the circle's.
+    f32 eps = 0.5
+    bool at_l = absf(c.x - r.x) < eps
+    bool at_t = absf(c.y - r.y) < eps
+    bool at_r = absf(right(c) - right(r)) < eps
+    bool at_b = absf(bottom(c) - bottom(r)) < eps
+    f32 cr = minf(rr, minf(c.w, c.h) * 0.5)
+    Radii q = Radii((rad if at_l && at_t else cr, rad if at_r && at_t else cr,
+                     rad if at_r && at_b else cr, rad if at_l && at_b else cr))
+    fill_rrect4(c, q, alpha(col, PRESS_OPACITY * fade))

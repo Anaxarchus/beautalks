@@ -1,0 +1,53 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Pure helpers: rectangles, UTF-8, easing, colours, tile coverage, shadows.
+package btui
+
+i32 test():
+    bool ok = true
+    // rect cutting
+    Rect r = rect(0.0, 0.0, 100.0, 50.0)
+    Rect top = cut_top(&r, 10.0)
+    ok = #expect(top.h == 10.0 && r.y == 10.0 && r.h == 40.0, "cut_top") && ok
+    Rect left = cut_left(&r, 30.0)
+    ok = #expect(left.w == 30.0 && r.x == 30.0 && r.w == 70.0, "cut_left") && ok
+    Rect rr = cut_right(&r, 20.0)
+    ok = #expect(rr.x == 80.0 && r.w == 50.0, "cut_right ", rr.x, " ", r.w) && ok
+    Rect i = intersect(rect(0.0, 0.0, 10.0, 10.0), rect(5.0, 5.0, 10.0, 10.0))
+    ok = #expect(i.x == 5.0 && i.w == 5.0 && i.h == 5.0, "intersect") && ok
+    Rect none = intersect(rect(0.0, 0.0, 1.0, 1.0), rect(5.0, 5.0, 1.0, 1.0))
+    ok = #expect(none.w == 0.0 && none.h == 0.0, "disjoint intersect is empty") && ok
+    ok = #expect(contains(rect(0.0, 0.0, 10.0, 10.0), 9.9, 0.0) && !contains(rect(0.0, 0.0, 10.0, 10.0), 10.0, 5.0), "contains is half-open") && ok
+    // UTF-8
+    string8 s = "a°✓€"
+    (i32 c0, i32 n0) = utf8_at(s, 0)
+    (i32 c1, i32 n1) = utf8_at(s, 1)
+    (i32 c2, i32 n2) = utf8_at(s, 3)
+    ok = #expect(c0 == 97 && n0 == 1, "ascii") && ok
+    ok = #expect(c1 == 0xB0 && n1 == 2, "degree sign") && ok
+    ok = #expect(c2 == 0x2713 && n2 == 3, "check mark") && ok
+    ok = #expect(utf8_next(s, 1) == 3 && utf8_prev(s, 3) == 1 && utf8_prev(s, 6) == 3, "utf8 next/prev") && ok
+    ref []char8 buf = #make([]char8, 0)
+    utf8_append(&buf, 0x2026)
+    (i32 c3, i32 n3) = utf8_at(buf, 0)
+    ok = #expect(c3 == 0x2026 && n3 == 3, "utf8 round trip") && ok
+    #delete(buf)
+    // easing
+    ok = #expect(ease_standard(0.0) == 0.0 && ease_standard(1.0) == 1.0, "ease endpoints") && ok
+    ok = #expect(ease_standard(0.5) > 0.5, "standard easing decelerates") && ok
+    f32 prev = 0.0
+    bool mono = true
+    for k in 1..=20:
+        f32 v = ease_standard(f32(i32(k)) / 20.0)
+        if v < prev:
+            mono = false
+        prev = v
+    ok = #expect(mono, "easing is monotonic") && ok
+    // colour
+    [4]u8 c = rgb(0x7a3e8e)
+    ok = #expect(c[0] == 0x7a && c[1] == 0x3e && c[2] == 0x8e && c[3] == 255, "rgb") && ok
+    [4]u8 h = over(rgb(0xffffff), rgb(0x000000), 0.08)
+    ok = #expect(h[0] == 235 && h[3] == 255, "8% state layer over white is ", h[0]) && ok
+    return 0 if ok else 1

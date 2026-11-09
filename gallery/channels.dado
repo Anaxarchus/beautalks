@@ -1,0 +1,408 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The mock "Channels" screen: app bar with the logo, the radio identity
+// card, a toolbar (search, filters, show-all-slots) and the channel table
+// with validation.
+package main
+
+import "core:slices"
+import "core:strings"
+import "core:strings/parse"
+import btui "../ui"
+
+bool g_show_all
+f32 g_scroll_dir = 1.0
+bool g_filter_problems
+bool g_filter_changed
+btui.TableState g_table
+btui.Field g_search
+ref []btui.Column g_cols
+ref []i32 g_view
+btui.Scroll g_dummy
+
+const i32 SLOTS = 1000
+
+[35]string8 TONES_A = ["Off", "67.0", "71.9", "77.0", "88.5", "100.0", "103.5", "107.2", "110.9", "114.8", "118.8", "123.0", "127.3", "131.8", "136.5", "141.3", "146.2", "151.4", "156.7", "162.2", "167.9", "173.8", "179.9", "186.2", "192.8", "203.5", "210.7", "218.1", "225.7", "233.6", "241.8", "250.3", "D023N", "D025N", "D754N"]
+[3]string8 POWERS_A = ["High", "Medium", "Low"]
+[3]string8 MODES_A = ["FM", "NFM", "AM"]
+[5]string8 DUPS_A = ["None", "Plus", "Minus", "Split", "Off"]
+
+void channels_init():
+    using btui.keep():
+        g_table = btui.table_state()
+        g_cols = #make([]btui.Column, 0)
+        g_cols = #append(g_cols, btui.column("#", 72.0, btui.COL_INDEX, false))
+        g_cols = #append(g_cols, btui.column("Name", 196.0, btui.COL_TEXT))
+        g_cols = #append(g_cols, btui.column("RX (MHz)", 132.0, btui.COL_NUM))
+        btui.Column d = btui.column("Duplex", 112.0, btui.COL_CHOICE)
+        d.choices = DUPS_A[:]
+        g_cols = #append(g_cols, d)
+        g_cols = #append(g_cols, btui.column("Offset", 108.0, btui.COL_NUM))
+        btui.Column tt = btui.column("TX tone", 120.0, btui.COL_CHOICE)
+        tt.choices = TONES_A[:]
+        g_cols = #append(g_cols, tt)
+        btui.Column rt = btui.column("RX tone", 120.0, btui.COL_CHOICE)
+        rt.choices = TONES_A[:]
+        g_cols = #append(g_cols, rt)
+        btui.Column pw = btui.column("Power", 112.0, btui.COL_CHOICE)
+        pw.choices = POWERS_A[:]
+        g_cols = #append(g_cols, pw)
+        btui.Column md = btui.column("Mode", 100.0, btui.COL_CHOICE)
+        md.choices = MODES_A[:]
+        g_cols = #append(g_cols, md)
+        g_cols = #append(g_cols, btui.column("Info", 180.0, btui.COL_STATUS, false, false))
+        g_view = #make([]i32, 0)
+    g_table.cur_col = 1
+    g_table.frozen = 2
+    g_table.footer = true
+
+// ── The table's view of the data ───────────────────────────────────────────
+
+// Rows are slots. Slot k (0-based) holds channel g_view[k] when k is within
+// the list; past it, an empty slot (only shown with "all 1000 slots").
+private i32 chan_of(i32 row):
+    if row < 0 || row >= i32(#len(g_view)):
+        return -1
+    return g_view[row]
+
+private bool name_long(^Chan c):
+    return #len(c.name) > NAME_MAX
+
+private bool problem(^Chan c):
+    return !in_band(c.rx) || name_long(c)
+
+private string8 cell_text(i32 row, i32 col):
+    if col == C_SLOT:
+        return #format(row + 1)
+    i32 k = chan_of(row)
+    if k < 0:
+        if col == C_NAME:
+            return "Empty"
+        return ""
+    ^Chan c = &g_chans[k]
+    if col == C_NAME:
+        return c.name
+    if col == C_RX:
+        return fmt_mhz(c.rx)
+    if col == C_DUP:
+        return dup_of(c)
+    if col == C_OFFSET:
+        return offset_of(c)
+    if col == C_TXTONE:
+        if #len(c.tx_tone) == 0:
+            return "Off"
+        return c.tx_tone
+    if col == C_RXTONE:
+        if #len(c.rx_tone) == 0:
+            return "Off"
+        return c.rx_tone
+    if col == C_POWER:
+        return POWERS_A[clampi(c.power, 0, 2)]
+    if col == C_MODE:
+        return c.mode
+    if col == C_INFO:
+        return c.note
+    return ""
+
+private i32 clampi(i32 v, i32 lo, i32 hi):
+    return btui.clampi(v, lo, hi)
+
+private i32 cell_deco(i32 row, i32 col):
+    i32 k = chan_of(row)
+    if k < 0:
+        return btui.DECO_DIM if col == C_NAME else btui.DECO_NONE
+    ^Chan c = &g_chans[k]
+    if col == C_RX && !in_band(c.rx):
+        return btui.DECO_ERROR
+    if col == C_NAME && name_long(c):
+        return btui.DECO_WARNING
+    if col == C_INFO:
+        return btui.DECO_TONE + c.tone
+    if (col == C_TXTONE && #len(c.tx_tone) == 0) || (col == C_RXTONE && #len(c.rx_tone) == 0):
+        return btui.DECO_DIM
+    if col == C_DUP && c.tx <= 0.0:
+        return btui.DECO_DIM
+    if col == C_SLOT && c.changed:
+        return btui.DECO_CHANGED
+    return btui.DECO_NONE
+
+private string8 cell_msg(i32 row, i32 col):
+    i32 k = chan_of(row)
+    if k < 0:
+        return ""
+    ^Chan c = &g_chans[k]
+    if col == C_RX:
+        return #format("The UV-5RM can't tune ", fmt_mhz(c.rx), " MHz (it covers 136–174 and 400–520). This channel will be skipped.")
+    if col == C_NAME:
+        return #format("Names are cut to ", NAME_MAX, " characters on this radio: “", c.name[0..<NAME_MAX], "”")
+    return ""
+
+// ── Filtering and sorting ──────────────────────────────────────────────────
+
+private bool matches(^Chan c, string8 q):
+    if #len(q) == 0:
+        return true
+    ref []char8 a = strings.to_lower(c.name)
+    ref []char8 b = strings.to_lower(q)
+    bool m = strings.contains(a, b) || strings.contains(fmt_mhz(c.rx), q) || strings.contains(strings.to_lower(c.service), b)
+    return m
+
+private i32 g_sort_col
+private bool g_sort_desc
+
+private bool less(i32 a, i32 b):
+    ^Chan x = &g_chans[a]
+    ^Chan y = &g_chans[b]
+    bool r = a < b
+    if g_sort_col == C_NAME:
+        i32 c = strings.compare(x.name, y.name)
+        r = c < 0 if c != 0 else a < b
+    else if g_sort_col == C_RX:
+        r = x.rx < y.rx if x.rx != y.rx else a < b
+    else if g_sort_col == C_MODE:
+        i32 c = strings.compare(x.mode, y.mode)
+        r = c < 0 if c != 0 else a < b
+    else if g_sort_col == C_POWER:
+        r = x.power < y.power if x.power != y.power else a < b
+    if g_sort_desc && g_sort_col > 0:
+        return !r && a != b
+    return r
+
+private void rebuild_view():
+    string8 q = btui.field_text(&g_search)
+    using btui.keep():
+        g_view = #resize(g_view, 0)
+        for i in 0..<#len(g_chans):
+            ^Chan c = &g_chans[i]
+            if !matches(c, q):
+                continue
+            if g_filter_problems && !problem(c):
+                continue
+            if g_filter_changed && !c.changed:
+                continue
+            g_view = #append(g_view, i32(i))
+    g_sort_col = g_table.sort_col
+    g_sort_desc = g_table.sort_desc
+    if g_sort_col > 0:
+        // insertion sort: tens of rows
+        for i in 1..<#len(g_view):
+            i32 v = g_view[i]
+            i64 j = i - 1
+            for j >= 0 && less(v, g_view[j]):
+                g_view[j + 1] = g_view[j]
+                j -= 1
+            g_view[j + 1] = v
+
+private void apply_edit(btui.TableEvent ev):
+    i32 k = chan_of(ev.row)
+    if k < 0:
+        return
+    ^Chan c = &g_chans[k]
+    c.changed = true
+    using btui.keep():
+        if ev.col == C_NAME:
+            c.name = strings.clone(strings.trim(ev.text))
+        else if ev.col == C_RX:
+            try f64 v = parse.to_f64(strings.trim(ev.text)) else:
+                btui.snackbar_show("That isn't a frequency. Type it in MHz, like 146.520")
+                return
+            f64 d = c.tx - c.rx
+            c.rx = v
+            if c.tx > 0.0:
+                c.tx = v + d
+        else if ev.col == C_OFFSET:
+            try f64 v = parse.to_f64(strings.trim(ev.text)) else:
+                return
+            if c.tx >= c.rx:
+                c.tx = c.rx + v
+            else:
+                c.tx = c.rx - v
+        else if ev.col == C_DUP:
+            f64 off = c.tx - c.rx
+            if off < 0.0:
+                off = 0.0 - off
+            if off < 0.0005:
+                off = 0.6 if c.rx < 300.0 else 5.0
+            if ev.choice == 0:
+                c.tx = c.rx
+            else if ev.choice == 1:
+                c.tx = c.rx + off
+            else if ev.choice == 2:
+                c.tx = c.rx - off
+            else if ev.choice == 4:
+                c.tx = 0.0
+        else if ev.col == C_TXTONE:
+            c.tx_tone = strings.clone(ev.text if ev.choice > 0 else "")
+        else if ev.col == C_RXTONE:
+            c.rx_tone = strings.clone(ev.text if ev.choice > 0 else "")
+        else if ev.col == C_POWER:
+            c.power = ev.choice
+        else if ev.col == C_MODE:
+            c.mode = strings.clone(ev.text)
+
+void channels_cursor_error():
+    // for the screenshot: the keyboard cursor on the out-of-band RX cell
+    g_table.cur_row = 2
+    g_table.cur_col = C_RX
+    btui.set_focus(btui.id("channels"))
+    btui.show_focus_ring()
+
+void channels_start_edit():
+    // for the screenshot: edit the RX tone of row 9 (a dropdown)
+    g_table.cur_row = 8
+    g_table.cur_col = C_RXTONE
+    btui.set_focus(btui.id("channels"))
+    btui.push_key(btui.KEY_ENTER, 0)
+
+// ── The page ───────────────────────────────────────────────────────────────
+
+void channels_page(btui.Rect area0):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect area = area0
+    btui.fill_rect(area, t.surface_container_low)
+    btui.Rect bar = btui.cut_top(&area, 64.0)
+    btui.Rect acts = btui.top_app_bar(bar, "Channels", false, true)
+    f32 ax = btui.right(acts) - 48.0
+    _ = btui.icon_button("more_vert", btui.rect(ax, bar.y + 8.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "More")
+    ax = ax - 48.0
+    _ = btui.icon_button("help", btui.rect(ax, bar.y + 8.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Help")
+    ax = ax - 48.0
+    _ = btui.icon_button("history", btui.rect(ax, bar.y + 8.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Backups")
+    // the page body sits on a surface sheet with a rounded top-left corner
+    btui.Rect sheet = btui.inset4(area, 0.0, 0.0, 16.0, 16.0)
+    btui.fill_rrect(sheet, 16.0, t.surface)
+    btui.Rect body = btui.inset(sheet, 24.0)
+    radio_card(btui.cut_top(&body, 112.0))
+    _ = btui.cut_top(&body, 20.0)
+    toolbar(btui.cut_top(&body, 48.0))
+    _ = btui.cut_top(&body, 16.0)
+    rebuild_view()
+    i32 rows = i32(#len(g_view))
+    if g_show_all && rows < SLOTS:
+        rows = SLOTS
+    if g_autoscroll:
+        // perf runs: sweep through all the rows, down and back up
+        f32 maxs = f32(rows) * btui.ROW_H
+        g_table.scroll.target = g_table.scroll.target + g_scroll_dir * 37.0
+        if g_table.scroll.target > maxs:
+            g_scroll_dir = -1.0
+        if g_table.scroll.target < 0.0:
+            g_scroll_dir = 1.0
+        btui.animating()
+    btui.TableEvent ev = btui.table("channels", body, g_cols[:], rows, &g_table, cell_text, cell_deco, cell_msg)
+    if ev.kind == btui.TEV_COMMIT || ev.kind == btui.TEV_CHOICE:
+        apply_edit(ev)
+    if ev.kind == btui.TEV_CLEAR:
+        btui.snackbar_show("Cleared. Press Ctrl+Z to undo (not in this mock).", "")
+    write_dialog()
+
+private void radio_card(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(r, btui.CARD_OUTLINED)
+    btui.Rect ib = btui.inset(r, 20.0)
+    // avatar
+    btui.fill_circle(ib.x + 32.0, btui.cy(r), 32.0, t.primary_container)
+    btui.icon("radio", ib.x + 20.0, btui.cy(r) - 12.0, 24.0, t.on_primary_container, true)
+    f32 x = ib.x + 64.0 + 20.0
+    f32 nx = btui.text(btui.TITLE_LARGE, x, ib.y + 4.0, "Truck radio", t.on_surface)
+    _ = btui.status_chip(nx + 12.0, ib.y + 6.0, "Tested · write OK", btui.TONE_SUCCESS, "verified", true)
+    _ = btui.text(btui.BODY_MEDIUM, x, ib.y + 36.0, "Baofeng UV-5RM  ·  firmware (example)  ·  seen 3 times", t.on_surface_variant)
+    f32 ux = x
+    btui.icon("usb", ux, ib.y + 62.0, 18.0, t.on_surface_variant)
+    ux = btui.text(btui.BODY_SMALL, ux + 22.0, ib.y + 63.0, "/dev/cu.usbserial-140 (CH340)", t.on_surface_variant)
+    btui.icon("backup", ux + 16.0, ib.y + 62.0, 18.0, t.on_surface_variant)
+    _ = btui.text(btui.BODY_SMALL, ux + 38.0, ib.y + 63.0, "Last backup today 14:02", t.on_surface_variant)
+    // actions
+    f32 bw = btui.button_width("Write to radio", "upload")
+    btui.Rect wb = btui.rect(btui.right(ib) - bw, btui.cy(r) - 20.0, bw, 40.0)
+    if btui.button("Write to radio", wb, btui.BTN_FILLED, "upload"):
+        btui.dialog_open("write")
+    f32 rw = btui.button_width("Read from radio", "download")
+    btui.Rect rb = btui.rect(wb.x - 12.0 - rw, wb.y, rw, 40.0)
+    if btui.button("Read from radio", rb, btui.BTN_TONAL, "download"):
+        btui.snackbar_show("Read 1000 channels from UV-5RM. Backup saved.", "Open")
+
+private void toolbar(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    // a compact search field
+    btui.Rect sr = btui.rect(r.x, r.y, 300.0, 48.0)
+    search_box(sr)
+    f32 x = btui.right(sr) + 16.0
+    i32 nprob = 0
+    i32 nchg = 0
+    for i in 0..<#len(g_chans):
+        if problem(&g_chans[i]):
+            nprob += 1
+        if g_chans[i].changed:
+            nchg += 1
+    f32 cyy = r.y + 8.0
+    (bool c1, f32 w1) = btui.chip_at(x, cyy, #format("Problems (", nprob, ")"), btui.CHIP_FILTER, "error", &g_filter_problems)
+    _ = c1
+    x = x + w1 + 8.0
+    (bool c2, f32 w2) = btui.chip_at(x, cyy, #format("Changed (", nchg, ")"), btui.CHIP_FILTER, "edit", &g_filter_changed)
+    _ = c2
+    x = x + w2 + 8.0
+    // right side: all slots switch and the count
+    f32 rx = btui.right(r)
+    _ = btui.switch_("allslots", rx - 52.0, r.y + 8.0, &g_show_all)
+    f32 lw = btui.text_width(btui.BODY_MEDIUM, "Show all 1000 slots")
+    _ = btui.text(btui.BODY_MEDIUM, rx - 52.0 - 12.0 - lw, r.y + 14.0, "Show all 1000 slots", t.on_surface)
+    string8 cnt = #format(#len(g_chans), " channels · ", btui.table_selected_count(&g_table), " selected")
+    f32 cw = btui.text_width(btui.BODY_MEDIUM, cnt)
+    f32 cx0 = rx - 52.0 - 12.0 - lw - 32.0 - cw
+    if cx0 > x + 16.0:
+        _ = btui.text(btui.BODY_MEDIUM, cx0, r.y + 14.0, cnt, t.on_surface_variant)
+
+// A pill-shaped search box (M3 search bar, 48 dp).
+private void search_box(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    btui.FieldOpts o = btui.field_opts("")
+    o.placeholder = "Search channels"
+    u64 sid = btui.id("search#tf")
+    bool foc = btui.has_focus(sid)
+    btui.fill_rrect(r, 24.0, t.surface_container_high)
+    if foc:
+        btui.stroke_rrect(r, 24.0, 2.0, t.primary)
+    btui.icon("search", r.x + 16.0, btui.cy(r) - 12.0, 24.0, t.on_surface_variant)
+    btui.Rect fr = btui.rect(r.x + 44.0, r.y - 4.0, r.w - 52.0, 56.0)
+    // borrow the text field's editing, without its container
+    btui.FieldOut out = btui.bare_field("search", fr, &g_search, o)
+    _ = out
+
+// ── The write dialog (safety checklist + stepper) ──────────────────────────
+
+private bool g_ack
+private i32 g_write_step = -1
+private f64 g_write_t0
+
+private void write_dialog():
+    ^btui.Scheme t = btui.theme()
+    (btui.Rect body, bool open) = btui.dialog_begin("write", #format("Write ", #len(g_chans), " channels to Truck radio?"), 640.0, 212.0, "upload")
+    if !open:
+        return
+    _ = btui.text_wrap(btui.rect(body.x, body.y, body.w, 60.0), btui.BODY_MEDIUM, "beautalks backs up the radio first, writes, then reads everything back to check it. One channel is outside this radio's bands and will be skipped.", t.on_surface_variant)
+    []string8 titles = ["Back up", "Write", "Verify"]
+    string8 mid = #format("Channel 12 of ", #len(g_chans))
+    []string8 caps = ["Saved 14:02", mid, "Read back, compare"]
+    [3]i32 st = [btui.STEP_DONE, btui.STEP_ACTIVE, btui.STEP_PENDING]
+    f32 prog = 0.38
+    if g_write_step >= 0:
+        f32 el = f32(btui.now() - g_write_t0)
+        prog = btui.clampf(el / 3.0, 0.0, 1.0)
+        if prog >= 1.0:
+            st = [btui.STEP_DONE, btui.STEP_DONE, btui.STEP_ACTIVE]
+            prog = -1.0
+        btui.animating()
+    btui.stepper(btui.rect(body.x, body.y + 76.0, body.w, 48.0), titles, caps, st[:], prog)
+    btui.progress_linear(btui.rect(body.x, body.y + 140.0, body.w, 8.0), prog if prog >= 0.0 else 1.0)
+    _ = btui.checkbox("I understand the radio's channels will be replaced", body.x - 10.0, body.y + 168.0, &g_ack)
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("Write", "", btui.BTN_FILLED)
+    if btui.button("Write", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_FILLED, "", !g_ack):
+        g_write_step = 0
+        g_write_t0 = btui.now()
+    f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()

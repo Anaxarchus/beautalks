@@ -1,0 +1,234 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Choosing and running the protocol engine for a model, for the CLI and the
+// GUI alike (driverhost.choose_engine): a scripted engine from
+// --drivers / the active updated driver set / the set shipped with the app,
+// else the built-in Dado engine. The safety sequence (tested/override,
+// backup, verify) runs around whichever is chosen.
+//
+//   engines.Runner run
+//   try run = engines.open_runner(port, &model, data_dir, "", false) else code: ...
+//   defer run.close()
+//   try ref []u8 img = run.download(&model, progress) else why: ...
+package engines
+
+import "core:os/fs"
+import "core:strings"
+import "../driverhost"
+import "../radio"
+import "../updater"
+
+// radio.Link seen as the driver host's Wire.
+type WireOver using driverhost.Wire:
+    radio.Link link
+
+    !void send(^self, []u8 data):
+        try self.link.send(data)
+
+    !i64 recv(^self, []u8 into, i32 timeout_ms):
+        try i64 n = self.link.recv(into, timeout_ms)
+        return n
+
+    void sleep_ms(^self, i32 ms):
+        self.link.sleep_ms(ms)
+
+    void discard(^self):
+        self.link.discard()
+
+// A scripted driver as a radio.Engine. Driver failures keep their numbers
+// (1-11 are radio.LinkError's; 20-24 the host's).
+type ScriptEngine using radio.Engine:
+    driverhost.Driver drv
+    WireOver wire
+
+    !ref []u8 download(^self, ^const radio.Model m, radio.Progress pr):
+        driverhost.Progress p = driverhost.Progress(fn: pr.fn, ctx: pr.ctx)
+        try ref []u8 img = driverhost.download(&self.drv, &self.wire, p) else code:
+            fail code
+        if radio.cancel_requested():
+            #delete(img)
+            fail i32(radio.LinkError.CANCELLED)
+        return img
+
+    !void upload(^self, ^const radio.Model m, []u8 img, radio.Progress pr):
+        driverhost.Progress p = driverhost.Progress(fn: pr.fn, ctx: pr.ctx)
+        try driverhost.upload(&self.drv, &self.wire, img, p) else code:
+            fail code
+
+    void pause(^self, i32 ms):
+        self.wire.sleep_ms(ms)
+
+// A message for any engine failure code: radio.LinkError's and the host's.
+string8 error_text(i32 code):
+    if code == driverhost.E_API:
+        return "the scripted driver speaks another driver API"
+    if code == driverhost.E_LOAD:
+        return "the scripted driver could not be loaded"
+    if code == driverhost.E_UNBOUND:
+        return "the scripted driver ran without a link"
+    if code == driverhost.E_TIMEOUT:
+        return "the scripted driver took too long"
+    if code == driverhost.E_NO_ENGINE:
+        return "no usable engine for this model"
+    return radio.link_error_message(radio.LinkError(code))
+
+// The driver directories, first wins: `override` when given, else the
+// active updated set (<data_dir>/drivers/active), then every shipped
+// drivers folder that exists (radio.shipped_candidates: $BEAUTALKS_DRIVERS,
+// ./drivers, <exe>/drivers, <exe>/../drivers, <exe>/../Resources/drivers).
+// The caller #deletes each and the list.
+ref [](ref []char8) driver_dirs(string8 data_dir, string8 override):
+    ref [](ref []char8) out = nil
+    if #len(override) != 0:
+        out = #append(out, strings.clone(override))
+        return out
+    updater.Config uc = updater.default_config()
+    uc.data_dir = data_dir
+    ref []char8 act = nil
+    try act = updater.active_dir(uc) else:
+        act = nil
+    if act != nil:
+        out = #append(out, act)
+    ref [](ref []char8) shipped = radio.shipped_candidates("drivers")
+    for d in shipped:
+        out = #append(out, strings.clone(d))
+    radio.free_paths(shipped)
+    return out
+
+void free_dirs(ref [](ref []char8) dirs):
+    for d in dirs:
+        #delete(d)
+    #delete(dirs)
+
+// Chooses the engine for `m` (see the file comment); `force_builtin` takes
+// the compiled engine when the model has one. Fails E_NO_ENGINE, with
+// driverhost.last_error() saying why.
+!driverhost.Choice choose(^const radio.Model m, string8 data_dir, string8 drivers_override, bool force_builtin):
+    bool builtin = radio.engine_known(m)
+    if force_builtin && builtin:
+        driverhost.Choice c
+        c.source = driverhost.Source.BUILTIN
+        return c
+    ref [](ref []char8) dirs = driver_dirs(data_dir, drivers_override)
+    ref []string8 views = nil
+    for d in dirs:
+        string8 v = d
+        views = #append(views, v)
+    driverhost.Choice c
+    try c = driverhost.choose_engine(views, m^.engine, m^.file, builtin) else code:
+        #delete(views)
+        free_dirs(dirs)
+        fail code
+    #delete(views)
+    free_dirs(dirs)
+    return c
+
+// An open port with the chosen engine. The link and the scripted engine
+// live on the heap: the driver host keeps the wire while it runs.
+type Runner:
+    driverhost.Choice choice
+    ref radio.SerialLink link
+    ref ScriptEngine script
+    bool open
+
+    bool scripted(^self):
+        return self.choice.source == driverhost.Source.SCRIPTED
+
+    // Downloads the radio's image (identifying it, or reusing its open
+    // session). The caller #deletes it.
+    radio.LinkError!ref []u8 download(^self, ^const radio.Model m, radio.Progress pr):
+        if self.scripted():
+            try ref []u8 img = self.script.download(m, pr) else code:
+                fail radio.LinkError(code)
+            return img
+        return radio.download(self.link, m, pr)
+
+    // The safe write: backup to `backup_path`, write, read back, compare.
+    radio.LinkError!void safe_write(^self, ^const radio.Model m, []u8 img, bool allow_untested, string8 backup_path, i32 pause_ms, radio.PhaseFn phase, rawptr ctx, radio.Progress pr):
+        if self.scripted():
+            try radio.safe_write_with(self.script, m, img, allow_untested, backup_path, pause_ms, phase, ctx, pr)
+            return
+        try radio.safe_write(self.link, m, img, allow_untested, backup_path, pause_ms, phase, ctx, pr)
+
+    // The gated safe write after a detection (see radio/gate.dado): the
+    // radio's fingerprint from the detection and its own memory decides,
+    // with write_status, whether `allow_untested` is needed. Answers the
+    // status that let it through. `d` is the detection this runner adopted.
+    radio.LinkError!radio.WriteStatus safe_write_detected(^self, ^radio.Detection d, ^const radio.Model m, []u8 img, ^radio.TestedStore store, bool allow_untested, string8 backup_path, i32 pause_ms, radio.PhaseFn phase, rawptr ctx, radio.Progress pr):
+        // the detection's link lives in this runner now
+        d^.link = self.link^
+        d^.link_open = true
+        radio.WriteStatus st
+        if self.scripted():
+            try st = radio.safe_write_detected_with(self.script, d, m, img, store, allow_untested, backup_path, pause_ms, phase, ctx, pr) else why:
+                d^.link_open = false
+                fail why
+        else:
+            try st = radio.safe_write_detected(d, m, img, store, allow_untested, backup_path, pause_ms, phase, ctx, pr) else why:
+                d^.link_open = false
+                fail why
+        d^.link_open = false
+        return st
+
+    // Step 2 of guided verification (radio/verify.dado) with this runner's
+    // engine: the scripted driver when one was chosen, else the built-in
+    // engine (one session for the UV-5R family).
+    radio.LinkError!void verify_write(^self, ^radio.Verification v, i32 pause_ms, radio.PhaseFn phase, rawptr ctx, radio.Progress pr):
+        if self.scripted():
+            try radio.verify_write_with(v, self.script, pause_ms, phase, ctx, pr)
+            return
+        try radio.verify_write(v, self.link, pause_ms, phase, ctx, pr)
+
+    // The restore after a failed or declined verification, same engine.
+    radio.LinkError!void verify_restore(^self, ^radio.Verification v, i32 pause_ms, radio.PhaseFn phase, rawptr ctx, radio.Progress pr):
+        if self.scripted():
+            try radio.verify_restore_with(v, self.script, pause_ms, phase, ctx, pr)
+            return
+        try radio.verify_restore(v, self.link, pause_ms, phase, ctx, pr)
+
+    // Closes the port and unloads a scripted engine.
+    void close(^self):
+        if self.open:
+            radio.close_serial(self.link)
+            self.open = false
+        self.choice.destroy()
+        #delete(self.script)
+        #delete(self.link)
+        self.script = nil
+        self.link = nil
+
+// Opens `port` at the model's baud with the engine `choose` picks.
+// Fails with an engine code (see error_text).
+!Runner open_runner(string8 port, ^const radio.Model m, string8 data_dir, string8 drivers_override, bool force_builtin):
+    Runner r
+    try r.choice = choose(m, data_dir, drivers_override, force_builtin)
+    try radio.SerialLink l = radio.open_serial(port, m^.baud) else why:
+        r.choice.destroy()
+        fail i32(why)
+    r.link = #new(radio.SerialLink)
+    r.link^ = l
+    r.open = true
+    if r.scripted():
+        r.script = #new(ScriptEngine)
+        r.script.drv = r.choice.driver
+        r.script.wire.link = r.link
+    return r
+
+// A runner over the open link of a successful detection (the port stays
+// open and the radio in its session). The detection no longer owns the
+// link: close the runner, not the detection's port.
+!Runner adopt_detection(^radio.Detection d, ^const radio.Model m, string8 data_dir, string8 drivers_override, bool force_builtin):
+    if !d^.found || !d^.link_open:
+        fail i32(radio.LinkError.BAD_MODEL)
+    Runner r
+    try r.choice = choose(m, data_dir, drivers_override, force_builtin)
+    r.link = #new(radio.SerialLink)
+    r.link^ = d^.link
+    d^.link_open = false
+    r.open = true
+    if r.scripted():
+        r.script = #new(ScriptEngine)
+        r.script.drv = r.choice.driver
+        r.script.wire.link = r.link
+    return r

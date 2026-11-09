@@ -1,0 +1,335 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Radios page (remembered radios: rename, forget, last backup, verified
+// status), the Backups page (per model, newest first; open, restore through
+// the write flow) and Settings / About (theme, folders, driver updates,
+// version, licences).
+package main
+
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import btui "../ui"
+import "../radio"
+import "../updater"
+
+// ── Radios ───────────────────────────────────────────────────────────────────
+
+btui.Scroll g_rad_scroll
+ref []char8 g_forget_id
+
+void radios_rename(string8 id, string8 nick):
+    if job_busy():
+        btui.snackbar_show("Wait for the radio to finish, then rename it.")
+        return
+    radio.Registry reg = radio.open_registry(g_data_dir)
+    defer reg.destroy()
+    if radio.rename_radio(&reg, id, strings.trim(nick)) && radio.save_registry(&reg):
+        if g_radio.known && eq_s(g_radio.rid) == id:
+            using app_keep():
+                #delete(g_radio.nickname)
+                g_radio.nickname = strings.clone(strings.trim(nick))
+        btui.snackbar_show("Renamed")
+
+void radios_page(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 32.0)
+    page_header(body, "Radios", "Every radio beautalks has talked to on this computer.")
+    radio.Registry reg = radio.open_registry(g_data_dir)
+    defer reg.destroy()
+    radio.KnownList k = radio.list_known(&reg)
+    defer k.destroy()
+    radio.TestedStore ts = radio.open_tested(g_data_dir)
+    defer ts.destroy()
+    btui.Rect lst = btui.rect(body.x, body.y + 80.0, body.w, body.h - 80.0)
+    if #len(k.radios) == 0:
+        empty_state(lst, "radio", "No radios yet", "Radios appear here once beautalks has detected them.", "Go to Radio")
+        return
+    // newest first
+    i64 n = #len(k.radios)
+    ref []i64 order = nil
+    for i in 0..<n:
+        order = #append(order, i64(i))
+    for i in 1..<n:
+        i64 v = order[i]
+        i64 j = i - 1
+        for j >= 0 && k.radios[order[j]].last_seen < k.radios[v].last_seen:
+            order[j + 1] = order[j]
+            j -= 1
+        order[j + 1] = v
+    _ = btui.scroll_update(lst, &g_rad_scroll, f32(n) * 112.0)
+    btui.push_clip(lst)
+    for ii in 0..<n:
+        radio.KnownRadio x = k.radios[order[ii]]
+        f32 y = lst.y + f32(i32(ii)) * 112.0 - g_rad_scroll.y
+        btui.Rect c = btui.rect(lst.x, y, lst.w, 100.0)
+        _ = btui.card(c, btui.CARD_OUTLINED)
+        btui.Rect ci = btui.inset(c, 20.0)
+        btui.fill_circle(ci.x + 28.0, btui.cy(c), 28.0, t.primary_container)
+        btui.icon("radio", ci.x + 16.0, btui.cy(c) - 12.0, 24.0, t.on_primary_container, true)
+        string8 id = k.text(x.id)
+        string8 nick = k.text(x.nickname)
+        i64 mi = model_index(k.text(x.model))
+        string8 mname = model_label(mi) if mi >= 0 else k.text(x.model)
+        string8 title = nick if #len(nick) > 0 else mname
+        f32 tx = ci.x + 76.0
+        f32 ex = btui.text(btui.TITLE_MEDIUM, tx, ci.y, title, t.on_surface)
+        // the library decides: shipped tested, or verified here for this
+        // radio's fingerprint
+        radio.WriteStatus ws = radio.known_write_status(&k, order[ii], g_models, &ts)
+        if ws.by == radio.TestedBy.SHIPPED:
+            _ = btui.status_chip(ex + 12.0, ci.y, "Tested for writing", btui.TONE_SUCCESS, "verified", true)
+        else if ws.by == radio.TestedBy.LOCAL:
+            _ = btui.status_chip(ex + 12.0, ci.y, "Verified on this computer", btui.TONE_SUCCESS, "verified", true)
+        else:
+            _ = btui.status_chip(ex + 12.0, ci.y, "Not tested for writing", btui.TONE_WARNING, "lock", true)
+        ref []char8 when = when_text(x.last_seen)
+        string8 l2 = #format("Seen ", x.seen, " time", "" if x.seen == 1 else "s", ", last on ", when)
+        if #len(nick) > 0:
+            l2 = #format(mname, "  ·  ", l2)
+        _ = btui.text(btui.BODY_MEDIUM, tx, ci.y + 26.0, l2, t.on_surface_variant)
+        string8 bk = k.text(x.backup)
+        string8 fw = k.text(x.firmware)
+        string8 l3 = "No backup yet"
+        if #len(bk) > 0:
+            l3 = #format("Last backup ", stamp_words(strings.trim_suffix(path.base(bk), ".img")))
+        if #len(fw) > 0:
+            l3 = #format("Firmware ", fw, "  ·  ", l3)
+        _ = btui.text(btui.BODY_SMALL, tx, ci.y + 48.0, l3, t.on_surface_variant)
+        f32 bx = btui.right(ci)
+        f32 fw2 = btui.button_width("Forget", "", btui.BTN_TEXT)
+        bx = bx - fw2
+        if btui.button("Forget", btui.rect(bx, btui.cy(c) - 20.0, fw2, 40.0), btui.BTN_TEXT, "", job_busy(), #format("forget", ii)):
+            using app_keep():
+                #delete(g_forget_id)
+                g_forget_id = strings.clone(id)
+            btui.dialog_open("forget")
+        f32 rw = btui.button_width("Rename", "edit", btui.BTN_TONAL)
+        bx = bx - 8.0 - rw
+        if btui.button("Rename", btui.rect(bx, btui.cy(c) - 20.0, rw, 40.0), btui.BTN_TONAL, "edit", job_busy(), #format("rename", ii)):
+            rename_open(id, nick)
+    btui.pop_clip()
+    #delete(order)
+    (btui.Rect db, bool open) = btui.dialog_begin("forget", "Forget this radio?", 440.0, 64.0, "delete")
+    if open:
+        _ = btui.text_wrap(db, btui.BODY_MEDIUM, "beautalks forgets its name and how it answers. Its backups stay in the backups folder.", t.on_surface_variant)
+        btui.Rect acts = btui.dialog_actions(db)
+        f32 w1 = btui.button_width("Forget", "", btui.BTN_TEXT)
+        if btui.button("Forget", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT):
+            btui.dialog_close()
+            if radio.forget_radio(&reg, g_forget_id) && radio.save_registry(&reg):
+                btui.snackbar_show("Forgotten")
+        f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+        if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+            btui.dialog_close()
+        btui.dialog_end()
+
+// ── Backups ──────────────────────────────────────────────────────────────────
+
+type BackupFile:
+    ref []char8 model
+    ref []char8 file
+    ref []char8 name
+
+ref []BackupFile g_backups
+f64 g_backups_t = -100.0
+btui.Scroll g_bk_scroll
+
+private void backups_scan():
+    using app_keep():
+        for b in g_backups:
+            #delete(b.model)
+            #delete(b.file)
+            #delete(b.name)
+        #delete(g_backups)
+        g_backups = nil
+        string8 root = path.join(g_data_dir, "backups")
+        try fs.Listing l = fs.read_dir(root) else:
+            return
+        for e in l.entries:
+            if !e.is_dir:
+                continue
+            string8 md = path.join(root, e.path)
+            try fs.Listing l2 = fs.read_dir(md) else:
+                continue
+            for f in l2.entries:
+                if strings.ends_with(f.path, ".img"):
+                    BackupFile b
+                    b.model = strings.clone(e.path)
+                    b.file = path.join(md, f.path)
+                    b.name = strings.clone(strings.trim_suffix(f.path, ".img"))
+                    g_backups = #append(g_backups, b)
+            l2.destroy()
+        l.destroy()
+        // model, then newest first (names are UTC stamps)
+        for i in 1..<#len(g_backups):
+            BackupFile v = g_backups[i]
+            i64 j = i - 1
+            for j >= 0 && (strings.compare(g_backups[j].model, v.model) > 0 || (eq_s(g_backups[j].model) == eq_s(v.model) && strings.compare(g_backups[j].name, v.name) < 0)):
+                g_backups[j + 1] = g_backups[j]
+                j -= 1
+            g_backups[j + 1] = v
+
+// Open a backup as the document (restore = open, then write).
+private bool open_backup(BackupFile b):
+    i64 mi = model_index(b.model)
+    if mi < 0:
+        btui.snackbar_show(#format("No model definition for ", b.model))
+        return false
+    try ref []u8 img = radio.load_image(b.file) else:
+        btui.snackbar_show("The backup could not be read.")
+        return false
+    if #len(img) != g_models[mi].image_size:
+        btui.snackbar_show("This backup doesn't match its model's image size.")
+        #delete(img)
+        return false
+    doc_open(mi, img, SRC_BACKUP, #format("Backup ", b.name), b.file)
+    #delete(img)
+    return true
+
+void backups_page(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 32.0)
+    page_header(body, "Backups", "A copy of the radio is kept every time beautalks reads it or writes to it.")
+    if btui.now() - g_backups_t > 2.0:
+        backups_scan()
+        g_backups_t = btui.now()
+    f32 ow = btui.button_width("Open folder", "folder_open", btui.BTN_TEXT)
+    if btui.button("Open folder", btui.rect(btui.right(body) - ow, body.y + 8.0, ow, 40.0), btui.BTN_TEXT, "folder_open"):
+        reveal(path.join(g_data_dir, "backups"))
+    btui.Rect lst = btui.rect(body.x, body.y + 80.0, body.w, body.h - 80.0)
+    if #len(g_backups) == 0:
+        empty_state(lst, "history", "No backups yet", "Read a radio and its backup appears here.", "Go to Radio")
+        return
+    // rows, with a model heading when the model changes
+    f32 y = lst.y - g_bk_scroll.y
+    f32 total = 0.0
+    btui.push_clip(lst)
+    string8 last = ""
+    for i in 0..<#len(g_backups):
+        BackupFile b = g_backups[i]
+        if eq_s(b.model) != last:
+            last = b.model
+            i64 mi = model_index(b.model)
+            string8 bm = b.model
+            _ = btui.text(btui.TITLE_SMALL, lst.x, y + 12.0, model_label(mi) if mi >= 0 else bm, t.primary)
+            y = y + 44.0
+            total = total + 44.0
+        btui.Rect rr = btui.rect(lst.x, y, lst.w, 56.0)
+        btui.icon("description", rr.x + 8.0, rr.y + 16.0, 24.0, t.on_surface_variant)
+        _ = btui.text(btui.BODY_LARGE, rr.x + 48.0, rr.y + 8.0, stamp_words(b.name), t.on_surface)
+        string8 bf = path.base(b.file)
+        _ = btui.text(btui.BODY_SMALL, rr.x + 48.0, rr.y + 32.0, bf, t.on_surface_variant)
+        f32 rw = btui.button_width("Restore", "settings_backup_restore", btui.BTN_TONAL)
+        if btui.button("Restore", btui.rect(btui.right(rr) - rw, rr.y + 8.0, rw, 40.0), btui.BTN_TONAL, "settings_backup_restore", job_busy(), #format("rest", i)):
+            if open_backup(b):
+                write_flow_open_image(g_doc.base)
+                g_wf_restoring = true
+        f32 opw = btui.button_width("Open", "", btui.BTN_TEXT)
+        if btui.button("Open", btui.rect(btui.right(rr) - rw - 8.0 - opw, rr.y + 8.0, opw, 40.0), btui.BTN_TEXT, "", false, #format("open", i)):
+            if open_backup(b):
+                g_page = PAGE_CHANNELS
+        btui.divider(rr.x, btui.right(rr), rr.y + 55.0)
+        y = y + 56.0
+        total = total + 56.0
+    btui.pop_clip()
+    _ = btui.scroll_update(lst, &g_bk_scroll, total)
+    btui.scrollbar("bk", lst, &g_bk_scroll)
+
+// A backup's name, "20261109T030929Z" (or "20261108-140233"), in words:
+// "9 Nov 2026, 03:09 UTC". Anything else is shown as it is.
+string8 stamp_words(string8 s):
+    if #len(s) < 15 || (s[8] != 'T' && s[8] != '-'):
+        return s
+    for i in 0..<15:
+        if i != 8 && (s[i] < '0' || s[i] > '9'):
+            return s
+    i64 y = radio.parse_num(s[0..<4], 0)
+    i64 mo = radio.parse_num(s[4..<6], 0)
+    i64 d = radio.parse_num(s[6..<8], 0)
+    i64 h = radio.parse_num(s[9..<11], 0)
+    i64 mi = radio.parse_num(s[11..<13], 0)
+    return date_words(y, mo, d, h, mi)
+
+// ── Settings / About ─────────────────────────────────────────────────────────
+
+ref []char8 g_upd_text
+
+void settings_job_done(^Job j):
+    using app_keep():
+        #delete(g_upd_text)
+        g_upd_text = strings.clone(j.message)
+    btui.snackbar_show("Driver update finished" if j.err == JERR_NONE else "Driver update failed")
+
+private void start_update(i32 kind):
+    if job_busy():
+        return
+    ^Job j = job_prepare(kind)
+    using app_keep():
+        j.data_dir = strings.clone(g_data_dir)
+    job_start()
+
+void settings_page(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 32.0)
+    page_header(body, "Settings", "")
+    f32 colw = (body.w - 24.0) * 0.5
+    f32 y = body.y + 56.0
+    // appearance
+    btui.Rect a = btui.rect(body.x, y, colw, 150.0)
+    _ = btui.card(a, btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, a.x + 24.0, a.y + 20.0, "Appearance", t.on_surface)
+    [3]string8 th = ["Like the system", "Light", "Dark"]
+    if btui.segmented("theme", btui.rect(a.x + 24.0, a.y + 64.0, colw - 48.0, 40.0), th[:], &g_theme_choice):
+        if g_theme_choice == 0:
+            btui.follow_system_theme()
+        else:
+            btui.set_dark(g_theme_choice == 2)
+    // folders
+    btui.Rect f = btui.rect(body.x, y + 174.0, colw, 230.0)
+    _ = btui.card(f, btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, f.x + 24.0, f.y + 20.0, "Folders", t.on_surface)
+    folder_row(f.x + 24.0, f.y + 60.0, colw - 48.0, "Data (backups, radios, test records)", g_data_dir, "data")
+    folder_row(f.x + 24.0, f.y + 140.0, colw - 48.0, "Library (profiles)", g_library_dir, "lib")
+    // drivers
+    btui.Rect d = btui.rect(body.x + colw + 24.0, y, colw, 230.0)
+    _ = btui.card(d, btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, d.x + 24.0, d.y + 20.0, "Radio drivers", t.on_surface)
+    updater.Config c = updater.default_config()
+    string8 active = "the drivers that came with beautalks"
+    ref []char8 ad = nil
+    try ad = updater.active_dir(c) else:
+        ad = nil
+    if ad != nil && fs.is_dir(ad):
+        active = #format("updated set in ", ad)
+    _ = btui.text_wrap(btui.rect(d.x + 24.0, d.y + 52.0, colw - 48.0, 44.0), btui.BODY_MEDIUM, #format("In use: ", active), t.on_surface_variant)
+    if #len(g_upd_text) == 0:
+        _ = btui.text_wrap(btui.rect(d.x + 24.0, d.y + 100.0, colw - 48.0, 60.0), btui.BODY_SMALL, "Drivers teach beautalks how to talk to each radio model. Updates come from the beautalks project; if a new set misbehaves, go back to the previous one.", t.on_surface_variant)
+    else:
+        _ = btui.text_wrap(btui.rect(d.x + 24.0, d.y + 100.0, colw - 48.0, 60.0), btui.BODY_SMALL, g_upd_text, t.on_surface_variant)
+    f32 uw = btui.button_width("Check for updates", "download", btui.BTN_TONAL)
+    if btui.button("Check for updates", btui.rect(d.x + 24.0, btui.bottom(d) - 60.0, uw, 40.0), btui.BTN_TONAL, "download", job_busy()):
+        start_update(JOB_UPDATE)
+    f32 rw = btui.button_width("Go back to the previous set", "", btui.BTN_TEXT)
+    if btui.button("Go back to the previous set", btui.rect(d.x + 24.0 + uw + 8.0, btui.bottom(d) - 60.0, rw, 40.0), btui.BTN_TEXT, "", job_busy()):
+        start_update(JOB_ROLLBACK)
+    if job_busy() && job().kind >= JOB_UPDATE:
+        btui.progress_linear(btui.rect(d.x + 24.0, btui.bottom(d) - 12.0, colw - 48.0, 4.0), -1.0)
+    // about
+    btui.Rect ab = btui.rect(body.x + colw + 24.0, y + 254.0, colw, 300.0)
+    _ = btui.card(ab, btui.CARD_OUTLINED)
+    f32 iw = btui.image("wordmark-dark" if btui.is_dark() else "wordmark", ab.x + 24.0, ab.y + 20.0, 28.0)
+    _ = iw
+    _ = btui.text(btui.BODY_MEDIUM, ab.x + 24.0, ab.y + 60.0, #format("Version ", app_version(), "  ·  ", #len(g_models), " radio models"), t.on_surface)
+    [5]string8 lic = ["beautalks is free software under the GNU GPL, version 3 or later.", "Radio protocol knowledge comes from CHIRP (GPLv3); thank you to its authors.", "Inter typeface: SIL Open Font License 1.1 (The Inter Project Authors).", "Material Symbols: Apache License 2.0 (Google).", "Built with Dado and sokol (zlib)."]
+    for i in 0..<5:
+        _ = btui.text_wrap(btui.rect(ab.x + 24.0, ab.y + 96.0 + f32(i32(i)) * 40.0, colw - 48.0, 40.0), btui.BODY_SMALL, lic[i], t.on_surface_variant)
+
+private void folder_row(f32 x, f32 y, f32 w, string8 label, string8 dir, string8 key):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.text(btui.LABEL_LARGE, x, y, label, t.on_surface)
+    btui.text_in(btui.rect(x, y + 24.0, w - 120.0, 24.0), btui.BODY_SMALL, dir, t.on_surface_variant)
+    f32 bw = btui.button_width("Show", "folder_open", btui.BTN_TEXT)
+    if btui.button("Show", btui.rect(x + w - bw, y + 8.0, bw, 40.0), btui.BTN_TEXT, "folder_open", false, key):
+        reveal(dir)

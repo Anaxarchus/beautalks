@@ -151,7 +151,7 @@ pass.
 * handshake, magics, scramble and regions, all read from the model INI
 * download, and upload (upload is untested on hardware)
 
-`dado test driverhost` runs it against an in-memory UV-5RM that serves `testdata/uv5rm_backup.img`
+`dado test driverhost` runs it against an in-memory UV-5RM that serves `testdata/uv5rm.img`
 scrambled, as the radio sends it. The test checks:
 * the download matches the backup byte for byte
 * the upload round-trips

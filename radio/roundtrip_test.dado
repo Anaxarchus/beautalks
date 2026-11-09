@@ -7,6 +7,9 @@
 package radio
 
 import "core:fmt"
+import "core:os"
+import "core:os/fs"
+import "core:path"
 
 bool roundtrip(^const Model m, string8 file):
     try ref []u8 img = load_image(file) else:
@@ -82,6 +85,20 @@ i32 test():
     i64 b = find_model(models, "UV-5R")
     if a < 0 || b < 0:
         return 1
-    bool ok = roundtrip(&models[a], "testdata/uv5rm_backup.img")
-    ok = roundtrip(&models[b], "testdata/uv5re_backup.img") && ok
+    bool ok = roundtrip(&models[a], "testdata/uv5rm.img")
+    ok = roundtrip(&models[b], "testdata/uv5re.img") && ok
+    // optional: the real backups, outside the repository
+    ref []char8 priv = nil
+    try priv = os.get_env("BEAUTALKS_PRIVATE_IMAGES") else:
+        priv = nil
+    if #len(priv) != 0:
+        ref []char8 pm = path.join(priv, "uv5rm_backup.img")
+        ref []char8 pr = path.join(priv, "uv5re_backup.img")
+        if fs.exists(pm):
+            ok = roundtrip(&models[a], pm) && ok
+        if fs.exists(pr):
+            ok = roundtrip(&models[b], pr) && ok
+        #delete(pm)
+        #delete(pr)
+    #delete(priv)
     return 0 if ok else 1

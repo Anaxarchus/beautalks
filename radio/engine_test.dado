@@ -1,0 +1,183 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The engines end to end over a pty against tools/emu.py: download, the
+// untested-write refusal, a guarded write with the user's override, read
+// back, detection, and the UV-5R upload guards.
+package radio
+
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+// Starts the emulator for `model_ini` serving `image`; `dump` receives its
+// memory after every write.
+bool start_emu(string8 model_ini, string8 image, string8 dump, string8 port_file, ^Emu out):
+    if fs.exists(port_file):
+        try fs.remove_file(port_file) else:
+            return false
+    [13]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--dump", dump, "--port-file", port_file, "--stats", "build/emu.stats", "")
+    try out^.d = proc.duplex(argv[0..<12]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists(port_file):
+            try out^.port = fs.read_file(port_file) else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+// A counter from the emulator's --stats file, -1 when unreadable.
+i64 emu_count(string8 key):
+    try ref []char8 t = fs.read_file("build/emu.stats") else:
+        return -1
+    defer #delete(t)
+    string8 s = t
+    string8 piece
+    strings.Splitter it = strings.splitter(s, "\n")
+    for strings.split_next(&it, &piece):
+        (string8 k, string8 v, bool found) = strings.split_first(piece, " ")
+        if found && k == key:
+            return parse_num(v, -1)
+    return -1
+
+void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        _ = 0
+    #delete(e^.port)
+
+bool round(^const Model m, string8 ini, string8 image, ref []u8 changed):
+    bool ok = true
+    Emu e
+    string8 dump = "build/emu_dump.img"
+    if !start_emu(ini, image, dump, "build/emu.port", &e):
+        return #expect(false, "emulator did not start")
+    try SerialLink l = open_serial(e.port, m^.baud) else:
+        stop_emu(&e)
+        return #expect(false, "cannot open the pty")
+    try ref []u8 got = download(&l, m, no_progress()) else why:
+        close_serial(&l)
+        stop_emu(&e)
+        return #expect(false, ini, ": download failed ", link_error_message(why))
+    try ref []u8 orig = load_image(image) else:
+        return false
+    ok = #expect(images_equal(got, orig), ini, ": download equals the backup") && ok
+    #delete(got)
+    i64 idents_before = emu_count("idents_accepted")
+    ok = #expect(idents_before == 1, ini, ": one ident for the download, got ", idents_before) && ok
+    // an untested model and no override: refused before a byte is sent
+    // (the same definition with `tested` forced to untested; the bundled
+    // UV-5RM and UV-5R are tested = write since the owner's hardware runs)
+    Model untested = m^
+    untested.tested = Tested.UNTESTED
+    bool was_refused = false
+    try upload(&l, &untested, changed, false, no_progress()) else why:
+        ok = #expect(why == LinkError.UNTESTED, ini, ": refusal is UNTESTED") && ok
+        was_refused = true
+    ok = #expect(was_refused, ini, ": untested upload refused") && ok
+    // the user's explicit override: backup, write, read back, compare
+    string8 bk = "build/emu_backup.img"
+    try safe_write(&l, m, changed, true, bk, 100, nil, nil, no_progress()) else why:
+        ok = #expect(false, ini, ": safe_write failed ", link_error_message(why)) && ok
+    // one session for backup + write + verify: the UV-17Pro reuses the
+    // download's open session (no ident at all); the UV-5R, whose session
+    // timed out meanwhile, needs exactly one new magic
+    i64 want = idents_before if m^.engine == "uv17pro" else idents_before + 1
+    ok = #expect(emu_count("idents_accepted") == want, ini, ": safe_write idents ", emu_count("idents_accepted") - idents_before) && ok
+    try ref []u8 backup = load_image(bk) else:
+        return false
+    ok = #expect(images_equal(backup, orig), ini, ": the backup is the radio's old memory") && ok
+    try ref []u8 radio_now = load_image(dump) else:
+        return false
+    ok = #expect(verify_mismatch(m, changed, radio_now) < 0, ini, ": the radio holds the new channels") && ok
+    #delete(backup)
+    #delete(radio_now)
+    #delete(orig)
+    close_serial(&l)
+    stop_emu(&e)
+    return ok
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    ^const Model rm = &models[find_model(models, "UV-5RM")]
+    ^const Model re = &models[find_model(models, "UV-5R")]
+    bool ok = true
+
+    // a change on each radio: channel 3 renamed, power and tone changed
+    try ref []u8 a = load_image("testdata/uv5rm.img") else:
+        return 1
+    try Channel c = decode_channel(rm, a, 3) else:
+        return 1
+    set_channel_name(&c, "CHANGED")
+    c.power = 1
+    try encode_channel(rm, a, &c) else:
+        return 1
+    ok = round(rm, "models/uv-5rm.ini", "testdata/uv5rm.img", a) && ok
+    #delete(a)
+
+    try ref []u8 b = load_image("testdata/uv5re.img") else:
+        return 1
+    try Channel d = decode_channel(re, b, 3) else:
+        return 1
+    d.tx_hz = 467612500
+    set_channel_name(&d, "EDITED")
+    try encode_channel(re, b, &d) else:
+        return 1
+    ok = round(re, "models/uv-5r.ini", "testdata/uv5re.img", b) && ok
+
+    // detection, then a download that continues the detected session
+    Emu e
+    if start_emu("models/uv-5r.ini", "testdata/uv5re.img", "build/emu_dump.img", "build/emu.port", &e):
+        Detection det
+        try det = detect(e.port, models, no_progress()) else:
+            det.found = false
+        ok = #expect(det.found && det.engine == "uv5r" && #len(det.candidates) > 0 && models[det.candidates[0]].id == "uv-5r", "detect picks uv-5r first") && ok
+        if det.found:
+            ref []u8 img = nil
+            try img = download_detected(&det, re, no_progress()) else:
+                img = nil
+            try ref []u8 orig = load_image("testdata/uv5re.img") else:
+                return 1
+            ok = #expect(img != nil && images_equal(img, orig), "download after detect") && ok
+            #delete(img)
+            #delete(orig)
+        close_detection(&det)
+        stop_emu(&e)
+
+    i32 refused = 0
+    // UV-5R guard: an image from a 220 MHz radio is refused by a normal one
+    b[3] = 0x02
+    if start_emu("models/uv-5r.ini", "testdata/uv5re.img", "build/emu_dump.img", "build/emu.port", &e):
+        try SerialLink l = open_serial(e.port, 9600) else:
+            return 1
+        try upload(&l, re, b, true, no_progress()) else why:
+            ok = #expect(why == LinkError.IMAGE_MISMATCH, "220 MHz image refused: ", link_error_message(why)) && ok
+            refused += 1
+        close_serial(&l)
+        stop_emu(&e)
+    b[3] = 0x04
+    // UV-5R guard: an image whose firmware says BFB250 ("original") vs a new radio
+    b[0x1838] = u8('B')
+    b[0x1839] = u8('F')
+    b[0x183A] = u8('B')
+    b[0x183B] = u8('2')
+    b[0x183C] = u8('5')
+    b[0x183D] = u8('0')
+    if start_emu("models/uv-5r.ini", "testdata/uv5re.img", "build/emu_dump.img", "build/emu.port", &e):
+        try SerialLink l = open_serial(e.port, 9600) else:
+            return 1
+        try upload(&l, re, b, true, no_progress()) else why:
+            ok = #expect(why == LinkError.IMAGE_MISMATCH, "original-firmware image refused: ", link_error_message(why)) && ok
+            refused += 1
+        close_serial(&l)
+        stop_emu(&e)
+    ok = #expect(refused == 2, "both guarded uploads were refused: ", refused) && ok
+    #delete(b)
+    return 0 if ok else 1

@@ -1,0 +1,193 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Profiles (model-independent channel lists) moved between the owner's two
+// radios, and the diagnostics the destination produces.
+package radio
+
+import "core:strings"
+
+i64 count_code(^Report rep, DiagCode code):
+    i64 n = 0
+    for d in rep^.diags:
+        if d.code == code:
+            n += 1
+    return n
+
+// The first diagnostic with `code`, or one with code 0.
+Diag first_of(^Report rep, DiagCode code):
+    for d in rep^.diags:
+        if d.code == code:
+            return d
+    Diag none
+    return none
+
+const string8 LIBRARY = """
+    set,name,long_name,rx_mhz,tx_mhz,mode,rx_tone,tx_tone,license_note,license,notes,source
+    air,GUARD,Air distress,121.500,,AM,,,,,receive only,test
+    test,LONGNAME12345,,146.520,146.520,FM,,,,,,test
+    test,abc,,446.000,446.000,NFM,,,,,,test
+    test,BADDCS,,446.100,446.100,FM,D024N,D024N,,,,test
+    test,TX300,,146.000,300.000,FM,,,,,,test
+    gmrs,GMRS1,GMRS 1,462.5625,462.5625,FM,,,required,"GMRS licence (FCC)",,test
+    """
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    i64 rmi = find_model(models, "UV-5RM")
+    i64 rei = find_model(models, "UV-5R")
+    if rmi < 0 || rei < 0:
+        return 1
+    ^const Model rm = &models[rmi]
+    ^const Model re = &models[rei]
+    try ref []u8 rm_img = load_image("testdata/uv5rm.img") else:
+        return 1
+    defer #delete(rm_img)
+    try ref []u8 re_img = load_image("testdata/uv5re.img") else:
+        return 1
+    defer #delete(re_img)
+    bool ok = true
+
+    // ── UV-5RE -> UV-5RM: everything fits (1000 slots, 12-char names)
+    ChannelList from_re = extract(re, re_img)
+    defer from_re.destroy()
+    ok = #expect(#len(from_re.entries) == 40, "5RE extract ", #len(from_re.entries)) && ok
+    ref []u8 a = copy_image(rm_img)
+    defer #delete(a)
+    Report r1
+    defer r1.destroy()
+    ApplyOptions fe = default_apply()
+    fe.fill_empty = true
+    apply(&from_re, rm, a, fe, &r1)
+    ok = #expect(r1.placed == 40 && r1.skipped == 0 && r1.changed == 0, "5RE->5RM placed ", r1.placed, " skipped ", r1.skipped, " changed ", r1.changed) && ok
+    // fill-empty keeps the 5RM's 49 channels: the first free slot is the deleted 48
+    Diag p1 = first_of(&r1, DiagCode.PLACED)
+    ok = #expect(p1.slot == 48, "first placed slot ", p1.slot) && ok
+    ok = #expect(used_count(rm, a) == 89, "5RM now holds ", used_count(rm, a)) && ok
+    // the 5RE's repeater (entry 35: 0-based 34) arrives intact
+    i32 rpt_slot = -1
+    for d in r1.diags:
+        if d.code == DiagCode.PLACED && d.entry == 34:
+            rpt_slot = d.slot
+    try Channel moved = decode_channel(rm, a, rpt_slot) else:
+        return 1
+    ok = #expect(moved.rx_hz == 146940000 && moved.tx_hz == 146340000 && channel_name(&moved) == "2M RPT" && moved.tx_tone.value == 1000 && moved.bcl, "repeater moved to ", rpt_slot) && ok
+
+    // ── UV-5RM -> UV-5R: 128 slots, 7-char upper-case names, High/Low, no airband
+    ChannelList from_rm = extract(rm, rm_img)
+    defer from_rm.destroy()
+    ok = #expect(#len(from_rm.entries) == 49, "5RM extract ", #len(from_rm.entries)) && ok
+    ref []u8 b = #make([]u8, re^.image_size)
+    defer #delete(b)
+    fill(b, 0, re^.image_size, 0xFF)
+    Report r2
+    defer r2.destroy()
+    apply(&from_rm, re, b, default_apply(), &r2)
+    ok = #expect(r2.placed == 48 && r2.skipped == 1, "5RM->5R placed ", r2.placed, " skipped ", r2.skipped) && ok
+    Diag air2 = first_of(&r2, DiagCode.RX_OUT_OF_BAND)
+    ok = #expect(air2.entry == 46 && air2.severity == Severity.ERROR, "AIR GUARD skipped") && ok
+    ok = #expect(count_code(&r2, DiagCode.NAME_TRUNCATED) == 2, "two names shortened (LONGNAME1234, 70CM CALL): ", count_code(&r2, DiagCode.NAME_TRUNCATED)) && ok
+    Diag lg = first_of(&r2, DiagCode.NAME_TRUNCATED)
+    ok = #expect(r2.text(lg.new_value) == "70CM CA", "first shortened name ", r2.text(lg.new_value)) && ok
+    ok = #expect(count_code(&r2, DiagCode.POWER_MAPPED) == 2, "two Medium channels mapped: ", count_code(&r2, DiagCode.POWER_MAPPED)) && ok
+    Diag pm = first_of(&r2, DiagCode.POWER_MAPPED)
+    ok = #expect(r2.text(pm.old_value) == "Medium" && r2.text(pm.new_value) == "Low" && pm.field == FieldId.POWER, "Medium -> Low") && ok
+    // packed from slot 0: entry 43 (the 5RM's ch44, D754I) is slot 43
+    try Channel d43 = decode_channel(re, b, 43) else:
+        return 1
+    ok = #expect(d43.rx_tone.kind == ToneKind.DCS && d43.rx_tone.value == 754 && d43.rx_tone.inverted, "D754I moved to slot 43") && ok
+    try Channel d32 = decode_channel(re, b, 32) else:
+        return 1
+    ok = #expect(d32.tx_hz < 0 && !d32.scan && channel_name(&d32) == "WX1", "receive-only WX1 kept TX off") && ok
+
+    // ── overflow: 40 channels from slot 100 of a 128-slot radio
+    ref []u8 c = copy_image(re_img)
+    defer #delete(c)
+    Report r3
+    defer r3.destroy()
+    ApplyOptions late = default_apply()
+    late.start = 100
+    apply(&from_re, re, c, late, &r3)
+    ok = #expect(r3.placed == 28 && count_code(&r3, DiagCode.NO_FREE_SLOT) == 12, "overflow placed ", r3.placed, " no-slot ", count_code(&r3, DiagCode.NO_FREE_SLOT)) && ok
+
+    // ── a channel library onto the UV-5R (no airband, 7-char upper-case names, High/Low)
+    ref []CsvProblem probs = nil
+    defer #delete(probs)
+    ChannelList lib = list_from_csv(LIBRARY, &probs)
+    defer lib.destroy()
+    ok = #expect(#len(probs) == 0 && #len(lib.entries) == 6, "library parsed ", #len(lib.entries), " problems ", #len(probs)) && ok
+    ref []u8 d = copy_image(re_img)
+    defer #delete(d)
+    Report r4
+    defer r4.destroy()
+    ApplyOptions at100 = default_apply()
+    at100.start = 100
+    apply(&lib, re, d, at100, &r4)
+    Diag air = first_of(&r4, DiagCode.RX_OUT_OF_BAND)
+    // messages for people: short MHz, band ranges, sentence case
+    strings.Builder mb = strings.builder(128)
+    diag_message(&r4, air, &mb)
+    string8 msg = strings.text(mb)
+    ok = #expect(msg == "121.5 MHz is outside the radio's receive range (130–176, 220–260, 400–520 MHz); skipped", "message: ", msg) && ok
+    #delete(mb)
+    Diag licd = first_of(&r4, DiagCode.LICENSE_NOTE)
+    strings.Builder lb = strings.builder(64)
+    diag_message(&r4, licd, &lb)
+    string8 lmsg = strings.text(lb)
+    ok = #expect(lmsg == "Licence: GMRS licence (FCC)", "licence message: ", lmsg) && ok
+    #delete(lb)
+    ok = #expect(air.severity == Severity.ERROR && air.entry == 0 && air.field == FieldId.RX, "airband skipped on UV-5R") && ok
+    Diag tr = first_of(&r4, DiagCode.NAME_TRUNCATED)
+    ok = #expect(tr.entry == 1 && r4.text(tr.new_value) == "LONGNAM" && r4.text(tr.old_value) == "LONGNAME12345", "name truncated to ", r4.text(tr.new_value)) && ok
+    Diag lc = first_of(&r4, DiagCode.NAME_CHARS)
+    ok = #expect(lc.entry == 2 && r4.text(lc.new_value) == "ABC", "lower case replaced: ", r4.text(lc.new_value)) && ok
+    ok = #expect(count_code(&r4, DiagCode.TONE_UNSUPPORTED) == 2, "D024 removed both ways") && ok
+    Diag tx = first_of(&r4, DiagCode.TX_OUT_OF_BAND)
+    ok = #expect(tx.entry == 4 && tx.severity == Severity.WARNING && tx.field == FieldId.TX, "TX 300 MHz -> receive only") && ok
+    Diag lic = first_of(&r4, DiagCode.LICENSE_NOTE)
+    ok = #expect(lic.entry == 5 && lic.severity == Severity.INFO, "licence note is info") && ok
+    ok = #expect(r4.placed == 5 && r4.skipped == 1 && r4.count(Severity.ERROR) == 1, "library on UV-5R placed ", r4.placed, " skipped ", r4.skipped) && ok
+
+    // ── the same library onto the UV-5RM: airband is AM there, 12 chars fit
+    ref []u8 e = copy_image(rm_img)
+    defer #delete(e)
+    Report r5
+    defer r5.destroy()
+    ApplyOptions at500 = default_apply()
+    at500.start = 500
+    apply(&lib, rm, e, at500, &r5)
+    ok = #expect(r5.placed == 6 && r5.skipped == 0, "library on UV-5RM placed ", r5.placed) && ok
+    Diag tr5 = first_of(&r5, DiagCode.NAME_TRUNCATED)
+    ok = #expect(r5.text(tr5.new_value) == "LONGNAME1234", "12-char name ", r5.text(tr5.new_value)) && ok
+    try Channel g = decode_channel(rm, e, 500) else:
+        return 1
+    ok = #expect(g.rx_hz == 121500000 && g.mode == Mode.AM && g.tx_hz < 0, "GUARD on 5RM is AM, receive only") && ok
+    ok = #expect(count_code(&r5, DiagCode.NAME_CHARS) == 0, "5RM takes lower case") && ok
+
+    // ── medium power onto a High/Low radio
+    (i64 pi, bool exact) = map_power(re, Level.MEDIUM)
+    ok = #expect(!exact && power_name(re, pi) == "Low", "Medium -> ", power_name(re, pi)) && ok
+
+    // ── keep slots: a duplicate and a slot the model does not have
+    ChannelList two
+    defer two.destroy()
+    Entry x
+    x.slot = 5
+    x.rx_hz = 146520000
+    x.tx_hz = 146520000
+    x.scan = true
+    two.entries = #append(two.entries, x)
+    two.entries = #append(two.entries, x)
+    x.slot = 200
+    two.entries = #append(two.entries, x)
+    ref []u8 f = copy_image(re_img)
+    defer #delete(f)
+    Report r6
+    defer r6.destroy()
+    ApplyOptions keep = default_apply()
+    keep.keep_slots = true
+    apply(&two, re, f, keep, &r6)
+    ok = #expect(count_code(&r6, DiagCode.DUPLICATE_SLOT) == 1 && count_code(&r6, DiagCode.SLOT_OUT_OF_RANGE) == 1 && r6.placed == 1, "keep-slots duplicate/out of range") && ok
+    return 0 if ok else 1

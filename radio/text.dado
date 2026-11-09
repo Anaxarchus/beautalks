@@ -142,3 +142,42 @@ bool parse_mode(string8 text, ^Mode out):
         out^ = Mode.AM
         return true
     return false
+
+// ── for people ───────────────────────────────────────────────────────────────
+
+// 30500000 -> "30.5", 446000000 -> "446", 462562500 -> "462.5625" (MHz,
+// trailing zeros dropped). Values just under a whole number from a band
+// limit (135.999999) read as the whole number.
+void append_mhz_short(^strings.Builder b, i64 hz):
+    i64 v = hz
+    if (v + 1) % 1000 == 0:
+        v += 1
+    append_int(b, v / 1000000)
+    i64 frac = v % 1000000
+    if frac == 0:
+        return
+    [6]char8 d
+    for i in 0..<6:
+        d[5 - i] = char8(i64('0') + frac % 10)
+        frac /= 10
+    i64 n = 6
+    for n > 0 && d[n - 1] == '0':
+        n -= 1
+    strings.append_char(b, '.')
+    for i in 0..<n:
+        strings.append_char(b, d[i])
+
+// "108-135.999999 136-174" -> "108–136, 136–174 MHz"
+void append_bands(^strings.Builder b, string8 bands):
+    i64 n = word_count(bands)
+    if n == 0:
+        strings.append(b, "any frequency")
+        return
+    for i in 0..<n:
+        (i64 lo, i64 hi) = band_at(bands, i)
+        if i > 0:
+            strings.append(b, ", ")
+        append_mhz_short(b, lo)
+        strings.append(b, "–")
+        append_mhz_short(b, hi)
+    strings.append(b, " MHz")

@@ -1,0 +1,125 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Decodes the synthetic fixtures (tools/make_fixtures.py) and checks known
+// channels. With BEAUTALKS_PRIVATE_IMAGES set to a directory holding real
+// radio backups (uv5rm_backup.img, uv5re_backup.img; never committed), they
+// are decoded too (counts only, nothing about their contents is asserted).
+package radio
+
+import "core:os"
+import "core:os/fs"
+import "core:path"
+
+bool tone_is(Tone t, ToneKind k, i32 v, bool inv):
+    return t.kind == k && t.value == v && t.inverted == inv
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    i64 mi = find_model(models, "UV-5RM")
+    i64 ri = find_model(models, "UV-5RE")
+    bool ok = #expect(mi >= 0 && ri >= 0, "UV-5RM and UV-5R (alias UV-5RE) found")
+    if !ok:
+        return 1
+    ^const Model m = &models[mi]
+    ^const Model r = &models[ri]
+
+    // ── UV-5RM fixture
+    try ref []u8 img = load_image("testdata/uv5rm.img") else:
+        return 1
+    ok = #expect(#len(img) == m^.image_size, "5RM image size ", #len(img)) && ok
+    ok = #expect(used_count(m, img) == 49, "5RM used ", used_count(m, img)) && ok
+    try Channel c1 = decode_channel(m, img, 1) else:
+        return 1
+    ok = #expect(c1.rx_hz == 462562500 && c1.tx_hz == 462562500 && channel_name(&c1) == "FRS 1", "ch1 FRS 1") && ok
+    ok = #expect(power_name(m, i64(c1.power)) == "Low" && c1.mode == Mode.FM && c1.scan && !c1.bcl, "ch1 Low FM scan") && ok
+    try Channel c8 = decode_channel(m, img, 8) else:
+        return 1
+    ok = #expect(c8.mode == Mode.NFM && c8.rx_hz == 467562500, "ch8 NFM (CHIRP: bit 6 set = NFM)") && ok
+    try Channel c23 = decode_channel(m, img, 23) else:
+        return 1
+    ok = #expect(c23.rx_hz == 462550000 && c23.tx_hz == 467550000 && tone_is(c23.rx_tone, ToneKind.CTCSS, 1413, false) && tone_is(c23.tx_tone, ToneKind.CTCSS, 1413, false), "ch23 GMRS repeater 141.3 both ways") && ok
+    ok = #expect(power_name(m, i64(c23.power)) == "High", "ch23 High") && ok
+    try Channel c33 = decode_channel(m, img, 33) else:
+        return 1
+    ok = #expect(c33.tx_hz < 0 && !c33.scan && channel_name(&c33) == "WX1", "ch33 WX1 receive only, no scan") && ok
+    try Channel c40 = decode_channel(m, img, 40) else:
+        return 1
+    ok = #expect(power_name(m, i64(c40.power)) == "Medium", "ch40 Medium") && ok
+    try Channel c42 = decode_channel(m, img, 42) else:
+        return 1
+    ok = #expect(c42.rx_hz == 146940000 && c42.tx_hz == 146340000 && c42.rx_tone.kind == ToneKind.OFF && tone_is(c42.tx_tone, ToneKind.CTCSS, 1000, false) && c42.bcl, "ch42 repeater -0.6, tone 100.0 out, BCL") && ok
+    try Channel c43 = decode_channel(m, img, 43) else:
+        return 1
+    ok = #expect(tone_is(c43.rx_tone, ToneKind.DCS, 23, false) && tone_is(c43.tx_tone, ToneKind.DCS, 23, false), "ch43 D023N") && ok
+    try Channel c44 = decode_channel(m, img, 44) else:
+        return 1
+    ok = #expect(tone_is(c44.rx_tone, ToneKind.DCS, 754, true) && tone_is(c44.tx_tone, ToneKind.DCS, 754, true), "ch44 D754I") && ok
+    try Channel c46 = decode_channel(m, img, 46) else:
+        return 1
+    ok = #expect(channel_name(&c46) == "LONGNAME1234", "ch46 12-char name") && ok
+    try Channel c47 = decode_channel(m, img, 47) else:
+        return 1
+    ok = #expect(c47.mode == Mode.AM && c47.rx_hz == 121500000 && c47.tx_hz < 0, "ch47 airband AM") && ok
+    try Channel c48 = decode_channel(m, img, 48) else:
+        return 1
+    ok = #expect(c48.empty, "ch48 deleted (first byte FF, stale bytes after)") && ok
+    try Channel c1000 = decode_channel(m, img, 1000) else:
+        return 1
+    ok = #expect(channel_name(&c1000) == "LAST" && c1000.tx_hz == 445000000, "ch1000") && ok
+    #delete(img)
+
+    // ── UV-5RE fixture
+    try ref []u8 re = load_image("testdata/uv5re.img") else:
+        return 1
+    ok = #expect(used_count(r, re) == 40, "5RE used ", used_count(r, re)) && ok
+    ok = #expect(basetype_matches(r, re) && image_firmware(r, re) == "HN5RV011", "5RE firmware tag") && ok
+    try Channel e0 = decode_channel(r, re, 0) else:
+        return 1
+    ok = #expect(e0.empty, "5RE idx0 empty") && ok
+    try Channel e1 = decode_channel(r, re, 1) else:
+        return 1
+    ok = #expect(e1.rx_hz == 462562500 && channel_name(&e1) == "FRS 1" && e1.mode == Mode.FM, "5RE idx1 FRS 1") && ok
+    try Channel e8 = decode_channel(r, re, 8) else:
+        return 1
+    ok = #expect(e8.mode == Mode.NFM, "5RE idx8 NFM") && ok
+    try Channel e34 = decode_channel(r, re, 34) else:
+        return 1
+    ok = #expect(channel_name(&e34) == "70CMCAL" && power_name(r, i64(e34.power)) == "Low", "5RE idx34 7-char name, Low") && ok
+    try Channel e35 = decode_channel(r, re, 35) else:
+        return 1
+    ok = #expect(e35.rx_hz == 146940000 && e35.tx_hz == 146340000 && tone_is(e35.tx_tone, ToneKind.CTCSS, 1000, false) && e35.bcl, "5RE idx35 repeater") && ok
+    try Channel e37 = decode_channel(r, re, 37) else:
+        return 1
+    ok = #expect(tone_is(e37.rx_tone, ToneKind.DCS, 754, true), "5RE idx37 D754I") && ok
+    try Channel e39 = decode_channel(r, re, 39) else:
+        return 1
+    ok = #expect(e39.empty, "5RE idx39 deleted") && ok
+    try Channel e127 = decode_channel(r, re, 127) else:
+        return 1
+    ok = #expect(channel_name(&e127) == "LAST", "5RE idx127") && ok
+    #delete(re)
+
+    // ── optional: real backups outside the repository
+    ref []char8 priv = nil
+    try priv = os.get_env("BEAUTALKS_PRIVATE_IMAGES") else:
+        priv = nil
+    if #len(priv) != 0:
+        ref []char8 pm = path.join(priv, "uv5rm_backup.img")
+        ref []char8 pr = path.join(priv, "uv5re_backup.img")
+        if fs.exists(pm):
+            try ref []u8 a = load_image(pm) else:
+                return 1
+            ok = #expect(#len(a) == m^.image_size && used_count(m, a) > 0, "private 5RM decodes") && ok
+            #delete(a)
+        if fs.exists(pr):
+            try ref []u8 b = load_image(pr) else:
+                return 1
+            ok = #expect(#len(b) == r^.image_size && used_count(r, b) > 0, "private 5RE decodes") && ok
+            #delete(b)
+        #delete(pm)
+        #delete(pr)
+    #delete(priv)
+    return 0 if ok else 1

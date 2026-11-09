@@ -1,0 +1,575 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Profiles: model-independent channel lists (radio.ChannelList, saved as
+// CSV in <library>/profiles). Create from the radio, blank, or from the
+// channel library; edit; add from the library (sets, filter, "fits this
+// radio" dimming, licence chips); apply to the open radio with placement
+// options and the library's diagnostics (radio.apply + Report), fix inline,
+// then continue into the write flow.
+package main
+
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+const i32 PF_EDIT = 0
+const i32 PF_LIBRARY = 1
+const i32 PF_APPLY = 2
+
+i32 g_pf_mode
+ref []ref []char8 g_pf_files
+i32 g_pf_sel = -1
+radio.ChannelList g_prof
+bool g_prof_open
+bool g_prof_dirty
+ref []char8 g_prof_name
+btui.TableState g_pt
+btui.Scroll g_pf_list_scroll
+
+void profiles_init():
+    using app_keep():
+        g_pt = btui.table_state()
+        g_pt.frozen = 1
+        g_lt = btui.table_state()
+        g_lt.frozen = 1
+        g_at = btui.table_state()
+        g_at.frozen = 1
+        g_at.footer = true
+    profiles_scan()
+
+void profiles_scan():
+    using app_keep():
+        for f in g_pf_files:
+            #delete(f)
+        #delete(g_pf_files)
+        g_pf_files = nil
+        try fs.Listing l = fs.read_dir(profiles_dir()) else:
+            return
+        for e in l.entries:
+            if strings.ends_with(e.path, ".csv"):
+                g_pf_files = #append(g_pf_files, strings.clone(e.path))
+        l.destroy()
+
+private void prof_load(i32 i):
+    using app_keep():
+        try ref []char8 text = fs.read_file(path.join(profiles_dir(), g_pf_files[i])) else:
+            btui.snackbar_show("That profile could not be read.")
+            return
+        if g_prof_open:
+            g_prof.destroy()
+        ref []radio.CsvProblem probs = nil
+        g_prof = radio.list_from_csv(text, &probs)
+        #delete(probs)
+        #delete(text)
+        #delete(g_prof_name)
+        g_prof_name = strings.clone(strings.trim_suffix(g_pf_files[i], ".csv"))
+    g_prof_open = true
+    g_prof_dirty = false
+    g_pf_sel = i
+    g_pf_mode = PF_EDIT
+
+void prof_save():
+    if !g_prof_open:
+        return
+    using app_keep():
+        ref []char8 csv = radio.list_to_csv(&g_prof)
+        string8 file = path.join(profiles_dir(), #format(g_prof_name, ".csv"))
+        try fs.write_file(file, csv) else:
+            btui.snackbar_show(#format("Could not save ", file))
+            #delete(csv)
+            return
+        #delete(csv)
+    g_prof_dirty = false
+    profiles_scan()
+    for i in 0..<#len(g_pf_files):
+        if strings.trim_suffix(g_pf_files[i], ".csv") == eq_s(g_prof_name):
+            g_pf_sel = i32(i)
+    btui.snackbar_show(#format("Saved \"", g_prof_name, "\""))
+
+// A free profile name: "Truck radio", "Truck radio (2)", …
+private ref []char8 free_name(string8 want):
+    ref []char8 n = strings.clone(want)
+    i32 k = 2
+    for fs.exists(path.join(profiles_dir(), #format(n, ".csv"))):
+        #delete(n)
+        n = #format(want, " (", k, ")")
+        k += 1
+    return n
+
+private void prof_new(string8 name):
+    using app_keep():
+        if g_prof_open:
+            g_prof.destroy()
+        radio.ChannelList z
+        g_prof = z
+        #delete(g_prof_name)
+        g_prof_name = free_name(name)
+    g_prof_open = true
+    g_prof_dirty = true
+
+// "Save as profile" from the Channels page: radio.extract of the edited image.
+void profile_from_doc():
+    (ref []u8 img, i32 _, i32 _) = doc_build_image()
+    using app_keep():
+        if g_prof_open:
+            g_prof.destroy()
+        g_prof = radio.extract(doc_model(), img)
+        g_prof.title = g_prof.add_text(#format("from ", model_label(g_doc.mi)))
+        #delete(g_prof_name)
+        g_prof_name = free_name(radio_title())
+    #delete(img)
+    g_prof_open = true
+    prof_save()
+    g_page = PAGE_PROFILES
+    g_pf_mode = PF_EDIT
+
+// ── the profile's table ──────────────────────────────────────────────────────
+
+const i32 P_NUM = 0
+const i32 P_NAME = 1
+const i32 P_RX = 2
+const i32 P_DUP = 3
+const i32 P_OFF = 4
+const i32 P_TXT = 5
+const i32 P_RXT = 6
+const i32 P_POW = 7
+const i32 P_MODE = 8
+const i32 P_NOTE = 9
+
+[4]string8 LEVELS = ["Default", "Low", "Medium", "High"]
+[3]string8 PMODES = ["FM", "NFM", "AM"]
+ref []btui.Column g_pcols
+
+private void pcols():
+    if g_pcols != nil:
+        return
+    using app_keep():
+        g_pcols = #append(g_pcols, btui.column("#", 64.0, btui.COL_INDEX, false))
+        g_pcols = #append(g_pcols, btui.column("Name", 180.0, btui.COL_TEXT))
+        g_pcols = #append(g_pcols, btui.column("RX (MHz)", 124.0, btui.COL_NUM))
+        btui.Column d = btui.column("Duplex", 104.0, btui.COL_CHOICE)
+        d.choices = DUP_NAMES[:]
+        g_pcols = #append(g_pcols, d)
+        g_pcols = #append(g_pcols, btui.column("Offset", 100.0, btui.COL_NUM))
+        g_pcols = #append(g_pcols, btui.column("TX tone", 104.0, btui.COL_CUSTOM))
+        g_pcols = #append(g_pcols, btui.column("RX tone", 104.0, btui.COL_CUSTOM))
+        btui.Column p = btui.column("Power", 104.0, btui.COL_CHOICE)
+        p.choices = LEVELS[:]
+        g_pcols = #append(g_pcols, p)
+        btui.Column m = btui.column("Mode", 88.0, btui.COL_CHOICE)
+        m.choices = PMODES[:]
+        g_pcols = #append(g_pcols, m)
+        g_pcols = #append(g_pcols, btui.column("Licence / note", 170.0, btui.COL_STATUS, false, false))
+
+private radio.Channel entry_as_channel(radio.Entry e):
+    radio.Channel c = radio.empty_channel(1)
+    c.empty = false
+    c.rx_hz = e.rx_hz
+    c.tx_hz = e.tx_hz
+    return c
+
+private string8 ptext(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_prof.entries)):
+        return ""
+    radio.Entry e = g_prof.entries[row]
+    radio.Channel c = entry_as_channel(e)
+    if col == P_NUM:
+        return #format(row + 1)
+    if col == P_NAME:
+        return #format(g_prof.text(e.name))
+    if col == P_RX:
+        return mhz_text(e.rx_hz)
+    if col == P_DUP:
+        return DUP_NAMES[dup_of(&c)]
+    if col == P_OFF:
+        i32 d = dup_of(&c)
+        if d == 1 || d == 2:
+            i64 off = e.tx_hz - e.rx_hz
+            return mhz_text(off if off > 0 else 0 - off)
+        if d == 3:
+            return mhz_text(e.tx_hz)
+        return ""
+    if col == P_TXT:
+        return tone_text(e.tx_tone)
+    if col == P_RXT:
+        return tone_text(e.rx_tone)
+    if col == P_POW:
+        return LEVELS[clampi3(i32(e.power), 0, 3)]
+    if col == P_MODE:
+        return radio.mode_name(e.mode)
+    if col == P_NOTE:
+        string8 lic = g_prof.text(e.license)
+        if #len(lic) > 0:
+            return short_note(lic)
+        (string8 n, i32 _) = service_note(e.rx_hz)
+        return n
+    return ""
+
+i32 clampi3(i32 v, i32 lo, i32 hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+private i32 pdeco(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_prof.entries)):
+        return btui.DECO_NONE
+    radio.Entry e = g_prof.entries[row]
+    if col == P_NOTE:
+        string8 lic = g_prof.text(e.license)
+        if #len(lic) > 0:
+            return btui.DECO_TONE + note_tone2(lic)
+        (string8 _, i32 tone) = service_note(e.rx_hz)
+        return btui.DECO_TONE + tone
+    if (col == P_TXT && e.tx_tone.kind == radio.ToneKind.OFF) || (col == P_RXT && e.rx_tone.kind == radio.ToneKind.OFF):
+        return btui.DECO_DIM
+    if col == P_DUP && e.tx_hz < 0:
+        return btui.DECO_DIM
+    return btui.DECO_NONE
+
+i32 note_tone2(string8 lic):
+    if lic == "rx_only_service" || strings.contains(lic, "eceive"):
+        return btui.TONE_INFO
+    return btui.TONE_NEUTRAL
+
+private string8 pmsg(i32 row, i32 col):
+    if col != P_NOTE || row < 0 || row >= i32(#len(g_prof.entries)):
+        return ""
+    radio.Entry e = g_prof.entries[row]
+    string8 lt = g_prof.text(e.license_text)
+    if #len(lt) > 0:
+        return #format(lt)
+    return service_full(e.rx_hz)
+
+private void papply(btui.TableEvent ev):
+    i32 r = ev.row
+    if r < 0 || r >= i32(#len(g_prof.entries)):
+        return
+    ^radio.Entry e = &g_prof.entries[r]
+    i32 col = ev.col
+    g_prof_dirty = true
+    using app_keep():
+        if ev.kind == btui.TEV_CUSTOM && (col == P_TXT || col == P_RXT):
+            tone_open(e.tx_tone if col == P_TXT else e.rx_tone, r, col, 1)
+            return
+        if ev.kind == btui.TEV_CHOICE:
+            radio.Channel c = entry_as_channel(e^)
+            if col == P_DUP:
+                set_dup_entry(e, ev.choice)
+            else if col == P_POW:
+                e.power = radio.Level(ev.choice)
+            else if col == P_MODE:
+                radio.Mode md
+                if radio.parse_mode(ev.text, &md):
+                    e.mode = md
+            _ = c
+            return
+        if ev.kind != btui.TEV_COMMIT:
+            return
+        string8 txt = strings.trim(ev.text)
+        if col == P_NAME:
+            e.name = g_prof.add_text(txt)
+            return
+        i64 hz = radio.parse_mhz(txt)
+        if hz <= 0:
+            btui.snackbar_show(#format("\"", txt, "\" isn't a frequency. Type it in MHz, like 146.520"))
+            return
+        if col == P_RX:
+            i64 d = e.tx_hz - e.rx_hz
+            bool off = e.tx_hz < 0
+            e.rx_hz = hz
+            if !off:
+                e.tx_hz = hz + d
+        else if col == P_OFF:
+            if e.tx_hz < e.rx_hz && e.tx_hz >= 0:
+                e.tx_hz = e.rx_hz - hz
+            else:
+                e.tx_hz = e.rx_hz + hz
+
+private void set_dup_entry(^radio.Entry e, i32 d):
+    radio.Channel c = entry_as_channel(e^)
+    i64 off = c.tx_hz - c.rx_hz
+    if off < 0:
+        off = 0 - off
+    if c.tx_hz < 0 || off == 0 || off > 10000000:
+        off = band_offset(c.rx_hz)
+    if d == 0:
+        e.tx_hz = e.rx_hz
+    else if d == 1:
+        e.tx_hz = e.rx_hz + off
+    else if d == 2:
+        e.tx_hz = e.rx_hz - off
+    else if d == 4:
+        e.tx_hz = -1
+
+void profile_set_tone(i32 row, i32 col, radio.Tone t):
+    if row < 0 || row >= i32(#len(g_prof.entries)):
+        return
+    if col == P_TXT:
+        g_prof.entries[row].tx_tone = t
+    else:
+        g_prof.entries[row].rx_tone = t
+    g_prof_dirty = true
+    if g_pf_mode == PF_APPLY:
+        apply_run()
+
+// ── the page ─────────────────────────────────────────────────────────────────
+
+void profiles_page(btui.Rect sheet):
+    if g_pf_mode == PF_LIBRARY:
+        library_view(sheet)
+        return
+    if g_pf_mode == PF_APPLY:
+        apply_view(sheet)
+        return
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 24.0)
+    btui.Rect left = btui.cut_left(&body, 300.0)
+    _ = btui.cut_left(&body, 24.0)
+    // the list of profiles
+    _ = btui.text(btui.HEADLINE_SMALL, left.x, left.y, "Profiles", t.on_surface)
+    _ = btui.text(btui.BODY_MEDIUM, left.x, left.y + 36.0, "Channel lists for any radio", t.on_surface_variant)
+    f32 nw = btui.fab_width("New profile")
+    btui.Rect nr = btui.rect(left.x, left.y + 72.0, nw, 56.0)
+    if btui.fab("add", "New profile", nr):
+        btui.menu_open("newprof", nr, -1)
+    [3]string8 ni = ["From the open radio", "Blank", "From the channel library"]
+    [3]string8 nic = ["radio", "description", "library_books"]
+    i32 ch = btui.menu("newprof", ni[:], -1, 260.0, nic[:])
+    if ch == 0:
+        if g_doc.open:
+            profile_from_doc()
+        else:
+            btui.snackbar_show("Read a radio first (Radio page).")
+    else if ch == 1:
+        prof_new("New profile")
+        prof_save()
+    else if ch == 2:
+        prof_new("From the library")
+        g_pf_mode = PF_LIBRARY
+    btui.Rect lst = btui.rect(left.x, left.y + 148.0, left.w, left.h - 148.0)
+    if #len(g_pf_files) == 0:
+        _ = btui.text_wrap(btui.rect(lst.x, lst.y, lst.w, 80.0), btui.BODY_MEDIUM, "No profiles yet. Make one from the radio you read, or from the channel library.", t.on_surface_variant)
+    _ = btui.scroll_update(lst, &g_pf_list_scroll, f32(#len(g_pf_files)) * 64.0)
+    btui.push_clip(lst)
+    for i in 0..<#len(g_pf_files):
+        f32 y = lst.y + f32(i32(i)) * 64.0 - g_pf_list_scroll.y
+        string8 nm = strings.trim_suffix(g_pf_files[i], ".csv")
+        if btui.list_item(btui.rect(lst.x, y, lst.w, 60.0), nm, "Profile", "library_books", "", g_pf_sel == i32(i), true, #format("pf", i)):
+            if g_prof_dirty:
+                prof_save()
+            prof_load(i32(i))
+    btui.pop_clip()
+    // the editor
+    if !g_prof_open:
+        empty_state(body, "library_books", "No profile open", "Pick one on the left, or make a new one.", "")
+        return
+    string8 title = g_prof_name
+    _ = btui.text(btui.HEADLINE_SMALL, body.x, body.y, title, t.on_surface)
+    _ = btui.text(btui.BODY_MEDIUM, body.x, body.y + 36.0, #format(#len(g_prof.entries), " channels", "  ·  unsaved changes" if g_prof_dirty else ""), t.on_surface_variant)
+    f32 x = btui.right(body)
+    f32 aw = btui.button_width("Apply to radio", "upload")
+    x = x - aw
+    if btui.button("Apply to radio", btui.rect(x, body.y + 8.0, aw, 40.0), btui.BTN_FILLED, "upload", #len(g_prof.entries) == 0):
+        apply_open()
+    f32 lw = btui.button_width("Add from library", "library_books", btui.BTN_TONAL)
+    x = x - 12.0 - lw
+    if btui.button("Add from library", btui.rect(x, body.y + 8.0, lw, 40.0), btui.BTN_TONAL, "library_books"):
+        g_pf_mode = PF_LIBRARY
+    f32 sw = btui.button_width("Save", "save", btui.BTN_TEXT)
+    x = x - 8.0 - sw
+    if btui.button("Save", btui.rect(x, body.y + 8.0, sw, 40.0), btui.BTN_TEXT, "save", !g_prof_dirty):
+        prof_save()
+    f32 dw = btui.button_width("Delete rows", "delete", btui.BTN_TEXT)
+    x = x - 8.0 - dw
+    if btui.button("Delete rows", btui.rect(x, body.y + 8.0, dw, 40.0), btui.BTN_TEXT, "delete", #len(g_prof.entries) == 0):
+        prof_delete_selected()
+    pcols()
+    btui.Rect tr = btui.rect(body.x, body.y + 72.0, body.w, body.h - 72.0)
+    btui.TableEvent ev = btui.table("prof", tr, g_pcols[:], i32(#len(g_prof.entries)), &g_pt, ptext, pdeco, pmsg)
+    if ev.kind != btui.TEV_NONE:
+        papply(ev)
+    if btui.take_key(btui.KEY_S, btui.MOD_CTRL):
+        prof_save()
+
+private void prof_delete_selected():
+    using app_keep():
+        ref []radio.Entry keep = nil
+        for i in 0..<#len(g_prof.entries):
+            bool sel = btui.table_row_selected(&g_pt, i32(i)) || (btui.table_selected_count(&g_pt) == 0 && g_pt.cur_row == i32(i))
+            if !sel:
+                keep = #append(keep, g_prof.entries[i])
+        #delete(g_prof.entries)
+        g_prof.entries = keep
+    g_prof_dirty = true
+
+// ── add from the channel library ─────────────────────────────────────────────
+
+btui.TableState g_lt
+i32 g_lib_set
+btui.Field g_lib_filter
+ref []i32 g_lib_view
+ref []bool g_lib_pick
+btui.Scroll g_lib_sets_scroll
+
+private bool lib_fits(radio.Entry e):
+    if !g_doc.open:
+        return true
+    ^const radio.Model m = doc_model()
+    if !radio.in_band_list(m.rx_bands if #len(m.rx_bands) > 0 else m.tx_bands, e.rx_hz):
+        return false
+    if e.mode == radio.Mode.AM && !radio.has_mode(m, "AM"):
+        return false
+    return true
+
+private void lib_view_build():
+    ^LibSet s = &g_sets[g_lib_set]
+    string8 q = strings.trim(btui.field_text(&g_lib_filter))
+    ref []char8 ql = strings.to_lower(q)
+    using app_keep():
+        if g_lib_view == nil:
+            g_lib_view = #make([]i32, 0)
+        g_lib_view = #resize(g_lib_view, 0)
+        if i64(#len(g_lib_pick)) != #len(s.list.entries):
+            #delete(g_lib_pick)
+            g_lib_pick = #make([]bool, #len(s.list.entries))
+        for i in 0..<#len(s.list.entries):
+            radio.Entry e = s.list.entries[i]
+            if #len(q) > 0:
+                ref []char8 nm = strings.to_lower(s.list.text(e.name))
+                ref []char8 lic = strings.to_lower(s.list.text(e.license))
+                ref []char8 f = mhz_text(e.rx_hz)
+                bool hit = strings.contains(nm, ql) || strings.contains(lic, ql) || strings.contains(f, q)
+                #delete(nm)
+                #delete(lic)
+                #delete(f)
+                if !hit:
+                    continue
+            g_lib_view = #append(g_lib_view, i32(i))
+
+private string8 ltext(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_lib_view)):
+        return ""
+    ^LibSet s = &g_sets[g_lib_set]
+    i32 k = g_lib_view[row]
+    radio.Entry e = s.list.entries[k]
+    if col == 0:
+        return "1" if g_lib_pick[k] else "0"
+    if col == 1:
+        return #format(s.list.text(e.name))
+    if col == 2:
+        return mhz_text(e.rx_hz)
+    if col == 3:
+        if e.tx_hz < 0:
+            return "Off"
+        return mhz_text(e.tx_hz)
+    if col == 4:
+        return radio.mode_name(e.mode)
+    if col == 5:
+        return set_note(s.list.text(e.license), s.name)
+    return ""
+
+private i32 ldeco(i32 row, i32 col):
+    if row < 0 || row >= i32(#len(g_lib_view)):
+        return btui.DECO_NONE
+    ^LibSet s = &g_sets[g_lib_set]
+    radio.Entry e = s.list.entries[g_lib_view[row]]
+    if col == 5:
+        return btui.DECO_TONE + note_tone2(s.list.text(e.license))
+    if !lib_fits(e):
+        return btui.DECO_DIM
+    return btui.DECO_NONE
+
+private string8 lmsg(i32 row, i32 col):
+    if col != 5 || row < 0 || row >= i32(#len(g_lib_view)):
+        return ""
+    ^LibSet s = &g_sets[g_lib_set]
+    radio.Entry e = s.list.entries[g_lib_view[row]]
+    return #format(s.list.text(e.license_text))
+
+ref []btui.Column g_lcols
+
+private void library_view(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 24.0)
+    if btui.icon_button("arrow_back", btui.rect(body.x - 8.0, body.y - 4.0, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Back"):
+        g_pf_mode = PF_EDIT
+    _ = btui.text(btui.HEADLINE_SMALL, body.x + 48.0, body.y, "Add from the channel library", t.on_surface)
+    string8 fits = "Dimmed channels don't fit " if g_doc.open else "Read a radio to see which channels fit it"
+    if g_doc.open:
+        fits = #format(fits, model_label(g_doc.mi), ". Licence notes are for your information only.")
+    _ = btui.text(btui.BODY_MEDIUM, body.x + 48.0, body.y + 36.0, fits, t.on_surface_variant)
+    if #len(g_sets) == 0:
+        empty_state(body, "library_books", "No channel library found", "The data/channels folder is missing.", "")
+        return
+    g_lib_set = clampi3(g_lib_set, 0, i32(#len(g_sets)) - 1)
+    btui.Rect area = btui.rect(body.x, body.y + 76.0, body.w, body.h - 76.0 - 56.0)
+    btui.Rect sets = btui.cut_left(&area, 280.0)
+    _ = btui.cut_left(&area, 16.0)
+    _ = btui.card(sets, btui.CARD_OUTLINED)
+    btui.Rect si = btui.inset(sets, 1.0)
+    _ = btui.scroll_update(si, &g_lib_sets_scroll, f32(#len(g_sets)) * 56.0 + 8.0)
+    btui.push_clip(si)
+    for i in 0..<#len(g_sets):
+        f32 y = si.y + 4.0 + f32(i32(i)) * 56.0 - g_lib_sets_scroll.y
+        if btui.list_item(btui.rect(si.x, y, si.w, 56.0), g_sets[i].name, "", "", #format(#len(g_sets[i].list.entries)), g_lib_set == i32(i), false, #format("set", i)):
+            g_lib_set = i32(i)
+            btui.Scroll z
+            g_lt.scroll = z
+    btui.pop_clip()
+    // filter + table
+    btui.FieldOpts o = btui.field_opts("Filter", btui.FIELD_OUTLINED)
+    o.leading = "search"
+    o.placeholder = "Name, frequency or note"
+    o.behind = t.surface
+    _ = btui.text_field("libfilter", btui.rect(area.x, area.y + 6.0, 360.0, 56.0), &g_lib_filter, o)
+    lib_view_build()
+    if g_lcols == nil:
+        using app_keep():
+            g_lcols = #append(g_lcols, btui.column("Add", 64.0, btui.COL_CHECK, true, false))
+            g_lcols = #append(g_lcols, btui.column("Name", 220.0, btui.COL_TEXT, false))
+            g_lcols = #append(g_lcols, btui.column("RX (MHz)", 124.0, btui.COL_NUM, false))
+            g_lcols = #append(g_lcols, btui.column("TX (MHz)", 124.0, btui.COL_NUM, false))
+            g_lcols = #append(g_lcols, btui.column("Mode", 80.0, btui.COL_TEXT, false))
+            g_lcols = #append(g_lcols, btui.column("Licence / note", 200.0, btui.COL_STATUS, false, false))
+    btui.Rect tr = btui.rect(area.x, area.y + 80.0, area.w, area.h - 80.0)
+    btui.TableEvent ev = btui.table("lib", tr, g_lcols[:], i32(#len(g_lib_view)), &g_lt, ltext, ldeco, lmsg)
+    if ev.kind == btui.TEV_TOGGLE && ev.row >= 0 && ev.row < i32(#len(g_lib_view)):
+        i32 k = g_lib_view[ev.row]
+        g_lib_pick[k] = !g_lib_pick[k]
+    i32 n = 0
+    for p in g_lib_pick:
+        if p:
+            n += 1
+    string8 lbl = #format("Add ", n, " channel", "" if n == 1 else "s")
+    f32 w = btui.button_width(lbl, "add")
+    if btui.button(lbl, btui.rect(btui.right(body) - w, btui.bottom(body) - 40.0, w, 40.0), btui.BTN_FILLED, "add", n == 0):
+        lib_add_picked()
+    f32 aw = btui.button_width("Select all shown", "", btui.BTN_TEXT)
+    if btui.button("Select all shown", btui.rect(btui.right(body) - w - 8.0 - aw, btui.bottom(body) - 40.0, aw, 40.0), btui.BTN_TEXT):
+        for k in g_lib_view:
+            g_lib_pick[k] = true
+
+private void lib_add_picked():
+    ^LibSet s = &g_sets[g_lib_set]
+    i32 n = 0
+    using app_keep():
+        for i in 0..<#len(s.list.entries):
+            if !g_lib_pick[i]:
+                continue
+            radio.Entry e = s.list.entries[i]
+            e.slot = -1
+            e.name = g_prof.add_text(s.list.text(e.name))
+            e.comment = g_prof.add_text(s.list.text(e.comment))
+            e.license = g_prof.add_text(s.list.text(e.license))
+            e.license_text = g_prof.add_text(s.list.text(e.license_text))
+            g_prof.entries = #append(g_prof.entries, e)
+            g_lib_pick[i] = false
+            n += 1
+    g_prof_dirty = true
+    g_pf_mode = PF_EDIT
+    btui.snackbar_show(#format("Added ", n, " channel", "" if n == 1 else "s", " from ", s.name))

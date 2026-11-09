@@ -12,12 +12,21 @@ import "core:os/fs"
 import "core:path"
 import "core:strings"
 import "core:time"
+import "../engines"
+import "../updater"
 import "../radio"
 
 const string8 USAGE = """
-    usage: beautalks [--models DIR] <command> ...
+    usage: beautalks [--models DIR] [--data DIR] [--drivers DIR] [--builtin] [--trace FILE] <command> ...
 
+      version                                 the program's version
       ports                                   list serial ports (USB IDs, cable chip)
+      radios                                  list the radios seen before
+      radios rename ID NICKNAME | radios forget ID
+      verify [--port P] [--model M] [--yes] [--answer yes|no] [--restore yes|no]
+                                              verify writing on this radio: read, back up, write the
+                                              identical image, compare, then your check after a power-cycle
+      tested | tested forget ID               radios verified on this computer (local records only)
       models                                  list the model definitions
       detect [--port P]                       identify the radio on the cable
       read [--port P] [--model M] -o FILE.img download the radio's memory
@@ -25,7 +34,7 @@ const string8 USAGE = """
       export FILE.img -o FILE.csv [--model M] channels to CSV
       import FILE.img FILE.csv -o OUT.img [--model M]
                                               CSV channels into an image (slots kept)
-      write FILE.img [--port P] [--model M] [--allow-untested]
+      write FILE.img [--port P] [--model M] [--allow-untested] [--backups DIR]
                                               back up the radio, write, read back, compare
       profile extract FILE.img -o LIST.csv [--model M]
                                               a model-independent channel list
@@ -33,7 +42,14 @@ const string8 USAGE = """
               [--start N] [--keep-slots] [--fill-empty] [--info]
                                               place a channel list on a model, with diagnostics
 
-    Model definitions come from --models DIR, else $BEAUTALKS_MODELS, else ./models,
+    --details prints every detection try (always printed when nothing answers).
+    --trace FILE appends a timestamped log of every byte sent and received,
+    port open/close and line changes (for hardware debugging).
+    Known radios live in --data DIR, else $BEAUTALKS_HOME, else the system's app
+    data folder + beautalks. Engines: a scripted engines/<engine>.js from --drivers DIR,
+    else the active updated driver set, else the shipped drivers/, else built in
+    (--builtin forces the built-in engines). Model definitions come from --models DIR, else
+    $BEAUTALKS_MODELS, else ./models,
     else <program dir>/../models.
     """
 
@@ -55,8 +71,18 @@ type Args:
         #delete(self.pos)
         #delete(self.opts)
 
+ref []char8 data_dir(^Args a):
+    string8 given = a^.opt("--data")
+    if #len(given) != 0:
+        return strings.clone(given)
+    return radio.app_data_dir()
+
+void save_registry_or_say(^radio.Registry reg):
+    if !radio.save_registry(reg):
+        fmt.eprintln("note: could not save the known-radios list in ", reg^.dir)
+
 bool is_switch(string8 a):
-    return a == "--check" || a == "--keep-slots" || a == "--fill-empty" || a == "--allow-untested" || a == "--info" || a == "-h" || a == "--help"
+    return a == "--details" || a == "--yes" || a == "--builtin" || a == "--check" || a == "--keep-slots" || a == "--fill-empty" || a == "--allow-untested" || a == "--info" || a == "-h" || a == "--help"
 
 // Splits words into positionals and options; answers false (and says why)
 // when an option lacks its value.
@@ -86,6 +112,10 @@ bool parse_args([]string8 words, ^Args out):
 
 // ── shared helpers ───────────────────────────────────────────────────────────
 
+// The model definitions folder: --models DIR, else $BEAUTALKS_MODELS, else
+// the active updated driver set's models (<data>/drivers/active/models),
+// else the shipped folder (radio.find_shipped: ./models, <exe>/models,
+// <exe>/../models, <exe>/../Resources/models).
 ref []char8 models_dir(^Args a, string8 program):
     string8 given = a^.opt("--models")
     if #len(given) != 0:
@@ -96,14 +126,23 @@ ref []char8 models_dir(^Args a, string8 program):
     if #len(env) != 0:
         return env
     #delete(env)
-    if fs.is_dir("models"):
-        return strings.clone("models")
-    try string8 exe = os.executable_path() else:
-        return strings.clone("models")
-    ref []char8 d = path.dir(exe)
-    ref []char8 out = path.join(d, "..", "models")
-    #delete(d)
-    return out
+    ref []char8 dd = data_dir(a)
+    updater.Config uc = updater.default_config()
+    uc.data_dir = dd
+    ref []char8 act = nil
+    try act = updater.active_dir(uc) else:
+        act = nil
+    #delete(dd)
+    if act != nil:
+        ref []char8 am = path.join(act, "models")
+        #delete(act)
+        if fs.is_dir(am):
+            return am
+        #delete(am)
+    ref []char8 found = radio.find_shipped("models")
+    if found != nil:
+        return found
+    return strings.clone("models")
 
 void print_model_line(^const radio.Model m):
     string8 t = "untested"
@@ -204,6 +243,11 @@ ref []char8 choose_port(^Args a):
 
 private i64 g_last_pct = -1
 
+// What the last detection did (read by the CLI flow tests).
+i32 g_last_attempts = -1
+bool g_last_fast_path = false
+bool g_last_session_reused = false
+
 void on_progress(rawptr ctx, i64 done, i64 total):
     if total <= 0:
         return
@@ -268,18 +312,44 @@ i32 cmd_detect(^Args a, []radio.Model models):
     defer #delete(port)
     if port == nil:
         return 2
-    fmt.eprintln("probing ", port, " (UV-5R family at 9600, then UV-17Pro family at 115200) ...")
-    try radio.Detection d = radio.detect(port, models, progress()) else why:
+    fmt.eprintln("probing ", port, " (open-session check, remembered radios, then UV-5R family at 9600 and UV-17Pro family at 115200) ...")
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    radio.Registry reg = radio.open_registry(dd)
+    defer reg.destroy()
+    try radio.Detection d = radio.detect_with(port, models, &reg, progress()) else why:
         fmt.eprintln("")
         fmt.eprintln("beautalks: ", radio.link_error_message(why))
         return 1
     defer radio.close_detection(&d)
     fmt.eprintln("")
+    print_timing(&d)
     if !d.found:
         fmt.println("no radio answered")
         return 1
     print_detection(&d, models)
+    if #len(d.candidates) != 0:
+        ref []char8 id = radio.remember_detection(&reg, &d, &models[d.candidates[0]], port)
+        fmt.println("known radio: ", id)
+        #delete(id)
+        save_registry_or_say(&reg)
     return 0
+
+private bool g_details = false
+
+void print_timing(^radio.Detection d):
+    if g_details || !d^.found:
+        string8 lg = d^.log
+        fmt.eprint(lg)
+    g_last_attempts = d^.attempts
+    g_last_fast_path = d^.fast_path
+    g_last_session_reused = d^.session_reused
+    if d^.session_reused:
+        fmt.eprintln("(the radio was still in its programming session; reused it, no ident sent)")
+    if d^.session_unknown:
+        fmt.eprintln("the radio is in an open programming session that beautalks has no record of;")
+        fmt.eprintln("power-cycle the radio and try again")
+    fmt.eprintln("(", d^.attempts, " handshake attempt(s), ", d^.elapsed_ms, " ms", ", remembered radio" if d^.fast_path else "", ")")
 
 void print_detection(^radio.Detection d, []radio.Model models):
     fmt.print("radio answered at ", d^.baud, " baud (", d^.engine, " protocol)")
@@ -290,9 +360,40 @@ void print_detection(^radio.Detection d, []radio.Model models):
     else:
         fmt.print("; model reply \"", string8(d^.hello.m_reply[0..<d^.hello.m_len]), "\"")
     fmt.println("")
-    fmt.println("candidates, best first:")
-    for c in d^.candidates:
-        print_model_line(&models[c])
+    // the matched model(s) are the answer; handshake-only ones one line
+    bool any_strong = false
+    for k in d^.matches:
+        if k == radio.MatchKind.REMEMBERED || k == radio.MatchKind.REPLY:
+            any_strong = true
+    if !any_strong && #len(d^.candidates) != 0:
+        ^const radio.Model best = &models[d^.candidates[0]]
+        fmt.println("most likely: ", best^.vendor, " ", best^.name, " (", radio.match_kind_name(d^.matches[0]), ")")
+    for i in 0..<#len(d^.candidates):
+        radio.MatchKind k = d^.matches[i]
+        if k != radio.MatchKind.REMEMBERED && k != radio.MatchKind.REPLY:
+            continue
+        ^const radio.Model m = &models[d^.candidates[i]]
+        fmt.print("radio: ", m^.vendor, " ", m^.name, " (")
+        if k == radio.MatchKind.REMEMBERED:
+            fmt.print("seen before with this handshake")
+        else if d^.engine == "uv17pro":
+            fmt.print("matched by model reply \"", m^.model_reply, "\"")
+        else:
+            fmt.print("matched by ident reply ", m^.ident_reply)
+        fmt.println(")")
+    strings.Builder b = strings.builder(128)
+    i64 n = 0
+    for i in 0..<#len(d^.candidates):
+        radio.MatchKind k = d^.matches[i]
+        if k == radio.MatchKind.REMEMBERED || k == radio.MatchKind.REPLY || (!any_strong && i == 0):
+            continue
+        if n != 0:
+            strings.append(&b, ", ")
+        strings.append(&b, models[d^.candidates[i]].name)
+        n += 1
+    if n != 0:
+        fmt.println("also speaks this protocol: ", strings.text(b), " (use --model)")
+    #delete(b)
 
 i32 cmd_read(^Args a, []radio.Model models):
     string8 out = a^.opt("-o")
@@ -306,29 +407,42 @@ i32 cmd_read(^Args a, []radio.Model models):
     string8 want = a^.opt("--model")
     ref []u8 img = nil
     defer #delete(img)
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    radio.Registry reg = radio.open_registry(dd)
+    defer reg.destroy()
+    ref []char8 rid = nil
+    defer #delete(rid)
+    i64 used = -1
     if #len(want) != 0:
         i64 mi = radio.find_model(models, want)
         if mi < 0:
             fmt.eprintln("beautalks: no model definition answers to \"", want, "\"")
             return 2
         ^const radio.Model m = &models[mi]
-        try radio.SerialLink l = radio.open_serial(port, m^.baud) else why:
-            fmt.eprintln("beautalks: cannot open ", port, ": ", radio.link_error_message(why))
+        engines.Runner run
+        try run = engines.open_runner(port, m, dd, a^.opt("--drivers"), a^.has("--builtin")) else code:
+            fmt.eprintln("beautalks: cannot use ", port, " for ", m^.name, ": ", engines.error_text(code))
             return 1
+        defer run.close()
+        if run.scripted():
+            fmt.eprintln("(engine: scripted ", run.choice.path, ".js)")
         fmt.eprintln("reading ", m^.vendor, " ", m^.name, " on ", port, " ...")
-        try img = radio.download(&l, m, progress()) else why:
-            radio.close_serial(&l)
+        radio.clear_cancel()
+        try img = run.download(m, progress()) else why:
             fmt.eprintln("")
-            fmt.eprintln("beautalks: ", radio.link_error_message(why))
+            fmt.eprintln("beautalks: ", engines.error_text(i32(why)))
             return 1
-        radio.close_serial(&l)
+        used = mi
+        rid = radio.remember_model_use(&reg, m, img, port)
     else:
         fmt.eprintln("no --model: detecting ...")
-        try radio.Detection d = radio.detect(port, models, progress()) else why:
+        try radio.Detection d = radio.detect_with(port, models, &reg, progress()) else why:
             fmt.eprintln("beautalks: ", radio.link_error_message(why))
             return 1
         defer radio.close_detection(&d)
         fmt.eprintln("")
+        print_timing(&d)
         if !d.found || #len(d.candidates) == 0:
             fmt.eprintln("beautalks: no known radio answered")
             return 1
@@ -340,8 +454,12 @@ i32 cmd_read(^Args a, []radio.Model models):
             fmt.eprintln("")
             fmt.eprintln("beautalks: ", radio.link_error_message(why))
             return 1
+        used = mi
+        rid = radio.remember_detection(&reg, &d, m, port)
     if !save_or_say(out, img):
         return 1
+    radio.remember_image(&reg, rid, &models[used], img, "")
+    save_registry_or_say(&reg)
     fmt.println("saved ", #len(img), " bytes to ", out)
     return 0
 
@@ -544,45 +662,160 @@ i32 cmd_write(^Args a, []radio.Model models):
         return 2
     ^const radio.Model m = &models[mi]
     bool allow = a^.has("--allow-untested")
-    if m^.tested != radio.Tested.WRITE:
-        if !allow:
-            fmt.eprintln("beautalks: writing to the ", m^.vendor, " ", m^.name, " is not tested; refused.")
-            fmt.eprintln("  --allow-untested writes anyway (the radio is backed up first and verified after).")
-            return 4
-        fmt.eprintln("WARNING: writing to the ", m^.vendor, " ", m^.name, " has NOT been tested with beautalks.")
-        fmt.eprintln("WARNING: a wrong write can leave the radio misconfigured; the backup lets you restore it.")
     if #len(img) != m^.image_size:
         fmt.eprintln("beautalks: the image is ", #len(img), " bytes; a ", m^.name, " image is ", m^.image_size)
         return 2
+    if m^.tested != radio.Tested.WRITE:
+        if allow:
+            fmt.eprintln("WARNING: writing to the ", m^.vendor, " ", m^.name, " has NOT been tested with beautalks.")
+            fmt.eprintln("WARNING: a wrong write can leave the radio misconfigured; the backup lets you restore it.")
+        else:
+            fmt.eprintln("(", m^.name, " is not tested by beautalks; checking this computer's verification records for the radio on the cable)")
     ref []char8 port = choose_port(a)
     defer #delete(port)
     if port == nil:
         return 2
-    try fs.make_dirs("backups") else:
-        fmt.eprintln("beautalks: cannot create backups/; nothing written")
-        return 1
-    ref []char8 ts = timestamp()
-    defer #delete(ts)
-    strings.Builder bp = strings.builder(64)
-    strings.append(&bp, "backups/")
-    strings.append(&bp, m^.id)
-    strings.append(&bp, "-")
-    strings.append(&bp, ts)
-    strings.append(&bp, ".img")
-    ref []char8 backup = strings.finish(&bp)
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    // the backup: <data>/backups/<model>/<UTC stamp>.img (+ .txt), or
+    // --backups DIR/<model>-<stamp>.img
+    ref []char8 backup = nil
     defer #delete(backup)
-    try radio.SerialLink l = radio.open_serial(port, m^.baud) else why:
-        fmt.eprintln("beautalks: cannot open ", port, ": ", radio.link_error_message(why))
-        return 1
-    defer radio.close_serial(&l)
-    try radio.safe_write(&l, m, img, allow, backup, 1000, on_phase, nil, progress()) else why:
+    string8 bdir = a^.opt("--backups")
+    if #len(bdir) != 0:
+        try fs.make_dirs(bdir) else:
+            fmt.eprintln("beautalks: cannot create ", bdir, "; nothing written")
+            return 1
+        ref []char8 ts = timestamp()
+        strings.Builder bp = strings.builder(64)
+        strings.append(&bp, bdir)
+        strings.append(&bp, "/")
+        strings.append(&bp, m^.id)
+        strings.append(&bp, "-")
+        strings.append(&bp, ts)
+        strings.append(&bp, ".img")
+        backup = strings.finish(&bp)
+        #delete(ts)
+    else:
+        backup = radio.new_backup_path(dd, m)
+        if backup == nil:
+            fmt.eprintln("beautalks: cannot create the backups folder under ", dd, "; nothing written")
+            return 1
+    // identify the radio on the cable: its fingerprint decides the gate
+    radio.Registry reg = radio.open_registry(dd)
+    defer reg.destroy()
+    radio.TestedStore store = radio.open_tested(dd)
+    defer store.destroy()
+    radio.clear_cancel()
+    try radio.Detection d = radio.detect_with(port, models, &reg, progress()) else why:
         fmt.eprintln("")
-        fmt.eprintln("beautalks: ", radio.link_error_message(why))
+        fmt.eprintln("beautalks: ", radio.link_error_message(why), "; nothing written")
+        return 1
+    defer radio.close_detection(&d)
+    print_timing(&d)
+    if !d.found:
+        fmt.eprintln("beautalks: no radio answered on ", port, "; nothing written")
+        return 1
+    bool speaks = false
+    for c in d.candidates:
+        if models[c].id == m^.id:
+            speaks = true
+    if !speaks:
+        fmt.eprintln("beautalks: the radio on ", port, " does not answer as a ", m^.name, "; nothing written")
+        return 1
+    engines.Runner run
+    try run = engines.adopt_detection(&d, m, dd, a^.opt("--drivers"), a^.has("--builtin")) else code:
+        fmt.eprintln("beautalks: no engine for ", m^.name, ": ", engines.error_text(code))
+        return 1
+    defer run.close()
+    if run.scripted():
+        fmt.eprintln("(engine: scripted ", run.choice.path, ".js)")
+    radio.WriteStatus st
+    try st = run.safe_write_detected(&d, m, img, &store, allow, backup, 1000, on_phase, nil, progress()) else why:
+        fmt.eprintln("")
+        if why == radio.LinkError.UNTESTED:
+            fmt.eprintln("beautalks: writing to this ", m^.vendor, " ", m^.name, " is not tested (not by beautalks, and not verified")
+            fmt.eprintln("  on this computer for this radio's firmware); nothing written.")
+            fmt.eprintln("  `beautalks verify` checks writing on your radio with an identical copy first;")
+            fmt.eprintln("  --allow-untested writes anyway (the radio is backed up first and verified after).")
+            return 4
+        fmt.eprintln("beautalks: ", engines.error_text(i32(why)))
         if fs.exists(backup):
             fmt.eprintln("the radio's memory before this attempt is in ", backup)
         return 1
+    if st.by == radio.TestedBy.LOCAL:
+        fmt.println("verified on this computer (", st.detail, ")")
     fmt.println("written and verified; the radio's previous memory is in ", backup)
+    ref []char8 rid = radio.remember_detection(&reg, &d, m, port)
+    radio.remember_image(&reg, rid, m, img, backup)
+    #delete(rid)
+    save_registry_or_say(&reg)
     return 0
+
+i32 cmd_radios(^Args a):
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    radio.Registry reg = radio.open_registry(dd)
+    defer reg.destroy()
+    string8 sub = a^.pos[1] if #len(a^.pos) > 1 else ""
+    if sub == "rename":
+        if #len(a^.pos) < 4:
+            fmt.eprintln("beautalks radios rename ID NICKNAME")
+            return 2
+        if !radio.rename_radio(&reg, a^.pos[2], a^.pos[3]):
+            fmt.eprintln("beautalks: no known radio ", a^.pos[2])
+            return 1
+        save_registry_or_say(&reg)
+        return 0
+    if sub == "forget":
+        if #len(a^.pos) < 3:
+            fmt.eprintln("beautalks radios forget ID")
+            return 2
+        if !radio.forget_radio(&reg, a^.pos[2]):
+            fmt.eprintln("beautalks: no known radio ", a^.pos[2])
+            return 1
+        save_registry_or_say(&reg)
+        return 0
+    if #len(sub) != 0:
+        fmt.eprintln("beautalks radios: list, rename or forget")
+        return 2
+    radio.KnownList k = radio.list_known(&reg)
+    defer k.destroy()
+    if #len(k.radios) == 0:
+        fmt.println("no radios seen yet (", reg.file, ")")
+    for x in k.radios:
+        fmt.print(k.text(x.id))
+        string8 nick = k.text(x.nickname)
+        if #len(nick) != 0:
+            fmt.print("  \"", nick, "\"")
+        fmt.println("")
+        fmt.print("    model ", k.text(x.model), "  seen ", x.seen, "x  last ")
+        ref []char8 when = format_time(x.last_seen)
+        fmt.print(when)
+        #delete(when)
+        fmt.println("  port ", k.text(x.port), "  usb ", k.text(x.usb))
+        string8 fw = k.text(x.firmware)
+        if #len(fw) != 0:
+            fmt.println("    firmware ", fw)
+        string8 bk = k.text(x.backup)
+        if #len(bk) != 0:
+            fmt.println("    last backup ", bk)
+    return 0
+
+ref []char8 format_time(i64 unix):
+    time.DateTime t = time.utc(unix * 1000000000)
+    strings.Builder b = strings.builder(32)
+    radio.append_padded(&b, t.year, 4)
+    strings.append_char(&b, '-')
+    radio.append_padded(&b, i64(t.month), 2)
+    strings.append_char(&b, '-')
+    radio.append_padded(&b, i64(t.day), 2)
+    strings.append_char(&b, ' ')
+    radio.append_padded(&b, i64(t.hour), 2)
+    strings.append_char(&b, ':')
+    radio.append_padded(&b, i64(t.minute), 2)
+    strings.append(&b, " UTC")
+    return strings.finish(&b)
 
 i32 run([]string8 args):
     Args a
@@ -593,8 +826,21 @@ i32 run([]string8 args):
         fmt.println(USAGE)
         return 0 if #len(a.pos) == 0 && (a.has("-h") || a.has("--help")) else 2
     string8 cmd = a.pos[0]
+    g_details = a.has("--details")
+    if cmd == "version":
+        fmt.println("beautalks ", updater.APP_VERSION)
+        return 0
+    string8 trace = a.opt("--trace")
+    if #len(trace) != 0:
+        if !radio.set_trace(trace):
+            fmt.eprintln("note: cannot write the trace file ", trace)
+    defer radio.stop_trace()
     if cmd == "ports":
         return cmd_ports()
+    if cmd == "radios":
+        return cmd_radios(&a)
+    if cmd == "tested":
+        return cmd_tested(&a)
     ref []char8 dir = models_dir(&a, args[0])
     defer #delete(dir)
     ref []radio.Model models = radio.load_models(dir)
@@ -616,6 +862,8 @@ i32 run([]string8 args):
         return cmd_import(&a, models)
     if cmd == "write":
         return cmd_write(&a, models)
+    if cmd == "verify":
+        return cmd_verify(&a, models)
     if cmd == "profile":
         string8 sub = a.pos[1] if #len(a.pos) > 1 else ""
         if sub == "extract":
@@ -631,3 +879,146 @@ i32 run([]string8 args):
 i32 main(i32 argc, ^rawptr argv):
     []string8 args = os.args(argc, argv)
     return run(args)
+
+// ── verify / tested ──────────────────────────────────────────────────────────
+
+// Asks a yes/no question; `preset` ("yes"/"no") answers it without asking;
+// with no terminal and no preset the answer is `fallback`.
+bool ask_yes(string8 question, string8 preset, bool fallback):
+    if #len(preset) != 0:
+        fmt.println(question, " ", preset)
+        return radio.parse_yes(preset)
+    if !os.is_terminal(0):
+        fmt.println(question, " (no terminal: ", "yes" if fallback else "no", ")")
+        return fallback
+    fmt.print(question, " [y/n] ")
+    try ref []char8 line = io.read_line(io.stdin()) else:
+        return false
+    defer #delete(line)
+    return radio.parse_yes(line)
+
+i32 cmd_verify(^Args a, []radio.Model models):
+    ref []char8 port = choose_port(a)
+    defer #delete(port)
+    if port == nil:
+        return 2
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    radio.Registry reg = radio.open_registry(dd)
+    defer reg.destroy()
+    radio.TestedStore store = radio.open_tested(dd)
+    defer store.destroy()
+    fmt.println("Verify writing on this radio")
+    fmt.println("  1. read the radio and keep a backup in ", dd, "/backups")
+    fmt.println("  2. write back an IDENTICAL copy, read it again and compare byte for byte")
+    fmt.println("  3. you power-cycle the radio and check it starts normally with the same channels")
+    fmt.println("  A pass is recorded on this computer only, for this model and this radio's firmware.")
+    if !a^.has("--yes") && !ask_yes("Start?", "", false):
+        fmt.println("not started")
+        return 1
+    radio.clear_cancel()
+    fmt.eprintln("reading ...")
+    try radio.Verification v = radio.verify_begin(port, models, a^.opt("--model"), &reg, dd, progress()) else why:
+        fmt.eprintln("")
+        string8 wanted = a^.opt("--model")
+        if why == radio.LinkError.BAD_MODEL && #len(wanted) != 0:
+            fmt.eprintln("beautalks: the radio on ", port, " does not answer as a ", wanted)
+        else if why == radio.LinkError.BAD_MODEL:
+            fmt.eprintln("beautalks: several models speak this radio's protocol; pass --model (see `beautalks detect`)")
+        else if why == radio.LinkError.BAD_REPLY:
+            fmt.eprintln("beautalks: the radio is in an open programming session nobody remembers; power-cycle it and run verify again")
+        else:
+            fmt.eprintln("beautalks: ", radio.link_error_message(why))
+        return 1
+    defer v.destroy()
+    save_registry_or_say(&reg)
+    fmt.println("radio: ", v.model.vendor, " ", v.model.name, " (", v.model.id, ")")
+    fmt.println("fingerprint: ", v.fingerprint)
+    fmt.println(#len(v.channels.entries), " channels, e.g.:")
+    for i in 0..<#len(v.channels.entries):
+        if i >= 8:
+            break
+        radio.Entry e = v.channels.entries[i]
+        strings.Builder b = strings.builder(64)
+        strings.append(&b, "  ")
+        radio.append_padded(&b, i64(e.slot), 4)
+        strings.append(&b, "  ")
+        strings.append(&b, v.channels.text(e.name))
+        strings.append(&b, "  ")
+        radio.append_mhz(&b, e.rx_hz)
+        fmt.println(strings.text(b))
+        #delete(b)
+    fmt.println("backup: ", v.backup_path)
+    radio.WriteStatus ws = radio.write_status(&v.model, v.fingerprint, &store)
+    if ws.by != radio.TestedBy.NONE:
+        fmt.println("note: this radio already counts as tested (", ws.detail, ")")
+    if #len(v.fingerprint) == 0:
+        fmt.eprintln("beautalks: this radio's identifying replies are unknown (an open session was reused); power-cycle it and run verify again")
+        return 1
+    if !a^.has("--yes") && !ask_yes("Are these your radio's channels? Write the identical copy now?", "", false):
+        fmt.println("stopped; nothing was written")
+        return 1
+    try radio.SerialLink l = radio.open_serial(port, v.model.baud) else why:
+        fmt.eprintln("beautalks: cannot open ", port, ": ", radio.link_error_message(why))
+        return 1
+    defer radio.close_serial(&l)
+    bool written = true
+    try radio.verify_write(&v, &l, 1000, on_phase, nil, progress()) else why:
+        fmt.eprintln("")
+        fmt.eprintln("beautalks: the verification write failed: ", radio.link_error_message(why))
+        if v.mismatch_at >= 0:
+            fmt.eprintln("  the radio read back differently from byte ", v.mismatch_at)
+        written = false
+    bool works = false
+    if written:
+        fmt.println("identical copy written and compared: no differences")
+        works = ask_yes("Power-cycle the radio now. Does it start normally and show the same channels?", a^.opt("--answer"), false)
+    bool pass = radio.record_verification(&v, &store, works, updater.APP_VERSION)
+    if !radio.save_tested(&store):
+        fmt.eprintln("note: could not save the test record in ", dd)
+    if v.report_path != nil:
+        fmt.println("report: ", v.report_path)
+    if pass:
+        fmt.println("recorded: ", v.model.name, " is now tested for writing on this computer (this radio's firmware)")
+        return 0
+    fmt.println("not recorded as tested")
+    if ask_yes("Write the backup back to the radio now?", a^.opt("--restore"), true):
+        try radio.verify_restore(&v, &l, 1000, on_phase, nil, progress()) else why:
+            fmt.eprintln("")
+            fmt.eprintln("beautalks: the restore failed: ", radio.link_error_message(why))
+            fmt.eprintln("  the backup is ", v.backup_path, "; try `beautalks write` with it")
+            return 1
+        fmt.println("restored the backup")
+    return 3
+
+i32 cmd_tested(^Args a):
+    ref []char8 dd = data_dir(a)
+    defer #delete(dd)
+    radio.TestedStore store = radio.open_tested(dd)
+    defer store.destroy()
+    string8 sub = a^.pos[1] if #len(a^.pos) > 1 else ""
+    if sub == "forget":
+        if #len(a^.pos) < 3:
+            fmt.eprintln("beautalks tested forget ID")
+            return 2
+        if !radio.forget_tested(&store, a^.pos[2]):
+            fmt.eprintln("beautalks: no test record ", a^.pos[2])
+            return 1
+        if !radio.save_tested(&store):
+            fmt.eprintln("note: could not save ", store.file)
+        return 0
+    if #len(sub) != 0:
+        fmt.eprintln("beautalks tested: list or forget")
+        return 2
+    radio.TestedList l = radio.list_tested(&store)
+    defer l.destroy()
+    if #len(l.records) == 0:
+        fmt.println("no radios verified on this computer (", store.file, ")")
+    for r in l.records:
+        fmt.println(l.text(r.id), "  ", l.text(r.result), "  model ", l.text(r.model))
+        fmt.println("    ", l.text(r.summary))
+        fmt.println("    fingerprint ", l.text(r.fingerprint))
+        string8 rp = l.text(r.report)
+        if #len(rp) != 0:
+            fmt.println("    report ", rp)
+    return 0

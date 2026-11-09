@@ -731,3 +731,31 @@ most recent on the same cable first — and only falls back to a full scan when 
 UI: a "Radios" group in the Library sidebar (nickname · model · last seen · last backup), rename
 inline, "Forget"; the radio panel shows the nickname when a remembered radio is detected
 ("● Truck radio — Baofeng UV-5RM · seen 3 times").
+
+---
+
+## Decision (owner, 2026-11-08): native sokol app with Material-style polish — supersedes the cell-grid layouts
+
+The terminal-style app:ui front end was rejected (audience: non-technical users) and dropped.
+A web engine was also ruled out. The app is a **native sokol application** drawn with Dado's
+app:draw/app:font (Metal on macOS), with a beautalks widget toolkit that gives it the feel of
+a polished Material Design web app: rounded surfaces, soft elevation shadows, Inter type,
+Material Symbols icons, motion, light and dark themes. The flows, safety rules, diagnostics
+design and decisions above still apply; the ASCII layouts and key bar are obsolete.
+
+### Added requirement (owner, 2026-11-08): built-in guided verification of untested hardware
+
+A model that isn't tested for writing gets a guided **"Verify this radio"** procedure instead of
+a bare warning:
+1. Explain + consent (model, firmware/identifying reply, "we write back an identical copy",
+   backup kept).
+2. Read + automatic backup; show the channels so the user recognises their radio.
+3. Safe write of the **identical image** (backup → write → read back), byte-for-byte compare.
+4. Physical check: "Power-cycle the radio. Does it start normally and show the same channels?"
+5. Yes → marked tested. Failure or No → guided restore from the backup + a saved report.
+
+"Tested" is recorded **locally only** (owner decision), in the data dir, keyed by model id **plus
+the radio's identifying fingerprint** (UV-5R ident/firmware tag, UV-17Pro F/M replies), so one
+verified firmware doesn't vouch for another. The UI shows e.g. "Verified on this computer:
+UV-5R · firmware HN5RV011". Shipped `tested = write` definitions still count as tested.
+No results are sent anywhere.

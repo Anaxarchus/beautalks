@@ -1,0 +1,269 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The runtime: btui drives sokol_app itself instead of going through
+// app:graphical, for three reasons:
+//   * `high_dpi = true`. app:display leaves it off, so a Retina Mac would get
+//     a 1x framebuffer stretched to 2x: blurry text. btui renders at device
+//     pixels and lays out in dp.
+//   * app:draw's vertex budget. A dense screen of text is tens of thousands
+//     of vertices; btui asks for 512k (`draw.init_capacity`).
+//   * Rebuild on demand. The UI is immediate-mode (rebuilt by the app's frame
+//     function) on top of app:draw's retained canvas: a frame with no input,
+//     no animation and no request just re-renders the retained canvas and
+//     naps, so an idle window costs almost nothing.
+//
+// Per-frame scratch memory: the app's frame function runs under an arena that
+// is emptied after every frame (like app:graphical's `process`). Anything the
+// app keeps across frames must be made under `using btui.keep():`.
+package btui
+
+import "app:draw"
+import "core:fmt"
+import "core:mem/arena"
+import "core:mem/libc"
+import "core:os"
+import "core:path"
+import "core:strings"
+import "core:time"
+import "vendor:sokol/sokol_app"
+import "vendor:sokol/sokol_gfx"
+import "vendor:sokol/sokol_glue"
+import "vendor:sokol/sokol_log"
+
+type FrameFn: void()
+
+private FrameFn g_frame_fn
+private FrameFn g_init_fn
+private i32 g_req_w
+private i32 g_req_h
+private f32 g_force_scale
+private draw.Canvas g_canvas = draw.NIL_CANVAS
+private arena.Arena g_frame_arena
+private bool g_arena_up
+private bool g_headless
+private i32 g_rebuild_frames = 2
+private bool g_quit
+private time.Instant g_t0
+private f64 g_now
+private f64 g_last_build_ms
+private f64 g_build_ms_avg
+private i32 g_frames_built
+private ref []char8 g_title
+
+// Seconds since the window opened (animation clock).
+f64 now():
+    return g_now
+
+// Ask for the UI to be rebuilt on the next frame (and the one after, so a
+// layout that depends on last frame's measurements settles).
+void request_frame():
+    if g_rebuild_frames < 2:
+        g_rebuild_frames = 2
+
+// Milliseconds the last UI rebuild took (the app's frame function plus the
+// toolkit's work), and a running average.
+f64 last_build_ms():
+    return g_last_build_ms
+
+f64 avg_build_ms():
+    return g_build_ms_avg
+
+i32 frames_built():
+    return g_frames_built
+
+// The allocator that outlives the frame (C's heap).
+(rawptr(rawptr, AllocatorMode, u64, u64, rawptr, u64) proc, rawptr data) keep():
+    return libc.allocator()
+
+void quit():
+    g_quit = true
+    if !g_headless:
+        sokol_app.sapp_request_quit()
+
+// Open the window and run until it closes. `init` runs once when the window
+// and the toolkit are up (load data there); `frame` builds the UI. The scale
+// is the display's, unless BTUI_SCALE is set (testing 2x on a 1x screen).
+void run(i32 width, i32 height, string8 title, FrameFn init, FrameFn frame):
+    g_frame_fn = frame
+    g_init_fn = init
+    g_req_w = width
+    g_req_h = height
+    g_force_scale = 0.0
+    string8 env = os_env("BTUI_SCALE")
+    if #len(env) > 0:
+        g_force_scale = parse_scale(env)
+    f32 mul = g_force_scale if g_force_scale > 0.0 else 1.0
+    sokol_app.sapp_desc desc
+    desc.init_cb = _init
+    desc.frame_cb = _frame
+    desc.cleanup_cb = _cleanup
+    desc.event_cb = _event
+    desc.width = i32(f32(width) * mul)
+    desc.height = i32(f32(height) * mul)
+    desc.high_dpi = true
+    desc.sample_count = 1
+    desc.enable_clipboard = true
+    desc.clipboard_size = 1048576
+    desc.enable_dragndrop = true
+    desc.max_dropped_files = 16
+    desc.max_dropped_file_path_length = 2048
+    using libc.allocator():
+        g_title = strings.clone_to_cstring(title)
+    desc.window_title = cstring(g_title)
+    desc.logger.func = sokol_log.slog_func
+    sokol_app.sapp_run(&desc)
+
+private f32 parse_scale(string8 s):
+    f32 v = 0.0
+    f32 frac = 0.0
+    f32 div = 1.0
+    for i in 0..<#len(s):
+        char8 c = s[i]
+        if c == '.':
+            frac = 1.0
+        else if c >= '0' && c <= '9':
+            if frac > 0.0:
+                div = div * 10.0
+                v = v + f32(i32(c) - 48) / div
+            else:
+                v = v * 10.0 + f32(i32(c) - 48)
+    return v
+
+private void up_common(bool headless):
+    g_headless = headless
+    if !g_arena_up:
+        g_frame_arena = arena.over(libc.allocator())
+        g_arena_up = true
+    g_t0 = time.instant()
+    atlas_init()
+    layers_init(g_canvas)
+    if !g_scheme_ready:
+        set_dark(false)
+
+private void _init():
+    sokol_gfx.sg_desc d
+    d.environment = sokol_glue.sglue_environment()
+    d.logger.func = sokol_log.slog_func
+    sokol_gfx.sg_setup(&d)
+    if !draw.init_capacity(524288, 16384):
+        fmt.println("btui: app:draw would not start: ", draw.last_error())
+        sokol_app.sapp_quit()
+        return
+    g_canvas = draw.canvas_create()
+    up_common(false)
+    update_scale()
+    if g_init_fn != nil:
+        g_init_fn()
+
+private void update_scale():
+    f32 s = sokol_app.sapp_dpi_scale()
+    if g_force_scale > 0.0:
+        s = g_force_scale
+    if s < 0.5:
+        s = 1.0
+    i32 fw = sokol_app.sapp_width()
+    i32 fh = sokol_app.sapp_height()
+    set_viewport(f32(fw) / s, f32(fh) / s, s)
+
+private void _frame():
+    g_now = time.as_seconds_f64(time.elapsed(g_t0))
+    update_scale()
+    bool build = g_rebuild_frames > 0 || has_events() || anim_active()
+    if build:
+        build_frame()
+    else:
+        // Idle: nothing changed. Re-render what is retained, and nap a
+        // little so a window without vsync (Xvfb) does not spin a core.
+        time.sleep(time.milliseconds(12))
+    atlas_upload()
+    sokol_gfx.sg_pass pass
+    [4]u8 bg = clear_color()
+    pass.action.colors[0].load_action = sokol_gfx.sg_load_action.SG_LOADACTION_CLEAR
+    pass.action.colors[0].clear_value.r = f32(bg[0]) / 255.0
+    pass.action.colors[0].clear_value.g = f32(bg[1]) / 255.0
+    pass.action.colors[0].clear_value.b = f32(bg[2]) / 255.0
+    pass.action.colors[0].clear_value.a = 1.0
+    pass.swapchain = sokol_glue.sglue_swapchain()
+    sokol_gfx.sg_begin_pass(&pass)
+    draw.canvas_render(g_canvas, sokol_app.sapp_width(), sokol_app.sapp_height())
+    sokol_gfx.sg_end_pass()
+    sokol_gfx.sg_commit()
+    apply_cursor()
+
+// One immediate-mode pass: input in, the app's frame function, the toolkit's
+// end-of-frame bookkeeping. Also what headless tests call.
+void build_frame():
+    time.Instant t = time.instant()
+    if g_rebuild_frames > 0:
+        g_rebuild_frames -= 1
+    using arena.allocator(&g_frame_arena):
+        ui_begin_frame()
+        if g_frame_fn != nil:
+            g_frame_fn()
+        ui_end_frame()
+    arena.reset(&g_frame_arena)
+    g_last_build_ms = time.as_seconds_f64(time.elapsed(t)) * 1000.0
+    g_frames_built += 1
+    if g_frames_built < 3:
+        g_build_ms_avg = g_last_build_ms
+    else:
+        g_build_ms_avg = g_build_ms_avg * 0.95 + g_last_build_ms * 0.05
+
+private void _cleanup():
+    draw.shutdown()
+    sokol_gfx.sg_shutdown()
+
+private void _event(^const sokol_app.sapp_event ev):
+    decode_event(ev)
+
+// ── Headless (tests) ───────────────────────────────────────────────────────
+
+// Bring the toolkit up with no window and no GPU: app:draw records and
+// counts, nothing is drawn. Layout is `w` x `h` dp at `scale`.
+bool headless_up(f32 w, f32 h, f32 scale, FrameFn frame):
+    if !draw.init_headless():
+        return false
+    g_canvas = draw.canvas_create()
+    g_frame_fn = frame
+    up_common(true)
+    set_viewport(w, h, scale)
+    return true
+
+// Advance the clock by `dt` seconds and build one frame from the queued input.
+void headless_frame(f64 dt):
+    g_now = g_now + dt
+    build_frame()
+    atlas_upload()
+
+bool headless():
+    return g_headless
+
+// An environment variable, or "" (kept for the life of the program).
+string8 os_env(string8 name):
+    ref []char8 v = nil
+    using keep():
+        try v = os.get_env(name) else:
+            return ""
+    string8 out = v
+    return out
+
+// The directory of the running executable, or ".".
+string8 exe_dir():
+    ref []char8 d = nil
+    using keep():
+        try string8 p = os.executable_path() else:
+            return "."
+        d = path.dir(p)
+    string8 out = d
+    return out
+
+// Draw calls the GPU took for the previous frame (sokol's count).
+i32 gpu_draw_calls():
+    return draw.gpu_draw_calls()
+
+// The frame-to-frame time sokol measured (seconds).
+f64 frame_seconds():
+    if g_headless:
+        return 0.0
+    return sokol_app.sapp_frame_duration()

@@ -1,0 +1,151 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The atlas: one RGBA8 texture holding every pixel btui draws with: glyphs,
+// icons, anti-aliased corner tiles, shadow tiles and a white block for solid
+// fills. One texture means app:draw's sokol_gp batcher merges a whole frame
+// into a few draw calls (only scissor changes split it).
+//
+// Everything is white with coverage in alpha, `(255, 255, 255, a)`, and is
+// drawn with a tint, so the stock sokol_gp shader (`texel * colour`) is all
+// btui needs. No shader of our own means nothing backend-specific: the same
+// code runs on GL (Linux) and Metal (macOS).
+//
+// Packing is shelf-first-fit with a 1 px transparent gutter around every
+// entry. When the atlas is full it is wiped (`atlas_reset`), every cache that
+// points into it is dropped (`g_atlas_gen` moves on), and the next frame
+// re-rasterises what it uses. Pixels change on the CPU and the whole image is
+// uploaded once before the frame's pass, at most once per frame.
+package btui
+
+import "app:draw"
+
+const i32 ATLAS_SIZE = 2048
+
+type Shelf: (i32 y, i32 h, i32 x)
+
+private ref []u8 g_apix
+private ref []Shelf g_shelves
+private i32 g_shelf_bottom
+private bool g_adirty
+private draw.Texture g_atex = draw.NIL_TEXTURE
+private i32 g_atlas_gen = 1
+private bool g_atlas_full_this_frame
+
+// Where the 4x4 white block lives; a solid fill samples its centre.
+private i32 g_white_x
+private i32 g_white_y
+
+i32 atlas_gen():
+    return g_atlas_gen
+
+draw.Texture atlas_texture():
+    return g_atex
+
+private void atlas_init():
+    if g_apix == nil:
+        g_apix = #make([]u8, i64(ATLAS_SIZE) * i64(ATLAS_SIZE) * 4)
+    atlas_clear()
+
+private void atlas_clear():
+    for i in 0..<#len(g_apix):
+        g_apix[i] = 0
+    // Unwritten texels are transparent *white*, so bilinear filtering at an
+    // entry's edge fades towards the tint, never towards black.
+    i64 n = i64(ATLAS_SIZE) * i64(ATLAS_SIZE)
+    for i in 0..<n:
+        g_apix[i * 4] = 255
+        g_apix[i * 4 + 1] = 255
+        g_apix[i * 4 + 2] = 255
+    #delete(g_shelves)
+    g_shelves = nil
+    g_shelf_bottom = 0
+    g_adirty = true
+    (i32 x, i32 y, bool ok) = atlas_alloc(4, 4)
+    _ = ok
+    g_white_x = x
+    g_white_y = y
+    for yy in 0..<4:
+        for xx in 0..<4:
+            atlas_set(x + i32(xx), y + i32(yy), 255)
+
+// Wipe everything: every cache keyed on `atlas_gen()` goes stale.
+void atlas_reset():
+    g_atlas_gen += 1
+    atlas_clear()
+    g_atlas_full_this_frame = true
+    request_frame()
+
+// Reserve a w x h region (plus the gutter). Answers its top-left corner.
+// When the atlas is full it is reset and the allocation retried once.
+(i32 x, i32 y, bool ok) atlas_alloc(i32 w, i32 h):
+    (i32 x, i32 y, bool ok) = try_alloc(w, h)
+    if ok:
+        return (x, y, true)
+    if g_atlas_full_this_frame:
+        return (0, 0, false)
+    atlas_reset()
+    return try_alloc(w, h)
+
+private (i32 x, i32 y, bool ok) try_alloc(i32 w, i32 h):
+    i32 gw = w + 2
+    i32 gh = h + 2
+    if gw > ATLAS_SIZE || gh > ATLAS_SIZE:
+        return (0, 0, false)
+    // First shelf tall enough (but not wastefully so) with room left.
+    for i in 0..<#len(g_shelves):
+        Shelf s = g_shelves[i]
+        if gh <= s.h && gh * 3 >= s.h * 2 - 4 && s.x + gw <= ATLAS_SIZE:
+            g_shelves[i].x = s.x + gw
+            return (s.x + 1, s.y + 1, true)
+    if g_shelf_bottom + gh > ATLAS_SIZE:
+        // Any shelf at all, before giving up.
+        for i in 0..<#len(g_shelves):
+            Shelf s = g_shelves[i]
+            if gh <= s.h && s.x + gw <= ATLAS_SIZE:
+                g_shelves[i].x = s.x + gw
+                return (s.x + 1, s.y + 1, true)
+        return (0, 0, false)
+    Shelf ns = Shelf((g_shelf_bottom, gh, gw))
+    g_shelves = #append(g_shelves, ns)
+    g_shelf_bottom = g_shelf_bottom + gh
+    return (1, ns.y + 1, true)
+
+void atlas_set(i32 x, i32 y, u8 a):
+    i64 i = (i64(y) * i64(ATLAS_SIZE) + i64(x)) * 4
+    g_apix[i] = 255
+    g_apix[i + 1] = 255
+    g_apix[i + 2] = 255
+    g_apix[i + 3] = a
+    g_adirty = true
+
+// Copy an RGBA block (straight alpha). Used for colour images (the logo).
+void atlas_put_rgba(i32 x, i32 y, i32 w, i32 h, []u8 px):
+    for yy in 0..<h:
+        for xx in 0..<w:
+            i64 s = (i64(yy) * i64(w) + i64(xx)) * 4
+            i64 d = (i64(y + i32(yy)) * i64(ATLAS_SIZE) + i64(x + i32(xx))) * 4
+            g_apix[d] = px[s]
+            g_apix[d + 1] = px[s + 1]
+            g_apix[d + 2] = px[s + 2]
+            g_apix[d + 3] = px[s + 3]
+    g_adirty = true
+
+// Upload if anything changed. Called by the runtime before the pass opens.
+void atlas_upload():
+    g_atlas_full_this_frame = false
+    if !g_adirty:
+        return
+    if !draw.texture_valid(g_atex):
+        g_atex = draw.texture_create(ATLAS_SIZE, ATLAS_SIZE, g_apix[:])
+    else:
+        _ = draw.texture_update(g_atex, g_apix[:])
+    g_adirty = false
+
+// The source rectangle (zero-sized, at a texel centre) of the white block.
+[4]f32 white_src():
+    return [f32(g_white_x) + 2.0, f32(g_white_y) + 2.0, 0.0, 0.0]
+
+// Read back one texel's alpha (tests).
+u8 atlas_alpha(i32 x, i32 y):
+    return g_apix[(i64(y) * i64(ATLAS_SIZE) + i64(x)) * 4 + 3]

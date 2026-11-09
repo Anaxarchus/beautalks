@@ -1,0 +1,223 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The painter: layers, clipping, and the dp drawing calls widgets use.
+//
+// Layers are app:draw items stacked by z-index under the root canvas: the
+// page, popups (menus, dropdowns), modal dialogs (with their scrim), popups
+// inside a dialog, snackbars and tooltips. Each frame every layer is cleared
+// and re-recorded; a widget draws into whichever layer is current. Within a
+// layer, drawing order is call order.
+package btui
+
+import "app:draw"
+
+const i32 LAYER_BASE = 0
+const i32 LAYER_POPUP = 1
+const i32 LAYER_MODAL = 2
+const i32 LAYER_MODAL_POPUP = 3
+const i32 LAYER_SNACK = 4
+const i32 LAYER_TOOLTIP = 5
+const i32 NLAYERS = 6
+
+private [NLAYERS]draw.Item g_layer_items
+private i32 g_layer
+private f32 g_vw
+private f32 g_vh
+private f32 g_scale = 1.0
+private i32 g_quads
+
+// The clip stack (dp), per layer.
+private [NLAYERS][32]Rect g_clips
+private [NLAYERS]i32 g_nclip
+
+void layers_init(draw.Canvas c):
+    for i in 0..<NLAYERS:
+        g_layer_items[i] = draw.canvas_item_create(c)
+        draw.canvas_item_set_z_index(g_layer_items[i], i32(i) * 10)
+
+void set_viewport(f32 w, f32 h, f32 scale):
+    if w != g_vw || h != g_vh || scale != g_scale:
+        request_frame()
+    g_vw = w
+    g_vh = h
+    g_scale = scale
+
+// The window in dp, and the device-pixel scale.
+f32 view_w():
+    return g_vw
+
+f32 view_h():
+    return g_vh
+
+Rect viewport():
+    return Rect((0.0, 0.0, g_vw, g_vh))
+
+f32 scale():
+    return g_scale
+
+draw.Item cur_item():
+    return g_layer_items[g_layer]
+
+i32 layer():
+    return g_layer
+
+// Switch layers; answers the previous one so a caller can restore it.
+i32 set_layer(i32 l):
+    i32 old = g_layer
+    g_layer = l
+    return old
+
+void count_quad():
+    g_quads += 1
+
+i32 quads():
+    return g_quads
+
+void painter_begin():
+    for i in 0..<NLAYERS:
+        draw.canvas_item_clear(g_layer_items[i])
+        g_nclip[i] = 0
+    g_layer = LAYER_BASE
+    g_quads = 0
+
+// ── dp to device pixels ────────────────────────────────────────────────────
+
+i32 px(f32 v):
+    return iround(v * g_scale)
+
+// A dp length as whole device pixels, at least `min_px`.
+i32 px_len(f32 v, i32 min_px):
+    return maxi(min_px, iround(v * g_scale))
+
+// The rectangle snapped to device pixels: (x0, y0, w, h).
+(i32, i32, i32, i32) snap(Rect r):
+    i32 x0 = px(r.x)
+    i32 y0 = px(r.y)
+    i32 x1 = px(r.x + r.w)
+    i32 y1 = px(r.y + r.h)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+// ── Clipping ───────────────────────────────────────────────────────────────
+
+void push_clip(Rect r):
+    i32 n = g_nclip[g_layer]
+    Rect c = r
+    if n > 0:
+        c = intersect(g_clips[g_layer][n - 1], r)
+    if n < 32:
+        g_clips[g_layer][n] = c
+        g_nclip[g_layer] = n + 1
+    (i32 x, i32 y, i32 w, i32 h) = snap(c)
+    draw.push_clip(cur_item(), [f32(x), f32(y), f32(w), f32(h)])
+
+void pop_clip():
+    i32 n = g_nclip[g_layer]
+    if n > 0:
+        g_nclip[g_layer] = n - 1
+    draw.pop_clip(cur_item())
+
+// The current clip rectangle in dp (the whole window when none).
+Rect clip_rect():
+    i32 n = g_nclip[g_layer]
+    if n == 0:
+        return Rect((0.0, 0.0, g_vw, g_vh))
+    return g_clips[g_layer][n - 1]
+
+// ── Shapes (dp) ────────────────────────────────────────────────────────────
+
+void fill_rect(Rect r, [4]u8 col):
+    (i32 x, i32 y, i32 w, i32 h) = snap(r)
+    solid_px(f32(x), f32(y), f32(w), f32(h), col)
+
+void fill_rrect(Rect r, f32 radius, [4]u8 col):
+    (i32 x, i32 y, i32 w, i32 h) = snap(r)
+    i32 rr = px(radius)
+    fill_rrect_px(x, y, w, h, rr, rr, rr, rr, col)
+
+void fill_rrect4(Rect r, Radii rad, [4]u8 col):
+    (i32 x, i32 y, i32 w, i32 h) = snap(r)
+    fill_rrect_px(x, y, w, h, px(rad.tl), px(rad.tr), px(rad.br), px(rad.bl), col)
+
+// An outline inside the rectangle's edge; `width` dp (1 dp is never thinner
+// than one device pixel).
+void stroke_rrect(Rect r, f32 radius, f32 width, [4]u8 col):
+    (i32 x, i32 y, i32 w, i32 h) = snap(r)
+    i32 rr = px(radius)
+    stroke_rrect_px(x, y, w, h, rr, rr, rr, rr, px_len(width, 1), col)
+
+void stroke_rrect4(Rect r, Radii rad, f32 width, [4]u8 col):
+    (i32 x, i32 y, i32 w, i32 h) = snap(r)
+    stroke_rrect_px(x, y, w, h, px(rad.tl), px(rad.tr), px(rad.br), px(rad.bl), px_len(width, 1), col)
+
+void fill_circle(f32 cx, f32 cy, f32 radius, [4]u8 col):
+    // Even diameters keep the four corner tiles from meeting at a half pixel.
+    i32 d = px(radius * 2.0)
+    if (d & 1) == 1:
+        d += 1
+    i32 x = px(cx) - d / 2
+    i32 y = px(cy) - d / 2
+    fill_rrect_px(x, y, d, d, d / 2, d / 2, d / 2, d / 2, col)
+
+void stroke_circle(f32 cx, f32 cy, f32 radius, f32 width, [4]u8 col):
+    i32 d = px(radius * 2.0)
+    if (d & 1) == 1:
+        d += 1
+    i32 x = px(cx) - d / 2
+    i32 y = px(cy) - d / 2
+    stroke_rrect_px(x, y, d, d, d / 2, d / 2, d / 2, d / 2, px_len(width, 1), col)
+
+// A hairline separator: `width` dp tall (at least one device pixel).
+void hline(f32 x0, f32 x1, f32 y, f32 width, [4]u8 col):
+    i32 t = px_len(width, 1)
+    solid_px(f32(px(x0)), f32(px(y)), f32(px(x1) - px(x0)), f32(t), col)
+
+void vline(f32 x, f32 y0, f32 y1, f32 width, [4]u8 col):
+    i32 t = px_len(width, 1)
+    solid_px(f32(px(x)), f32(px(y0)), f32(t), f32(px(y1) - px(y0)), col)
+
+// ── Elevation ──────────────────────────────────────────────────────────────
+// Material 3's shadow tokens (as material-web renders them): a key shadow
+// (30% black) and an ambient one (15% black, with spread). CSS blur radius b
+// is a Gaussian of sigma b/2.
+
+type ShadowSpec: (f32 dy, f32 blur, f32 spread, f32 opacity)
+
+private (ShadowSpec, ShadowSpec) elevation_spec(i32 level):
+    if level == 1:
+        return (ShadowSpec((1.0, 2.0, 0.0, 0.30)), ShadowSpec((1.0, 3.0, 1.0, 0.15)))
+    if level == 2:
+        return (ShadowSpec((1.0, 2.0, 0.0, 0.30)), ShadowSpec((2.0, 6.0, 2.0, 0.15)))
+    if level == 3:
+        return (ShadowSpec((1.0, 3.0, 0.0, 0.30)), ShadowSpec((4.0, 8.0, 3.0, 0.15)))
+    if level == 4:
+        return (ShadowSpec((2.0, 3.0, 0.0, 0.30)), ShadowSpec((6.0, 10.0, 4.0, 0.15)))
+    return (ShadowSpec((4.0, 4.0, 0.0, 0.30)), ShadowSpec((8.0, 12.0, 6.0, 0.15)))
+
+private void one_shadow(Rect r, f32 radius, ShadowSpec s, f32 strength):
+    Rect e = expand(offset(r, 0.0, s.dy), s.spread)
+    (i32 x, i32 y, i32 w, i32 h) = snap(e)
+    f32 sigma = s.blur * 0.5 * g_scale
+    [4]u8 col = [0, 0, 0, u8(clampf(s.opacity * strength, 0.0, 1.0) * 255.0 + 0.5)]
+    shadow_px(x, y, w, h, px(radius + s.spread), sigma, col)
+
+// The shadow of a surface at an elevation level 0..5. `strength` scales it
+// (1 normally; dark themes may want more).
+void shadow(Rect r, f32 radius, i32 level, f32 strength = 1.0):
+    if level <= 0:
+        return
+    (ShadowSpec a, ShadowSpec b) = elevation_spec(level)
+    f32 k = strength
+    if is_dark():
+        k = k * 1.6
+    one_shadow(r, radius, b, k)
+    one_shadow(r, radius, a, k)
+
+// A surface: shadow for `level`, then the fill.
+void surface(Rect r, f32 radius, [4]u8 col, i32 level):
+    shadow(r, radius, level)
+    fill_rrect(r, radius, col)
+
+// The colour the window is cleared to.
+[4]u8 clear_color():
+    return theme().surface

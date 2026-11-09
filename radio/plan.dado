@@ -61,8 +61,11 @@ type Entry:
     bool bcl
     Span name
     Span comment
-    // licence / service note (channel libraries); reported as info only
+    // licence / service note (channel libraries); reported as info only:
+    // `license` is the library's code (none / required / rx_only_service),
+    // `license_text` the licence or service in plain language
     Span license
+    Span license_text
 
 type ChannelList:
     ref []Entry entries
@@ -87,6 +90,17 @@ type ChannelList:
         #delete(self.pool)
         self.entries = nil
         self.pool = nil
+
+    // A deep copy (its own entries and text); destroy it separately.
+    ChannelList copy(^self):
+        ChannelList out
+        out.title = self.title
+        out.notes = self.notes
+        for e in self.entries:
+            out.entries = #append(out.entries, e)
+        for ch in self.pool:
+            out.pool = #append(out.pool, ch)
+        return out
 
 // The level of the model's power index `i` ("Med", "Mid" -> MEDIUM).
 Level model_level(^const Model m, i64 i):
@@ -120,7 +134,7 @@ ChannelList extract(^const Model m, []u8 img):
 
 // ── CSV ──────────────────────────────────────────────────────────────────────
 
-const string8 CSV_HEADER = "number,name,rx_mhz,tx_mhz,rx_tone,tx_tone,power,mode,scan,bcl,comment"
+const string8 CSV_HEADER = "number,name,rx_mhz,tx_mhz,rx_tone,tx_tone,power,mode,scan,bcl,comment,license_note,license"
 
 // The list as beautalks CSV. `# title:` and `# notes:` lines carry the
 // list's own name and notes. The caller #deletes the text.
@@ -161,6 +175,10 @@ ref []char8 list_to_csv(^ChannelList l):
         strings.append(&b, "yes" if e.bcl else "no")
         strings.append_char(&b, ',')
         csv_field(&b, l^.text(e.comment))
+        strings.append_char(&b, ',')
+        csv_field(&b, l^.text(e.license))
+        strings.append_char(&b, ',')
+        csv_field(&b, l^.text(e.license_text))
         strings.append_char(&b, '\n')
     return strings.finish(&b)
 
@@ -180,10 +198,11 @@ type Columns:
     i64 comment
     i64 notes
     i64 license_note
+    i64 license
     i64 set
 
 private Columns columns_of(^const CsvRow row):
-    Columns c = Columns(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
+    Columns c = Columns(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1)
     for i in 0..<#len(row^.fields):
         string8 h = strings.trim(row^.fields[i])
         if h == "number" || h == "slot" || h == "location":
@@ -214,6 +233,8 @@ private Columns columns_of(^const CsvRow row):
             c.notes = i
         else if h == "license_note":
             c.license_note = i
+        else if h == "license" || h == "licence":
+            c.license = i
         else if h == "set":
             c.set = i
     return c
@@ -310,6 +331,9 @@ ChannelList list_from_csv(string8 text, ^ref([]CsvProblem) problems):
         string8 lic = col(&row, c.license_note)
         if #len(lic) != 0:
             e.license = out.add_text(lic)
+        string8 lict = col(&row, c.license)
+        if #len(lict) != 0:
+            e.license_text = out.add_text(lict)
         out.entries = #append(out.entries, e)
     return out
 
@@ -464,54 +488,54 @@ void diag_message(^Report rep, Diag d, ^strings.Builder b):
     string8 n = rep^.text(d.new_value)
     switch d.code:
         case DiagCode.PLACED:
-            strings.append(b, "placed in channel ")
+            strings.append(b, "Placed in channel ")
             strings.append(b, n)
         case DiagCode.RX_OUT_OF_BAND:
             strings.append(b, o)
-            strings.append(b, " MHz is outside the radio's receive bands (")
+            strings.append(b, " MHz is outside the radio's receive range (")
             strings.append(b, n)
             strings.append(b, "); skipped")
         case DiagCode.TX_OUT_OF_BAND:
-            strings.append(b, "transmit ")
+            strings.append(b, "Transmit ")
             strings.append(b, o)
-            strings.append(b, " MHz is outside the radio's transmit bands; receive only")
+            strings.append(b, " MHz is outside the radio's transmit range; set to receive only")
         case DiagCode.NO_FREE_SLOT:
-            strings.append(b, "no free channel left (the radio has ")
+            strings.append(b, "No free channel left (the radio has ")
             strings.append(b, o)
             strings.append(b, "); skipped")
         case DiagCode.SLOT_OUT_OF_RANGE:
-            strings.append(b, "channel ")
+            strings.append(b, "Channel ")
             strings.append(b, o)
             strings.append(b, " does not exist (")
             strings.append(b, n)
             strings.append(b, "); skipped")
         case DiagCode.DUPLICATE_SLOT:
-            strings.append(b, "channel ")
+            strings.append(b, "Channel ")
             strings.append(b, o)
             strings.append(b, " already taken by an earlier entry; skipped")
         case DiagCode.SLOT_OCCUPIED:
-            strings.append(b, "channel ")
+            strings.append(b, "Channel ")
             strings.append(b, o)
             strings.append(b, " is in use and only empty channels may be filled; skipped")
         case DiagCode.NAME_TRUNCATED:
-            strings.append(b, "name \"")
+            strings.append(b, "Name \"")
             strings.append(b, o)
             strings.append(b, "\" shortened to \"")
             strings.append(b, n)
             strings.append(b, "\"")
         case DiagCode.NAME_CHARS:
-            strings.append(b, "name \"")
+            strings.append(b, "Name \"")
             strings.append(b, o)
             strings.append(b, "\" has characters the radio cannot show; now \"")
             strings.append(b, n)
             strings.append(b, "\"")
         case DiagCode.POWER_MAPPED:
-            strings.append(b, "power ")
+            strings.append(b, "Power ")
             strings.append(b, o)
             strings.append(b, " not available; using ")
             strings.append(b, n)
         case DiagCode.MODE_CHANGED:
-            strings.append(b, "mode ")
+            strings.append(b, "Mode ")
             strings.append(b, o)
             strings.append(b, " -> ")
             strings.append(b, n)
@@ -520,21 +544,20 @@ void diag_message(^Report rep, Diag d, ^strings.Builder b):
             else:
                 strings.append(b, " (the radio has no AM at this frequency)")
         case DiagCode.TONE_UNSUPPORTED:
-            strings.append(b, field_id_name(d.field))
-            strings.append(b, " ")
+            strings.append(b, "Receive tone " if d.field == FieldId.RX_TONE else "Transmit tone ")
             strings.append(b, o)
             strings.append(b, " cannot be stored; removed")
         case DiagCode.NOT_STORABLE:
-            strings.append(b, "cannot be stored: ")
+            strings.append(b, "Cannot be stored: ")
             strings.append(b, n)
         case DiagCode.FREQ_ROUNDED:
-            strings.append(b, field_id_name(d.field))
-            strings.append(b, " ")
+            strings.append(b, "Receive frequency " if d.field == FieldId.RX else "Transmit frequency ")
             strings.append(b, o)
-            strings.append(b, " rounded to ")
+            strings.append(b, " MHz rounded to ")
             strings.append(b, n)
+            strings.append(b, " MHz")
         case DiagCode.LICENSE_NOTE:
-            strings.append(b, "note: ")
+            strings.append(b, "Licence: ")
             strings.append(b, o)
         else:
             strings.append(b, "?")
@@ -630,8 +653,10 @@ void apply(^ChannelList l, ^const Model m, []u8 img, ApplyOptions opt, ^Report r
     for k in 0..<#len(l^.entries):
         Entry e = l^.entries[k]
         string8 ename = l^.text(e.name)
-        if e.license.len != 0:
-            strings.append(&v.o, l^.text(e.license))
+        if e.license.len != 0 || e.license_text.len != 0:
+            // old = the plain-language licence (or the code), new = the code
+            strings.append(&v.o, l^.text(e.license_text if e.license_text.len != 0 else e.license))
+            strings.append(&v.n, l^.text(e.license))
             emit(rep, &v, Severity.INFO, DiagCode.LICENSE_NOTE, FieldId.COMMENT, k, -1)
         // ── where it goes
         i32 slot = -1
@@ -677,25 +702,25 @@ void apply(^ChannelList l, ^const Model m, []u8 img, ApplyOptions opt, ^Report r
         c.mode = e.mode
         bool changed = false
         if c.rx_hz % 10 != 0:
-            append_mhz(&v.o, c.rx_hz)
+            append_mhz_short(&v.o, c.rx_hz)
             c.rx_hz = (c.rx_hz + 5) / 10 * 10
-            append_mhz(&v.n, c.rx_hz)
+            append_mhz_short(&v.n, c.rx_hz)
             emit(rep, &v, Severity.WARNING, DiagCode.FREQ_ROUNDED, FieldId.RX, k, slot)
             changed = true
         if c.tx_hz > 0 && c.tx_hz % 10 != 0:
-            append_mhz(&v.o, c.tx_hz)
+            append_mhz_short(&v.o, c.tx_hz)
             c.tx_hz = (c.tx_hz + 5) / 10 * 10
-            append_mhz(&v.n, c.tx_hz)
+            append_mhz_short(&v.n, c.tx_hz)
             emit(rep, &v, Severity.WARNING, DiagCode.FREQ_ROUNDED, FieldId.TX, k, slot)
             changed = true
         if !in_band_list(m^.rx_bands, c.rx_hz):
-            append_mhz(&v.o, c.rx_hz)
-            strings.append(&v.n, m^.rx_bands)
+            append_mhz_short(&v.o, c.rx_hz)
+            append_bands(&v.n, m^.rx_bands)
             emit(rep, &v, Severity.ERROR, DiagCode.RX_OUT_OF_BAND, FieldId.RX, k, -1)
             rep^.skipped += 1
             continue
         if c.tx_hz >= 0 && !in_band_list(m^.tx_bands, c.tx_hz):
-            append_mhz(&v.o, c.tx_hz)
+            append_mhz_short(&v.o, c.tx_hz)
             strings.append(&v.n, "off")
             emit(rep, &v, Severity.WARNING, DiagCode.TX_OUT_OF_BAND, FieldId.TX, k, slot)
             c.tx_hz = -1
@@ -799,11 +824,11 @@ ref []char8 report_text(^ChannelList l, ^Report rep, bool with_info):
                 strings.append(&b, nm)
                 strings.append(&b, " ")
             strings.append(&b, "(")
-            append_mhz(&b, e.rx_hz)
-            strings.append(&b, "): ")
+            append_mhz_short(&b, e.rx_hz)
+            strings.append(&b, " MHz): ")
         diag_message(rep, d, &b)
         strings.append_char(&b, '\n')
-    strings.append(&b, "placed ")
+    strings.append(&b, "Placed ")
     append_int(&b, i64(rep^.placed))
     strings.append(&b, ", changed ")
     append_int(&b, i64(rep^.changed))

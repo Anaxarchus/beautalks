@@ -102,12 +102,61 @@ string need(string key):
         return hex_bytes(id)
     return id.bytes()
 
+// Whether a programming session is already open (the radio was not
+// power-cycled since the last one). In a session the radio executes every
+// R and W frame it can parse and ignores other bytes; a new ident would be
+// parsed as commands. So we probe with a harmless read of block 0 first and
+// reuse an open session. (Nothing sent outside a write holds 0x57.)
+// Reads and throws away input until `quiet_ms` pass in silence.
+void drain(int quiet_ms):
+    for i in 0..<40:
+        []byte junk = link.read(256, quiet_ms)
+        if junk.len() == 0:
+            return
+
+// One probe: 1 open, 0 silence, -1 partial or garbled.
+int probe_once():
+    link.discard()
+    link.write([0x52, 0x00, 0x00, 0x40])
+    []byte got = link.read(0x44, 600)
+    if got.len() == 0:
+        return 0
+    if got.len() == 0x44 && got[0] == 0x52 && got[1] == 0 && got[2] == 0 && got[3] == 0x40:
+        drain(100)
+        return 1
+    return -1
+
+bool session_open():
+    int r = probe_once()
+    if r < 0:
+        drain(300)
+        r = probe_once()
+        if r < 0:
+            drain(300)
+    return r == 1
+
 // Program mode + magics. Answers the replies, as text, for detection:
 // "M:<the 'M' magic's reply>" is what [detect] model_reply matches.
 string identify():
-    link.discard()
-    link.write(ident_bytes())
-    []byte ack = link.read(1, 1000)
+    // up to 3 tries, 500 ms apart: the first ident after a session can be
+    // missed (provisional timing, as radio.IDENT_TRIES / IDENT_RETRY_MS)
+    []byte ack = []
+    for tries in 0..<3:
+        if tries > 0:
+            link.discard()
+            link.sleep(500)
+        link.discard()
+        link.write(ident_bytes())
+        ack = link.read(1, 1000)
+        if ack.len() == 1 && ack[0] == 0x06:
+            break
+        if ack.len() == 1:
+            // anything but 06: an open session the probe missed parses the
+            // ident as a read (52 4F 47 52 ...); never send another ident
+            drain(300)
+            if session_open():
+                return "session"
+
     if ack.len() == 0:
         fail Error("no answer to the program-mode string", NO_ANSWER)
     if ack[0] != 0x06:
@@ -147,7 +196,8 @@ int total_size():
     return n
 
 []byte download():
-    identify()
+    if !session_open():
+        identify()
     []byte key = hex_bytes(model.get("link.key", ""))
     int block = number(model.get("link.block", "0x40"))
     int total = total_size()
@@ -172,7 +222,8 @@ void upload([]byte image):
     int total = total_size()
     if image.len() != total:
         fail Error("image is " + string(image.len()) + " bytes, model wants " + string(total), IMAGE_SIZE)
-    identify()
+    if !session_open():
+        identify()
     []byte key = hex_bytes(model.get("link.key", ""))
     int block = number(model.get("link.block", "0x40"))
     int at = 0

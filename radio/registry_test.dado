@@ -1,0 +1,139 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Known radios: a radio seen before is detected with one handshake; an
+// unseen one still falls back to the full scan. Registry persistence,
+// rename and forget.
+package radio
+
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+// Starts the emulator for `model_ini` serving `image`; `dump` receives its
+// memory after every write.
+bool start_emu(string8 model_ini, string8 image, string8 dump, string8 port_file, ^Emu out):
+    if fs.exists(port_file):
+        try fs.remove_file(port_file) else:
+            return false
+    [11]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--dump", dump, "--port-file", port_file, "")
+    try out^.d = proc.duplex(argv[0..<10]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists(port_file):
+            try out^.port = fs.read_file(port_file) else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        _ = 0
+    #delete(e^.port)
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    bool ok = true
+    string8 dir = "build/registry_test"
+    if fs.exists(dir):
+        try fs.remove_all(dir) else:
+            return 1
+    Registry reg = open_registry(dir)
+    Emu e
+    // 1. unseen UV-5RM, empty registry: the full scan (every UV-5R magic, then the ident)
+    if !start_emu("models/uv-5rm.ini", "testdata/uv5rm.img", "build/reg_dump.img", "build/reg.port", &e):
+        return 1
+    try Detection d1 = detect_with(e.port, models, &reg, no_progress()) else:
+        return 1
+    i64 scan = 0
+    for m in models:
+        if m.engine == "uv5r":
+            scan += 1
+    // the full scan tries the UV-17Pro idents first now: one handshake, ~1-2 s
+    string8 log1 = d1.log
+    ok = #expect(d1.found && !d1.fast_path && d1.attempts == 1 && d1.elapsed_ms < 5000, "unseen: full scan, attempts ", d1.attempts, " in ", d1.elapsed_ms, " ms") && ok
+    ok = #expect(strings.contains(log1, "session probe") && strings.contains(log1, "PROGRAMBFNORMALU @115200: answered"), "the detection log says what was tried") && ok
+    ok = #expect(models[d1.candidates[0]].id == "uv-5rm", "unseen: uv-5rm ranked first") && ok
+    ref []char8 id = remember_detection(&reg, &d1, &models[d1.candidates[0]], e.port)
+    close_detection(&d1)
+    ok = #expect(save_registry(&reg), "registry saved") && ok
+    reg.destroy()
+    stop_emu(&e)
+
+    // 2. the same radio again (new process state: registry reloaded from disk): one handshake
+    Registry reg2 = open_registry(dir)
+    defer reg2.destroy()
+    if !start_emu("models/uv-5rm.ini", "testdata/uv5rm.img", "build/reg_dump.img", "build/reg.port", &e):
+        return 1
+    try Detection d2 = detect_with(e.port, models, &reg2, no_progress()) else:
+        return 1
+    ok = #expect(d2.found && d2.fast_path && d2.attempts == 1, "seen: fast path, attempts ", d2.attempts, " in ", d2.elapsed_ms, " ms") && ok
+    string8 log2 = d2.log
+    ok = #expect(strings.contains(log2, "(remembered uv-5rm)"), "the log names the remembered radio") && ok
+    ok = #expect(models[d2.candidates[0]].id == "uv-5rm", "seen: uv-5rm first") && ok
+    // the detected session goes straight on to a download
+    try ref []u8 img = download_detected(&d2, &models[d2.candidates[0]], no_progress()) else:
+        return 1
+    ref []char8 id2 = remember_detection(&reg2, &d2, &models[d2.candidates[0]], e.port)
+    string8 a1 = id
+    string8 a2 = id2
+    ok = #expect(a1 == a2, "same record: ", id2, " vs ", id) && ok
+    remember_image(&reg2, id2, &models[d2.candidates[0]], img, "backups/x.img")
+    #delete(img)
+    close_detection(&d2)
+    stop_emu(&e)
+
+    // 3. an unseen UV-5RE while the UV-5RM is remembered: the remembered
+    //    handshake fails once, then the full scan finds it
+    if !start_emu("models/uv-5r.ini", "testdata/uv5re.img", "build/reg_dump.img", "build/reg.port", &e):
+        return 1
+    try Detection d3 = detect_with(e.port, models, &reg2, no_progress()) else:
+        return 1
+    string8 log3 = d3.log
+    ok = #expect(d3.found && !d3.fast_path && d3.engine == "uv5r" && d3.attempts >= 2 && d3.elapsed_ms < 15000, "unseen 5RE: fallback, attempts ", d3.attempts, " in ", d3.elapsed_ms, " ms") && ok
+    ok = #expect(strings.contains(log3, "(remembered uv-5rm): no reply") && strings.contains(log3, "@9600: answered"), "the log shows the failed remembered try and the answer") && ok
+    ref []char8 id3 = remember_detection(&reg2, &d3, &models[d3.candidates[0]], e.port)
+    close_detection(&d3)
+    stop_emu(&e)
+
+    // listing, rename, forget, persistence
+    ok = #expect(rename_radio(&reg2, id2, "Sam's 5RM"), "rename") && ok
+    ok = #expect(save_registry(&reg2), "save") && ok
+    Registry reg3 = open_registry(dir)
+    defer reg3.destroy()
+    KnownList k = list_known(&reg3)
+    ok = #expect(#len(k.radios) == 2, "two known radios ", #len(k.radios)) && ok
+    string8 id2s = id2
+    bool found_nick = false
+    for x in k.radios:
+        if k.text(x.id) == id2s:
+            string8 sha = k.text(x.image_sha256)
+            found_nick = k.text(x.nickname) == "Sam's 5RM" && x.seen == 2 && k.text(x.handshake) == "PROGRAMBFNORMALU" && #len(sha) == 64 && k.text(x.backup) == "backups/x.img"
+    ok = #expect(found_nick, "record fields survive a reload") && ok
+    k.destroy()
+    ok = #expect(forget_radio(&reg3, id3), "forget") && ok
+    KnownList k2 = list_known(&reg3)
+    ok = #expect(#len(k2.radios) == 1, "one left") && ok
+    k2.destroy()
+    // known radios carry their fingerprint and write status
+    KnownList k3 = list_known(&reg3)
+    TestedStore none = open_tested("build/registry_test_none")
+    for i in 0..<#len(k3.radios):
+        string8 fp = k3.text(k3.radios[i].fingerprint)
+        ok = #expect(strings.starts_with(fp, "uv17pro:F=0136") && strings.contains(fp, " M=355248"), "known radio fingerprint: ", fp) && ok
+        WriteStatus ws = known_write_status(&k3, i, models, &none)
+        ok = #expect(ws.by == TestedBy.SHIPPED, "UV-5RM is shipped tested") && ok
+    none.destroy()
+    k3.destroy()
+    #delete(id)
+    #delete(id2)
+    #delete(id3)
+    return 0 if ok else 1

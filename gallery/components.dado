@@ -1,0 +1,203 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Components page: every widget, grouped in cards, in a scroll area.
+package main
+
+import btui "../ui"
+
+btui.Scroll g_comp_scroll
+bool g_cb1 = true
+bool g_cb2
+bool g_cb3 = true
+bool g_sw1 = true
+bool g_sw2
+i32 g_radio_sel = 1
+bool g_fc1 = true
+bool g_fc2
+bool g_fc3 = true
+i32 g_tab
+i32 g_seg = 1
+i32 g_list_sel = 1
+f32 g_prog = 0.62
+
+private f32 section(f32 x, f32 y, f32 w, f32 h, string8 title, string8 sub):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(btui.rect(x, y, w, h), btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, x + 24.0, y + 20.0, title, t.on_surface)
+    if #len(sub) > 0:
+        _ = btui.text(btui.BODY_SMALL, x + 24.0, y + 44.0, sub, t.on_surface_variant)
+    return y + 72.0
+
+private void label(f32 x, f32 y, string8 s):
+    _ = btui.text(btui.LABEL_MEDIUM, x, y, s, btui.theme().on_surface_variant)
+
+void components_page(btui.Rect area0):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect area = area0
+    btui.Rect bar = btui.cut_top(&area, 64.0)
+    _ = btui.top_app_bar(bar, "Components", g_comp_scroll.y > 1.0, false)
+    f32 content_h = 1350.0
+    _ = btui.scroll_update(area, &g_comp_scroll, content_h)
+    btui.push_clip(area)
+    f32 x0 = area.x + 24.0
+    f32 y0 = area.y + 8.0 - g_comp_scroll.y
+    f32 W = area.w - 48.0
+    f32 colw = (W - 24.0) * 0.5
+    f32 xr = x0 + colw + 24.0
+
+    // ── Buttons ──
+    f32 y = section(x0, y0, colw, 300.0, "Buttons", "Filled, tonal, outlined, text, elevated; icon buttons; FAB")
+    f32 x = x0 + 24.0
+    (bool b1, f32 w1) = btui.button_at(x, y, "Read radio", btui.BTN_FILLED, "download")
+    if b1:
+        btui.snackbar_show("Filled button clicked")
+    x = x + w1 + 12.0
+    (bool b2, f32 w2) = btui.button_at(x, y, "Save", btui.BTN_TONAL, "save")
+    _ = b2
+    x = x + w2 + 12.0
+    (bool b3, f32 w3) = btui.button_at(x, y, "Export CSV", btui.BTN_OUTLINED)
+    _ = b3
+    x = x + w3 + 12.0
+    (bool b4, f32 w4) = btui.button_at(x, y, "Learn more", btui.BTN_TEXT)
+    _ = b4
+    _ = w4
+    y = y + 56.0
+    x = x0 + 24.0
+    (bool b5, f32 w5) = btui.button_at(x, y, "Elevated", btui.BTN_ELEVATED, "add")
+    _ = b5
+    x = x + w5 + 12.0
+    (bool b6, f32 w6) = btui.button_at(x, y, "Disabled", btui.BTN_FILLED, "", true)
+    _ = b6
+    x = x + w6 + 12.0
+    (bool b7, f32 w7) = btui.button_at(x, y, "Disabled", btui.BTN_OUTLINED, "", true)
+    _ = b7
+    x = x + w7 + 12.0
+    (bool b8, f32 w8) = btui.button_at(x, y, "Erase radio", btui.BTN_DANGER, "delete")
+    _ = b8
+    _ = w8
+    y = y + 60.0
+    x = x0 + 16.0
+    _ = btui.icon_button("edit", btui.rect(x, y, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Edit")
+    _ = btui.icon_button("star", btui.rect(x + 52.0, y, 48.0, 48.0), btui.ICON_STANDARD, true, false, "Favourite")
+    _ = btui.icon_button("sync", btui.rect(x + 104.0, y, 48.0, 48.0), btui.ICON_FILLED, false, false, "Sync")
+    _ = btui.icon_button("tune", btui.rect(x + 156.0, y, 48.0, 48.0), btui.ICON_TONAL, false, false, "Settings")
+    _ = btui.icon_button("delete", btui.rect(x + 208.0, y, 48.0, 48.0), btui.ICON_OUTLINED, false, false, "Delete")
+    _ = btui.icon_button("lock", btui.rect(x + 260.0, y, 48.0, 48.0), btui.ICON_STANDARD, false, true)
+    // FABs
+    _ = btui.fab("add", "", btui.rect(x0 + colw - 24.0 - 56.0 - 12.0 - btui.fab_width("New profile"), y - 4.0, 56.0, 56.0))
+    f32 fw = btui.fab_width("New profile")
+    _ = btui.fab("playlist_add", "New profile", btui.rect(x0 + colw - 24.0 - fw, y - 4.0, fw, 56.0))
+    y = y + 64.0
+    []string8 segs = ["Day", "Week", "Month"]
+    _ = btui.segmented("seg", btui.rect(x0 + 24.0, y, 320.0, 40.0), segs, &g_seg)
+
+    // ── Selection ──
+    y = section(xr, y0, colw, 300.0, "Selection controls", "Checkbox, switch, radio button")
+    f32 cx0 = xr + 16.0
+    _ = btui.checkbox("Back up before writing", cx0, y, &g_cb1)
+    _ = btui.checkbox("Skip empty channels", cx0, y + 44.0, &g_cb2)
+    _ = btui.checkbox("Overwrite names", cx0, y + 88.0, &g_cb3, false, true)
+    _ = btui.checkbox("Disabled option", cx0, y + 132.0, &g_cb3, true)
+    f32 sx = xr + colw * 0.5 + 8.0
+    _ = btui.switch_("sw1", sx, y + 4.0, &g_sw1)
+    _ = btui.text(btui.BODY_LARGE, sx + 64.0, y + 8.0, "Auto-detect cable", t.on_surface)
+    g_sw2 = btui.is_dark()
+    if btui.switch_("sw2", sx, y + 52.0, &g_sw2):
+        btui.set_dark(g_sw2)
+    _ = btui.text(btui.BODY_LARGE, sx + 64.0, y + 56.0, "Dark theme", t.on_surface)
+    _ = btui.radio("High", sx - 8.0, y + 96.0, &g_radio_sel, 0, false, "pwr")
+    _ = btui.radio("Medium", sx - 8.0 + 90.0, y + 96.0, &g_radio_sel, 1, false, "pwr")
+    _ = btui.radio("Low", sx - 8.0 + 206.0, y + 96.0, &g_radio_sel, 2, false, "pwr")
+
+    // ── Chips + badges ──
+    f32 y2 = y0 + 300.0 + 24.0
+    y = section(x0, y2, colw, 220.0, "Chips and badges", "Assist, filter, input, suggestion; status pills")
+    x = x0 + 24.0
+    (bool c1, f32 cw1) = btui.chip_at(x, y, "Add to radio", btui.CHIP_ASSIST, "add")
+    _ = c1
+    x = x + cw1 + 8.0
+    (bool c2, f32 cw2) = btui.chip_at(x, y, "GMRS", btui.CHIP_FILTER, "", &g_fc1)
+    _ = c2
+    x = x + cw2 + 8.0
+    (bool c3, f32 cw3) = btui.chip_at(x, y, "FRS", btui.CHIP_FILTER, "", &g_fc2)
+    _ = c3
+    x = x + cw3 + 8.0
+    (bool c4, f32 cw4) = btui.chip_at(x, y, "UV-5RM", btui.CHIP_INPUT, "radio")
+    _ = c4
+    x = x + cw4 + 8.0
+    (bool c5, f32 cw5) = btui.chip_at(x, y, "146.520", btui.CHIP_SUGGESTION)
+    _ = c5
+    _ = cw5
+    y = y + 48.0
+    x = x0 + 24.0
+    x = x + btui.status_chip(x, y, "Tested · write OK", btui.TONE_SUCCESS, "verified") + 8.0
+    x = x + btui.status_chip(x, y, "Untested · read-only", btui.TONE_WARNING, "lock") + 8.0
+    x = x + btui.status_chip(x, y, "Unverified layout", btui.TONE_ERROR, "error") + 8.0
+    y = y + 44.0
+    x = x0 + 24.0
+    x = x + btui.status_chip(x, y, "Receive only", btui.TONE_INFO, "info", true) + 8.0
+    x = x + btui.status_chip(x, y, "GMRS licence", btui.TONE_WARNING, "", true) + 8.0
+    x = x + btui.status_chip(x, y, "Licence-free", btui.TONE_SUCCESS, "", true) + 8.0
+    x = x + btui.status_chip(x, y, "Amateur licence", btui.TONE_PRIMARY, "", true) + 24.0
+    btui.icon("notifications", x, y, 24.0, t.on_surface_variant)
+    btui.badge(x, y, "")
+    btui.icon("cable", x + 40.0, y, 24.0, t.on_surface_variant)
+    btui.badge(x + 40.0, y, "3")
+    btui.icon("history", x + 80.0, y, 24.0, t.on_surface_variant)
+    btui.badge(x + 80.0, y, "999+")
+
+    // ── Progress ──
+    y = section(xr, y2, colw, 220.0, "Progress", "Linear and circular, determinate and indeterminate")
+    g_prog = g_prog + 0.0
+    btui.progress_linear(btui.rect(xr + 24.0, y + 4.0, colw - 48.0, 8.0), g_prog)
+    btui.progress_linear(btui.rect(xr + 24.0, y + 28.0, colw - 48.0, 8.0), -1.0)
+    btui.progress_circular(xr + 48.0, y + 88.0, 48.0, 0.72)
+    btui.progress_circular(xr + 120.0, y + 88.0, 48.0, -1.0)
+    btui.progress_circular(xr + 180.0, y + 88.0, 24.0, -1.0, 3.0)
+    _ = btui.text(btui.BODY_MEDIUM, xr + 216.0, y + 66.0, "Reading channel 412 of 1000…", t.on_surface)
+    _ = btui.text(btui.BODY_SMALL, xr + 216.0, y + 88.0, "About 20 seconds left", t.on_surface_variant)
+
+    // ── Tabs + stepper ──
+    f32 y3 = y2 + 220.0 + 24.0
+    y = section(x0, y3, W, 250.0, "Tabs and stepper", "")
+    []string8 tl = ["Channels", "Settings", "Backups", "Raw image"]
+    []string8 ti = ["cell_tower", "settings", "history", "description"]
+    _ = btui.tabs("tabs", btui.rect(x0 + 24.0, y - 24.0, W * 0.5, 64.0), tl, &g_tab, ti)
+    []string8 st = ["Back up", "Write", "Verify"]
+    []string8 sc = ["Saved 14:02", "Channel 12 of 32", "Read back and compare"]
+    [3]i32 ss = [btui.STEP_DONE, btui.STEP_ACTIVE, btui.STEP_PENDING]
+    btui.stepper(btui.rect(x0 + 24.0, y + 64.0, W * 0.62, 48.0), st, sc, ss[:], 0.38)
+    [3]i32 ss2 = [btui.STEP_DONE, btui.STEP_DONE, btui.STEP_ERROR]
+    []string8 sc2 = ["Saved 14:02", "32 channels", "Channel 7 differs"]
+    btui.stepper(btui.rect(x0 + 24.0, y + 124.0, W * 0.62, 48.0), st, sc2, ss2[:], -1.0)
+
+    // ── Lists + cards ──
+    f32 y4 = y3 + 250.0 + 24.0
+    y = section(x0, y4, colw, 424.0, "Lists", "One- and two-line items, selection")
+    f32 lw = colw - 2.0
+    if btui.list_item(btui.rect(x0 + 1.0, y, lw, 72.0), "Truck radio", "Baofeng UV-5RM · seen 3 times", "radio", "2 min ago", g_list_sel == 0, true):
+        g_list_sel = 0
+    if btui.list_item(btui.rect(x0 + 1.0, y + 72.0, lw, 72.0), "Kitchen handheld", "Baofeng UV-5R · seen 11 times", "radio", "Yesterday", g_list_sel == 1, true):
+        g_list_sel = 1
+    if btui.list_item(btui.rect(x0 + 1.0, y + 144.0, lw, 72.0), "Family Alaska", "Profile · 32 channels", "library_books", "8 Nov", g_list_sel == 2, true):
+        g_list_sel = 2
+    btui.divider(x0 + 16.0, x0 + colw - 16.0, y + 216.0)
+    _ = btui.list_item(btui.rect(x0 + 1.0, y + 220.0, lw, 56.0), "Open a backup…", "", "folder_open")
+    _ = btui.list_item(btui.rect(x0 + 1.0, y + 276.0, lw, 56.0), "Settings", "", "settings")
+
+    y = section(xr, y4, colw, 424.0, "Cards", "Elevated, filled, outlined (hover the elevated one)")
+    f32 cw = (colw - 48.0 - 24.0) / 3.0
+    _ = btui.card(btui.rect(xr + 24.0, y, cw, 150.0), btui.CARD_ELEVATED, "card1")
+    _ = btui.card(btui.rect(xr + 24.0 + cw + 12.0, y, cw, 150.0), btui.CARD_FILLED, "card2")
+    _ = btui.card(btui.rect(xr + 24.0 + 2.0 * (cw + 12.0), y, cw, 150.0), btui.CARD_OUTLINED, "card3")
+    []string8 cn = ["Elevated", "Filled", "Outlined"]
+    for i in 0..<3:
+        f32 cxp = xr + 24.0 + f32(i32(i)) * (cw + 12.0)
+        _ = btui.text(btui.TITLE_MEDIUM, cxp + 16.0, y + 16.0, cn[i], t.on_surface)
+        _ = btui.text_wrap(btui.rect(cxp + 16.0, y + 44.0, cw - 32.0, 80.0), btui.BODY_SMALL, "A surface for one thing: a radio, a profile, a backup.", t.on_surface_variant)
+    _ = btui.text(btui.BODY_MEDIUM, xr + 24.0, y + 176.0, "Tooltips: rest the pointer on any icon button.", t.on_surface_variant)
+    _ = btui.text(btui.BODY_MEDIUM, xr + 24.0, y + 200.0, "Focus: press Tab to walk the controls (rings show).", t.on_surface_variant)
+    _ = btui.text(btui.BODY_MEDIUM, xr + 24.0, y + 224.0, "Text: Inter 4 · ±0.5 dB · 146.520 MHz · 22°C · ✓ — …", t.on_surface_variant)
+    btui.pop_clip()
+    btui.scrollbar("comp", area, &g_comp_scroll)

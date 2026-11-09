@@ -1,0 +1,131 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Forms page: text fields, selects, a menu, a dialog and a snackbar.
+package main
+
+import btui "../ui"
+
+btui.Field g_f_name
+btui.Field g_f_freq
+btui.Field g_f_bad
+btui.Field g_f_nick
+btui.Field g_f_off
+btui.Field g_f_dis
+i32 g_sel_model = 1
+i32 g_sel_tone = 6
+i32 g_sel_port
+
+[5]string8 MODELS_A = ["Baofeng UV-5R", "Baofeng UV-5RM", "Baofeng UV-17 Pro", "Baofeng BF-F8HP", "Retevis H-777"]
+[3]string8 PORTS_A = ["/dev/cu.usbserial-140 (CH340)", "/dev/cu.usbmodem1101", "/dev/cu.Bluetooth-Incoming-Port"]
+[5]string8 MENU_ITEMS_A = ["Duplicate", "Move up", "Move down", "Copy as CSV", "Clear channel"]
+[5]string8 MENU_ICONS_A = ["content_copy", "arrow_upward", "arrow_downward", "description", "delete"]
+
+void forms_init():
+    btui.field_set(&g_f_name, "Truck radio")
+    btui.field_set(&g_f_freq, "146.520")
+    btui.field_set(&g_f_bad, "520.7")
+    btui.field_set(&g_f_off, "0.600")
+    btui.field_set(&g_f_dis, "UV-5RM")
+
+void forms_open_menu():
+    btui.menu_open("rowmenu", g_menu_anchor, 0)
+
+btui.Rect g_menu_anchor
+
+void forms_page(btui.Rect area0):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect area = area0
+    btui.Rect bar = btui.cut_top(&area, 64.0)
+    _ = btui.top_app_bar(bar, "Forms", false, false)
+    f32 x0 = area.x + 24.0
+    f32 y = area.y + 8.0
+    f32 W = area.w - 48.0
+    f32 colw = (W - 24.0) * 0.5
+    f32 xr = x0 + colw + 24.0
+    _ = btui.card(btui.rect(x0, y, colw, 560.0), btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, x0 + 24.0, y + 20.0, "Text fields", t.on_surface)
+    f32 fy = y + 64.0
+    f32 fw = colw - 48.0
+    btui.FieldOpts o1 = btui.field_opts("Radio nickname", btui.FIELD_FILLED)
+    o1.helper = "Shown in the radio list"
+    o1.leading = "radio"
+    _ = btui.text_field("name", btui.rect(x0 + 24.0, fy, fw, 76.0), &g_f_name, o1)
+    fy = fy + 92.0
+    btui.FieldOpts o2 = btui.field_opts("Receive frequency", btui.FIELD_OUTLINED)
+    o2.suffix = "MHz"
+    o2.numeric = true
+    o2.helper = "2 m: 144–148 · 70 cm: 420–450"
+    o2.behind = t.surface
+    _ = btui.text_field("freq", btui.rect(x0 + 24.0, fy, fw * 0.5 - 8.0, 76.0), &g_f_freq, o2)
+    btui.FieldOpts o5 = btui.field_opts("Offset", btui.FIELD_OUTLINED)
+    o5.suffix = "MHz"
+    o5.numeric = true
+    _ = btui.text_field("off", btui.rect(x0 + 24.0 + fw * 0.5 + 8.0, fy, fw * 0.5 - 8.0, 76.0), &g_f_off, o5)
+    fy = fy + 92.0
+    btui.FieldOpts o3 = btui.field_opts("Transmit frequency", btui.FIELD_FILLED)
+    o3.suffix = "MHz"
+    o3.numeric = true
+    o3.error = "520.700 MHz is outside this radio's bands (400–520)"
+    _ = btui.text_field("bad", btui.rect(x0 + 24.0, fy, fw, 76.0), &g_f_bad, o3)
+    fy = fy + 92.0
+    btui.FieldOpts o4 = btui.field_opts("Search channels", btui.FIELD_OUTLINED)
+    o4.leading = "search"
+    o4.placeholder = "Name, frequency or service"
+    o4.behind = t.surface
+    _ = btui.text_field("nick", btui.rect(x0 + 24.0, fy, fw, 56.0), &g_f_nick, o4)
+    fy = fy + 76.0
+    btui.FieldOpts o6 = btui.field_opts("Model (detected)", btui.FIELD_FILLED)
+    o6.disabled = true
+    _ = btui.text_field("dis", btui.rect(x0 + 24.0, fy, fw, 56.0), &g_f_dis, o6)
+
+    // selects, menu, dialog, snackbar
+    _ = btui.card(btui.rect(xr, y, colw, 560.0), btui.CARD_OUTLINED)
+    _ = btui.text(btui.TITLE_MEDIUM, xr + 24.0, y + 20.0, "Menus, dialogs, snackbars", t.on_surface)
+    fy = y + 64.0
+    btui.FieldOpts s1 = btui.field_opts("Radio model", btui.FIELD_OUTLINED)
+    s1.behind = t.surface
+    s1.leading = "radio"
+    _ = btui.select("model", btui.rect(xr + 24.0, fy, fw, 56.0), &g_sel_model, MODELS_A[:], s1)
+    fy = fy + 80.0
+    btui.FieldOpts s2 = btui.field_opts("CTCSS tone", btui.FIELD_FILLED)
+    s2.helper = "Sent with every transmission"
+    _ = btui.select("tone", btui.rect(xr + 24.0, fy, fw * 0.5 - 8.0, 56.0), &g_sel_tone, TONES_A[:], s2)
+    btui.FieldOpts s3 = btui.field_opts("Port", btui.FIELD_FILLED)
+    _ = btui.select("port", btui.rect(xr + 24.0 + fw * 0.5 + 8.0, fy, fw * 0.5 - 8.0, 56.0), &g_sel_port, PORTS_A[:], s3)
+    fy = fy + 96.0
+    f32 bx = xr + 24.0
+    (bool d1, f32 dw1) = btui.button_at(bx, fy, "Open dialog", btui.BTN_TONAL, "open_in_new")
+    if d1:
+        btui.dialog_open("confirm")
+    bx = bx + dw1 + 12.0
+    (bool d2, f32 dw2) = btui.button_at(bx, fy, "Show snackbar", btui.BTN_OUTLINED)
+    if d2:
+        btui.snackbar_show("Saved “Family Alaska” (32 channels)", "Undo")
+    bx = bx + dw2 + 12.0
+    f32 mw = btui.button_width("Row actions", "more_vert", btui.BTN_TEXT)
+    g_menu_anchor = btui.rect(bx, fy, mw, 40.0)
+    if btui.button("Row actions", g_menu_anchor, btui.BTN_TEXT, "more_vert"):
+        btui.menu_open("rowmenu", g_menu_anchor, -1)
+    i32 mi = btui.menu("rowmenu", MENU_ITEMS_A[:], -1, 220.0, MENU_ICONS_A[:])
+    if mi >= 0:
+        btui.snackbar_show(#format("“", MENU_ITEMS_A[mi], "” chosen"))
+    fy = fy + 72.0
+    _ = btui.text_wrap(btui.rect(xr + 24.0, fy, fw, 200.0), btui.BODY_MEDIUM, "Keyboard: Tab and Shift+Tab move focus; Space or Enter press buttons and open selects; arrows, Home/End and type-ahead work in menus; Esc closes menus and dialogs. Text fields support selection with Shift+arrows, word jumps, double-click, and the clipboard (Cmd on macOS, Ctrl on Linux).", t.on_surface_variant)
+    confirm_dialog()
+
+private void confirm_dialog():
+    ^btui.Scheme t = btui.theme()
+    (btui.Rect body, bool open) = btui.dialog_begin("confirm", "Replace the channels on this radio?", 440.0, 48.0, "warning")
+    if !open:
+        return
+    _ = btui.text_wrap(body, btui.BODY_MEDIUM, "Your current channels are backed up first. You can put them back from Backups at any time.", t.on_surface_variant)
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("Replace", "", btui.BTN_TEXT)
+    if btui.button("Replace", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+        btui.snackbar_show("Channels replaced")
+    f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()

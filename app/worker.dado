@@ -1,0 +1,395 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Radio work on a thread. One job at a time; the UI polls `job_state()` each
+// frame and keeps frames coming while a job runs, so the window never
+// blocks. Progress and phase are atomics; results are plain fields the
+// worker fills before it publishes DONE (a sequentially consistent store),
+// read by the UI only after it has seen DONE.
+//
+// Everything a job does is a call into the radio library (and engines /
+// updater): detection with the registry's fast path, download, the single
+// write gate (Runner.safe_write_detected), the guided-verification steps,
+// driver updates. Cancel is radio.request_cancel(); the job then ends with
+// CANCELLED at the library's next safe point.
+package main
+
+import "core:os/fs"
+import "core:strings"
+import "core:threads"
+import "core:time"
+import "../engines"
+import "../radio"
+import "../updater"
+
+const i32 JOB_DETECT = 1
+const i32 JOB_READ = 2
+const i32 JOB_WRITE = 3
+const i32 JOB_VERIFY_BEGIN = 4
+const i32 JOB_VERIFY_WRITE = 5
+const i32 JOB_VERIFY_RESTORE = 6
+const i32 JOB_UPDATE = 7
+const i32 JOB_ROLLBACK = 8
+
+const i32 JS_IDLE = 0
+const i32 JS_RUNNING = 1
+const i32 JS_DONE = 2
+
+const i32 PH_START = 0
+const i32 PH_DETECT = 1
+const i32 PH_READ = 2
+const i32 PH_BACKUP = 3
+const i32 PH_WRITE = 4
+const i32 PH_VERIFY = 5
+const i32 PH_SAVE = 6
+const i32 PH_COMPARE = 7
+const i32 PH_NET = 8
+
+// Failures that are not a LinkError.
+const i32 JERR_NONE = 0
+const i32 JERR_NO_RADIO = 100
+const i32 JERR_SESSION = 101
+const i32 JERR_BACKUP = 102
+const i32 JERR_ENGINE = 103
+const i32 JERR_NOT_THIS_MODEL = 104
+const i32 JERR_AMBIGUOUS = 105
+const i32 JERR_LINK = 106
+
+type Job:
+    i32 kind
+    i32 state
+    i32 phase
+    i64 done_n
+    i64 total_n
+    // ── inputs ──
+    ref []char8 port
+    ref []char8 data_dir
+    ref []char8 drivers
+    bool builtin
+    []radio.Model models
+    // a model id the user chose ("" = the detection's best)
+    ref []char8 want_model
+    // JOB_WRITE: the image to write
+    ref []u8 img_in
+    bool allow_untested
+    // verify steps keep their state here between jobs
+    radio.Verification ver
+    bool ver_open
+    // ── outputs ──
+    i32 err
+    i32 link_err
+    i64 model_used
+    ref []i64 cands
+    ref []radio.MatchKind matches
+    ref []char8 engine
+    // the detection's per-try log (radio.Detection.log), for "Details"
+    ref []char8 detect_log
+    ref []u8 img
+    ref []char8 backup
+    ref []char8 rid
+    ref []char8 fingerprint
+    ref []char8 how
+    i32 status_by
+    ref []char8 status_detail
+    ref []char8 nickname
+    i64 seen
+    bool fast_path
+    ref []char8 message
+
+private Job g_job
+private threads.Thread g_thread
+
+^Job job():
+    return &g_job
+
+i32 job_state():
+    return threads.atomic_load(&g_job.state)
+
+bool job_busy():
+    return job_state() == JS_RUNNING
+
+(i32 phase, i64 done, i64 total) job_progress():
+    return (threads.atomic_load(&g_job.phase), threads.atomic_load(&g_job.done_n), threads.atomic_load(&g_job.total_n))
+
+private void on_progress(rawptr ctx, i64 done, i64 total):
+    threads.atomic_store(&g_job.total_n, total)
+    threads.atomic_store(&g_job.done_n, done)
+
+private void set_phase(i32 p):
+    threads.atomic_store(&g_job.done_n, i64(0))
+    threads.atomic_store(&g_job.total_n, i64(0))
+    threads.atomic_store(&g_job.phase, p)
+
+private void on_write_phase(rawptr ctx, radio.WritePhase p):
+    if p == radio.WritePhase.BACKUP:
+        set_phase(PH_BACKUP)
+    else if p == radio.WritePhase.WRITE:
+        set_phase(PH_WRITE)
+    else if p == radio.WritePhase.VERIFY:
+        set_phase(PH_VERIFY)
+
+private radio.Progress progress():
+    return radio.Progress(fn: on_progress, ctx: nil)
+
+// Free the previous job's outputs and set up a fresh one (UI thread, only
+// when no job runs). Verification state survives (it spans several jobs).
+^Job job_prepare(i32 kind):
+    ^Job j = &g_job
+    #delete(j.port)
+    #delete(j.data_dir)
+    #delete(j.drivers)
+    #delete(j.want_model)
+    #delete(j.img_in)
+    #delete(j.cands)
+    #delete(j.matches)
+    #delete(j.engine)
+    #delete(j.img)
+    #delete(j.backup)
+    #delete(j.rid)
+    #delete(j.fingerprint)
+    #delete(j.how)
+    #delete(j.status_detail)
+    #delete(j.nickname)
+    #delete(j.message)
+    #delete(j.detect_log)
+    radio.Verification keep_ver = j.ver
+    bool keep_open = j.ver_open
+    Job z
+    g_job = z
+    j.ver = keep_ver
+    j.ver_open = keep_open
+    j.kind = kind
+    j.model_used = -1
+    return j
+
+void job_drop_verification():
+    if g_job.ver_open:
+        g_job.ver.destroy()
+        g_job.ver_open = false
+
+private rawptr bt_job_thread(rawptr arg):
+    using app_keep():
+        run_job(&g_job)
+    threads.atomic_store(&g_job.state, JS_DONE)
+    return nil
+
+// Start the prepared job on its thread.
+void job_start():
+    if g_thread != nil:
+        _ = threads.join(g_thread)
+        g_thread = nil
+    radio.clear_cancel()
+    threads.atomic_store(&g_job.state, JS_RUNNING)
+    if headless_test():
+        // tests run jobs inline: deterministic, and no thread to join
+        _ = bt_job_thread(nil)
+        return
+    g_thread = threads.spawn(bt_job_thread, nil)
+    if g_thread == nil:
+        _ = bt_job_thread(nil)
+
+void job_cancel():
+    radio.request_cancel()
+
+// Mark a finished job as collected.
+void job_collect():
+    threads.atomic_store(&g_job.state, JS_IDLE)
+
+// ── the jobs ─────────────────────────────────────────────────────────────────
+
+private void run_job(^Job j):
+    if j.kind == JOB_UPDATE || j.kind == JOB_ROLLBACK:
+        run_update(j)
+        return
+    if j.kind == JOB_VERIFY_BEGIN:
+        run_verify_begin(j)
+        return
+    if j.kind == JOB_VERIFY_WRITE || j.kind == JOB_VERIFY_RESTORE:
+        run_verify_write(j)
+        return
+    radio.Registry reg = radio.open_registry(j.data_dir)
+    defer reg.destroy()
+    radio.TestedStore store = radio.open_tested(j.data_dir)
+    defer store.destroy()
+    set_phase(PH_DETECT)
+    try radio.Detection d = radio.detect_with(j.port, j.models, &reg, progress()) else why:
+        j.err = JERR_LINK
+        j.link_err = i32(why)
+        return
+    defer radio.close_detection(&d)
+    if d.log != nil:
+        string8 lg = d.log
+        j.detect_log = strings.clone(lg)
+    j.fast_path = d.fast_path
+    j.engine = strings.clone(d.engine)
+    for c in d.candidates:
+        j.cands = #append(j.cands, c)
+    for k in d.matches:
+        j.matches = #append(j.matches, k)
+    if d.session_unknown:
+        j.err = JERR_SESSION
+        return
+    if !d.found || #len(d.candidates) == 0:
+        j.err = JERR_NO_RADIO
+        return
+    i64 mi = d.candidates[0]
+    if #len(j.want_model) > 0:
+        mi = -1
+        for c in d.candidates:
+            if j.models[c].id == eq_s(j.want_model):
+                mi = c
+        if mi < 0:
+            j.err = JERR_NOT_THIS_MODEL
+            return
+    else if #len(d.candidates) > 1 && d.matches[0] != radio.MatchKind.REMEMBERED && d.matches[0] != radio.MatchKind.REPLY:
+        // the UI asks "Which radio is this?" and runs the job again
+        j.err = JERR_AMBIGUOUS
+        j.how = detection_how(&d)
+        return
+    j.model_used = mi
+    ^const radio.Model m = &j.models[mi]
+    j.how = detection_how(&d)
+    if j.kind == JOB_DETECT:
+        j.rid = radio.remember_detection(&reg, &d, m, j.port)
+        lookup_known(j, &reg)
+        _ = radio.save_registry(&reg)
+        return
+    if j.kind == JOB_READ:
+        set_phase(PH_READ)
+        try j.img = radio.download_detected(&d, m, progress()) else why:
+            j.err = JERR_LINK
+            j.link_err = i32(why)
+            return
+        set_phase(PH_SAVE)
+        j.fingerprint = radio.fingerprint_of(&d, m, j.img)
+        radio.WriteStatus ws = radio.write_status(m, j.fingerprint, &store)
+        j.status_by = i32(ws.by)
+        j.status_detail = strings.clone(ws.detail)
+        j.rid = radio.remember_detection(&reg, &d, m, j.port)
+        j.backup = radio.new_backup_path(j.data_dir, m)
+        if j.backup == nil || !radio.save_backup(j.backup, m, j.img):
+            j.err = JERR_BACKUP
+        string8 bk = j.backup
+        radio.remember_image(&reg, j.rid, m, j.img, bk)
+        lookup_known(j, &reg)
+        _ = radio.save_registry(&reg)
+        return
+    // JOB_WRITE: the library's single write gate decides (shipped tested,
+    // verified on this computer, or the user's explicit "write anyway")
+    j.backup = radio.new_backup_path(j.data_dir, m)
+    if j.backup == nil:
+        j.err = JERR_BACKUP
+        return
+    engines.Runner run
+    try run = engines.adopt_detection(&d, m, j.data_dir, j.drivers, j.builtin) else code:
+        j.err = JERR_ENGINE
+        j.message = strings.clone(engines.error_text(code))
+        return
+    defer run.close()
+    radio.WriteStatus st
+    try st = run.safe_write_detected(&d, m, j.img_in, &store, j.allow_untested, j.backup, 1000, on_write_phase, nil, progress()) else why:
+        j.err = JERR_LINK
+        j.link_err = i32(why)
+        return
+    j.status_by = i32(st.by)
+    j.status_detail = strings.clone(st.detail)
+    j.fingerprint = radio.fingerprint_of(&d, m, j.img_in)
+    j.rid = radio.remember_detection(&reg, &d, m, j.port)
+    radio.remember_image(&reg, j.rid, m, j.img_in, j.backup)
+    lookup_known(j, &reg)
+    _ = radio.save_registry(&reg)
+
+private void lookup_known(^Job j, ^radio.Registry reg):
+    radio.KnownList k = radio.list_known(reg)
+    defer k.destroy()
+    for x in k.radios:
+        if k.text(x.id) == eq_s(j.rid):
+            #delete(j.nickname)
+            j.nickname = strings.clone(k.text(x.nickname))
+            j.seen = x.seen
+
+private void run_verify_begin(^Job j):
+    job_drop_verification_inner(j)
+    radio.Registry reg = radio.open_registry(j.data_dir)
+    defer reg.destroy()
+    set_phase(PH_READ)
+    try j.ver = radio.verify_begin(j.port, j.models, j.want_model, &reg, j.data_dir, progress()) else why:
+        j.err = JERR_LINK
+        j.link_err = i32(why)
+        return
+    j.ver_open = true
+    _ = radio.save_registry(&reg)
+
+private void job_drop_verification_inner(^Job j):
+    if j.ver_open:
+        j.ver.destroy()
+        j.ver_open = false
+
+private void run_verify_write(^Job j):
+    if !j.ver_open:
+        j.err = JERR_NO_RADIO
+        return
+    // through the engines' runner, so a scripted (updated) driver verifies
+    // with the same engine it writes with
+    engines.Runner run
+    try run = engines.open_runner(j.ver.port, &j.ver.model, j.data_dir, j.drivers, j.builtin) else code:
+        j.err = JERR_ENGINE
+        j.message = strings.clone(engines.error_text(code))
+        return
+    defer run.close()
+    if j.kind == JOB_VERIFY_WRITE:
+        try run.verify_write(&j.ver, 1000, on_write_phase, nil, progress()) else why:
+            j.err = JERR_LINK
+            j.link_err = i32(why)
+        return
+    try run.verify_restore(&j.ver, 1000, on_write_phase, nil, progress()) else why:
+        j.err = JERR_LINK
+        j.link_err = i32(why)
+
+private void run_update(^Job j):
+    set_phase(PH_NET)
+    updater.Config c = updater.default_config()
+    updater.Report r
+    if j.kind == JOB_UPDATE:
+        r = updater.update_drivers(c)
+    else:
+        r = updater.rollback(c)
+    j.message = updater.describe(r)
+    if r.status == updater.Status.FAILED:
+        j.err = JERR_ENGINE
+    r.destroy()
+
+// What the detection heard, in words.
+ref []char8 detection_how(^radio.Detection d):
+    strings.Builder b = strings.builder(64)
+    if d^.fast_path:
+        strings.append(&b, "remembered radio; ")
+    if d^.engine == "uv5r":
+        strings.append(&b, "ident ")
+        for k in 0..<8:
+            if k > 0:
+                strings.append_char(&b, ' ')
+            radio.append_hex(&b, d^.ident[k..<k + 1])
+    else if d^.session_reused:
+        strings.append(&b, "its programming session was still open")
+    else:
+        strings.append(&b, "model reply \"")
+        string8 r = strings.trim(string8(d^.hello.m_reply[0..<d^.hello.m_len]))
+        bool sp = false
+        for i in 0..<#len(r):
+            char8 ch = r[i]
+            if ch == ' ':
+                if !sp:
+                    strings.append_char(&b, ' ')
+                sp = true
+                continue
+            sp = false
+            strings.append_char(&b, ch if ch >= ' ' && ch < '~' else '?')
+        strings.append(&b, "\"")
+    return strings.finish(&b)
+
+i64 now_ms():
+    return time.unix_nanos() / 1000000
+
+bool file_exists(string8 p):
+    return fs.exists(p)

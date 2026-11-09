@@ -1,0 +1,247 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Buttons, icon buttons, the FAB, and the state-layer / focus-ring helpers
+// every interactive widget shares. Sizes and colours follow the Material 3
+// component specs (m3.material.io), in dp.
+package btui
+
+// ── Shared helpers ─────────────────────────────────────────────────────────
+
+// The keyboard focus ring: 3 dp in `secondary`, 2 dp outside the shape, shown
+// only after keyboard navigation (like :focus-visible).
+void focus_ring(Rect r, f32 radius, bool focused):
+    if !focused || !focus_visible():
+        return
+    Rect o = expand(r, 5.0)
+    stroke_rrect(o, radius + 5.0, 3.0, theme().secondary)
+
+// The state layer of an interactive shape: hover 8%, focus 10%, press
+// ripple, in the content colour.
+void state_layer(u64 uid, Rect r, f32 radius, [4]u8 content, Interact it):
+    f32 op = 0.0
+    if it.hover:
+        op = HOVER_OPACITY
+    if it.focused && focus_visible():
+        op = maxf(op, FOCUS_OPACITY)
+    f32 a = animate(uid ~ u64(0x51A7E), op, 0.15)
+    if a > 0.001:
+        fill_rrect(r, radius, alpha(content, a))
+    draw_ripple(uid, r, radius, content)
+
+void state_layer4(u64 uid, Rect r, Radii rad, [4]u8 content, Interact it):
+    f32 op = 0.0
+    if it.hover:
+        op = HOVER_OPACITY
+    if it.focused && focus_visible():
+        op = maxf(op, FOCUS_OPACITY)
+    f32 a = animate(uid ~ u64(0x51A7E), op, 0.15)
+    if a > 0.001:
+        fill_rrect4(r, rad, alpha(content, a))
+    draw_ripple(uid, r, rad.tl, content)
+
+// ── Buttons ────────────────────────────────────────────────────────────────
+
+const i32 BTN_FILLED = 0
+const i32 BTN_TONAL = 1
+const i32 BTN_OUTLINED = 2
+const i32 BTN_TEXT = 3
+const i32 BTN_ELEVATED = 4
+const i32 BTN_DANGER = 5
+
+const f32 BUTTON_H = 40.0
+
+// The width a button needs for its label (and an optional 18 dp icon).
+f32 button_width(string8 label, string8 icon_name = "", i32 kind = 0):
+    f32 pad_l = 24.0
+    f32 pad_r = 24.0
+    if kind == BTN_TEXT:
+        pad_l = 12.0
+        pad_r = 12.0
+    f32 w = text_width(LABEL_LARGE, label)
+    if #len(icon_name) > 0:
+        pad_l = pad_l - 8.0
+        w = w + 18.0 + 8.0
+        if kind == BTN_TEXT:
+            pad_r = 16.0
+    return ceilf(w + pad_l + pad_r)
+
+// A common-button. Answers true when clicked (mouse, or Space/Enter when
+// focused). `r` is usually `button_width` wide and BUTTON_H tall.
+bool button(string8 label, Rect r, i32 kind = 0, string8 icon_name = "", bool disabled = false, string8 key = ""):
+    ^Scheme t = theme()
+    u64 uid = id(key if #len(key) > 0 else label)
+    Interact it = interact(uid, r, true, disabled)
+    f32 rad = r.h * 0.5
+    [4]u8 bg = TRANSPARENT
+    [4]u8 fg = t.primary
+    i32 elev = 0
+    bool outline = false
+    if kind == BTN_FILLED:
+        bg = t.primary
+        fg = t.on_primary
+        elev = 1 if it.hover else 0
+    else if kind == BTN_DANGER:
+        bg = t.error
+        fg = t.on_error
+        elev = 1 if it.hover else 0
+    else if kind == BTN_TONAL:
+        bg = t.secondary_container
+        fg = t.on_secondary_container
+        elev = 1 if it.hover else 0
+    else if kind == BTN_ELEVATED:
+        bg = t.surface_container_low
+        fg = t.primary
+        elev = 2 if it.hover else 1
+    else if kind == BTN_OUTLINED:
+        outline = true
+    if disabled:
+        fg = alpha(t.on_surface, DISABLED_CONTENT)
+        if bg[3] > 0:
+            bg = alpha(t.on_surface, DISABLED_CONTAINER)
+        elev = 0
+    f32 e = animate(uid ~ u64(0xE1E7), f32(elev), 0.2)
+    if e > 0.05 && !disabled:
+        shadow(r, rad, maxi(1, iround(e)), minf(1.0, e))
+    if bg[3] > 0:
+        fill_rrect(r, rad, bg)
+    if outline:
+        [4]u8 oc = t.outline
+        if disabled:
+            oc = alpha(t.on_surface, DISABLED_CONTAINER)
+        else if it.focused && focus_visible():
+            oc = t.primary
+        stroke_rrect(r, rad, 1.0, oc)
+    if !disabled:
+        state_layer(uid, r, rad, fg, it)
+    focus_ring(r, rad, it.focused)
+    // content, centred
+    f32 tw = text_width(LABEL_LARGE, label)
+    f32 cw = tw
+    if #len(icon_name) > 0:
+        cw = cw + 26.0
+    f32 x = r.x + (r.w - cw) * 0.5
+    if #len(icon_name) > 0:
+        icon(icon_name, x, cy(r) - 9.0, 18.0, fg)
+        x = x + 26.0
+    _ = text(LABEL_LARGE, x, cy(r) - LABEL_LARGE.line * 0.5, label, fg)
+    return it.clicked
+
+// A button laid out at (x, y) with its natural width; answers (clicked, width).
+(bool, f32) button_at(f32 x, f32 y, string8 label, i32 kind = 0, string8 icon_name = "", bool disabled = false):
+    f32 w = button_width(label, icon_name, kind)
+    bool c = button(label, Rect((x, y, w, BUTTON_H)), kind, icon_name, disabled)
+    return (c, w)
+
+// ── Icon buttons ───────────────────────────────────────────────────────────
+
+const i32 ICON_STANDARD = 0
+const i32 ICON_FILLED = 1
+const i32 ICON_TONAL = 2
+const i32 ICON_OUTLINED = 3
+
+// A 40 dp icon button (24 dp icon) centred in `r` (usually 40 x 40, or a
+// 48 x 48 touch target). `selected` toggles filled glyph / container colour.
+bool icon_button(string8 icon_name, Rect r, i32 kind = 0, bool selected = false, bool disabled = false, string8 tip = "", string8 key = ""):
+    ^Scheme t = theme()
+    u64 uid = id(#format(key if #len(key) > 0 else icon_name, "#ib"))
+    Rect b = center_in(r, 40.0, 40.0)
+    Interact it = interact(uid, b, true, disabled)
+    [4]u8 fg = t.on_surface_variant
+    [4]u8 bg = TRANSPARENT
+    if selected:
+        fg = t.primary
+    if kind == ICON_FILLED:
+        bg = t.primary
+        fg = t.on_primary
+    else if kind == ICON_TONAL:
+        bg = t.secondary_container
+        fg = t.on_secondary_container
+    else if kind == ICON_OUTLINED:
+        if selected:
+            bg = t.inverse_surface
+            fg = t.inverse_on_surface
+    if disabled:
+        fg = alpha(t.on_surface, DISABLED_CONTENT)
+        if bg[3] > 0:
+            bg = alpha(t.on_surface, DISABLED_CONTAINER)
+    if bg[3] > 0:
+        fill_circle(cx(b), cy(b), 20.0, bg)
+    if kind == ICON_OUTLINED && !selected:
+        stroke_circle(cx(b), cy(b), 20.0, 1.0, t.outline_variant if !disabled else alpha(t.on_surface, DISABLED_CONTAINER))
+    if !disabled:
+        state_layer(uid, b, 20.0, fg, it)
+    focus_ring(b, 20.0, it.focused)
+    icon_in(b, icon_name, 24.0, fg, selected)
+    if #len(tip) > 0:
+        tooltip(uid, b, tip, it.hover)
+    return it.clicked
+
+// ── FAB ────────────────────────────────────────────────────────────────────
+
+// A floating action button. With a label it is an extended FAB (height 56,
+// icon + label); without, a 56 dp square with a 16 dp corner.
+bool fab(string8 icon_name, string8 label, Rect r, bool tertiary = false):
+    ^Scheme t = theme()
+    u64 uid = id(#format("fab", icon_name, label))
+    Interact it = interact(uid, r, true, false)
+    [4]u8 bg = t.primary_container
+    [4]u8 fg = t.on_primary_container
+    if tertiary:
+        bg = t.tertiary_container
+        fg = t.on_tertiary_container
+    f32 e = animate(uid ~ u64(0xE1E7), 4.0 if it.hover else 3.0, 0.2)
+    shadow(r, 16.0, iround(e))
+    fill_rrect(r, 16.0, bg)
+    state_layer(uid, r, 16.0, fg, it)
+    focus_ring(r, 16.0, it.focused)
+    if #len(label) == 0:
+        icon_in(r, icon_name, 24.0, fg)
+    else:
+        icon(icon_name, r.x + 16.0, cy(r) - 12.0, 24.0, fg)
+        _ = text(LABEL_LARGE, r.x + 52.0, cy(r) - 10.0, label, fg)
+    return it.clicked
+
+f32 fab_width(string8 label):
+    return ceilf(16.0 + 24.0 + 12.0 + text_width(LABEL_LARGE, label) + 20.0)
+
+// ── Segmented button ───────────────────────────────────────────────────────
+
+// A single-select segmented button; answers true when the selection changed.
+bool segmented(string8 key, Rect r, []string8 labels, ^i32 sel):
+    ^Scheme t = theme()
+    i32 n = i32(#len(labels))
+    if n == 0:
+        return false
+    bool changed = false
+    f32 w = r.w / f32(n)
+    push_id(id(key))
+    for i in 0..<n:
+        Rect s = Rect((r.x + f32(i) * w, r.y, w, r.h))
+        f32 rl = r.h * 0.5 if i == 0 else 0.0
+        f32 rr = r.h * 0.5 if i == n - 1 else 0.0
+        Radii rad = Radii((rl, rr, rr, rl))
+        u64 uid = idn("seg", i64(i))
+        Interact it = interact(uid, s, true, false)
+        bool on = sel^ == i32(i)
+        if on:
+            fill_rrect4(s, rad, t.secondary_container)
+        [4]u8 fg = t.on_secondary_container if on else t.on_surface
+        state_layer4(uid, s, rad, fg, it)
+        if it.clicked && !on:
+            sel^ = i32(i)
+            changed = true
+        f32 tw = text_width(LABEL_LARGE, labels[i])
+        f32 cw = tw + (26.0 if on else 0.0)
+        f32 x = s.x + (s.w - cw) * 0.5
+        if on:
+            icon("check", x, cy(s) - 9.0, 18.0, fg)
+            x = x + 26.0
+        _ = text(LABEL_LARGE, x, cy(s) - 10.0, labels[i], fg)
+        focus_ring(s, r.h * 0.5, it.focused)
+    // outlines over the fills, so shared edges are one line
+    stroke_rrect(r, r.h * 0.5, 1.0, t.outline)
+    for i in 1..<n:
+        vline(r.x + f32(i) * w, r.y, bottom(r), 1.0, t.outline)
+    pop_id()
+    return changed

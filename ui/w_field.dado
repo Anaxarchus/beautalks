@@ -1,0 +1,641 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Text fields (filled and outlined, M3), the line-editing core they and the
+// table's cell editor share, menus, and the select (dropdown) field.
+package btui
+
+import "core:strings"
+
+// ── The editing core ───────────────────────────────────────────────────────
+
+// A single-line edit buffer the app owns. `caret` and `anchor` are byte
+// indices (on code point boundaries); the selection is between them.
+type Field:
+    ref []char8 text
+    i64 caret
+    i64 anchor
+    f32 scroll_x
+    f64 blink_t0
+    bool selecting
+
+void field_set(^Field f, string8 s):
+    using keep():
+        if f.text == nil:
+            f.text = #make([]char8, 0)
+        f.text = #resize(f.text, 0)
+        for i in 0..<#len(s):
+            f.text = #append(f.text, s[i])
+    f.caret = #len(s)
+    f.anchor = f.caret
+    f.scroll_x = 0.0
+
+string8 field_text(^Field f):
+    string8 s = f.text
+    return s
+
+bool field_has_selection(^Field f):
+    return f.caret != f.anchor
+
+(i64, i64) field_selection(^Field f):
+    if f.caret < f.anchor:
+        return (f.caret, f.anchor)
+    return (f.anchor, f.caret)
+
+void field_select_all(^Field f):
+    f.anchor = 0
+    f.caret = #len(f.text)
+
+private void delete_range(^Field f, i64 a, i64 b):
+    if b <= a:
+        return
+    i64 n = #len(f.text)
+    i64 d = b - a
+    for i in a..<(n - d):
+        f.text[i] = f.text[i + d]
+    f.text = #resize(f.text, n - d)
+    f.caret = a
+    f.anchor = a
+
+// Replace the selection with `s` (the typing, pasting path).
+void field_insert(^Field f, string8 s):
+    using keep():
+        if f.text == nil:
+            f.text = #make([]char8, 0)
+    (i64 a, i64 b) = field_selection(f)
+    delete_range(f, a, b)
+    i64 n = #len(f.text)
+    i64 k = #len(s)
+    if k == 0:
+        return
+    f.text = #resize(f.text, n + k)
+    i64 i = n - 1
+    for i >= a:
+        f.text[i + k] = f.text[i]
+        i -= 1
+    for j in 0..<k:
+        f.text[a + j] = s[j]
+    f.caret = a + k
+    f.anchor = f.caret
+
+private bool is_word(char8 c):
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || u8(c) >= 0x80
+
+private i64 word_left(string8 s, i64 at):
+    i64 i = at
+    for i > 0 && !is_word(s[i - 1]):
+        i -= 1
+    for i > 0 && is_word(s[i - 1]):
+        i -= 1
+    return i
+
+private i64 word_right(string8 s, i64 at):
+    i64 i = at
+    i64 n = #len(s)
+    for i < n && !is_word(s[i]):
+        i += 1
+    for i < n && is_word(s[i]):
+        i += 1
+    return i
+
+// Select the word around byte index `at` (double-click).
+void field_select_word(^Field f, i64 at):
+    string8 s = f.text
+    i64 a = at
+    i64 b = at
+    for a > 0 && is_word(s[a - 1]):
+        a -= 1
+    for b < #len(s) && is_word(s[b]):
+        b += 1
+    f.anchor = a
+    f.caret = b
+
+const i32 EDIT_NONE = 0
+const i32 EDIT_CHANGED = 1
+const i32 EDIT_MOVED = 2
+
+// Apply this frame's keyboard input to a focused field. `accept` filters
+// typed characters (nil accepts all). Answers EDIT_CHANGED if the text
+// changed, EDIT_MOVED if only the caret/selection did.
+i32 field_keys(^Field f, bool(i32) accept = nil):
+    i32 res = EDIT_NONE
+    string8 s = f.text
+    i64 n = #len(s)
+    // word moves: Alt on macOS, Ctrl elsewhere; line moves: Cmd on macOS
+    u32 word_mod = MOD_ALT
+    when #OS != #DARWIN:
+        word_mod = MOD_CTRL
+    for i in 0..<key_count():
+        KeyEv k = key_at(i)
+        if k.taken:
+            continue
+        bool shift = (k.mods & MOD_SHIFT) != 0
+        bool word = (k.mods & word_mod) != 0
+        bool cmdk = is_cmd(k.mods)
+        i64 old_c = f.caret
+        bool used = true
+        s = f.text
+        n = #len(s)
+        if k.key == KEY_LEFT:
+            if field_has_selection(f) && !shift:
+                (i64 a, i64 _) = field_selection(f)
+                f.caret = a
+            else if cmdk && #OS == #DARWIN:
+                f.caret = 0
+            else if word:
+                f.caret = word_left(s, f.caret)
+            else:
+                f.caret = utf8_prev(s, f.caret)
+        else if k.key == KEY_RIGHT:
+            if field_has_selection(f) && !shift:
+                (i64 _, i64 b) = field_selection(f)
+                f.caret = b
+            else if cmdk && #OS == #DARWIN:
+                f.caret = n
+            else if word:
+                f.caret = word_right(s, f.caret)
+            else:
+                f.caret = utf8_next(s, f.caret)
+        else if k.key == KEY_HOME:
+            f.caret = 0
+        else if k.key == KEY_END:
+            f.caret = n
+        else if k.key == KEY_BACKSPACE:
+            if field_has_selection(f):
+                (i64 a, i64 b) = field_selection(f)
+                delete_range(f, a, b)
+            else if f.caret > 0:
+                i64 from = word_left(s, f.caret) if word else utf8_prev(s, f.caret)
+                delete_range(f, from, f.caret)
+            res = EDIT_CHANGED
+        else if k.key == KEY_DELETE:
+            if field_has_selection(f):
+                (i64 a, i64 b) = field_selection(f)
+                delete_range(f, a, b)
+            else if f.caret < n:
+                i64 to = word_right(s, f.caret) if word else utf8_next(s, f.caret)
+                delete_range(f, f.caret, to)
+            res = EDIT_CHANGED
+        else if cmdk && k.key == KEY_A:
+            field_select_all(f)
+        else if cmdk && k.key == KEY_C:
+            if field_has_selection(f):
+                (i64 a, i64 b) = field_selection(f)
+                clipboard_set(s[a..<b])
+        else if cmdk && k.key == KEY_X:
+            if field_has_selection(f):
+                (i64 a, i64 b) = field_selection(f)
+                clipboard_set(s[a..<b])
+                delete_range(f, a, b)
+                res = EDIT_CHANGED
+        else if cmdk && k.key == KEY_V:
+            string8 clip = clipboard_get()
+            // one line only, and through the filter
+            ref []char8 clean = #make([]char8, 0)
+            i64 j = 0
+            for j < #len(clip):
+                (i32 cp, i32 m) = utf8_at(clip, j)
+                j += i64(m)
+                if cp == 10 || cp == 13:
+                    break
+                if cp < 32:
+                    continue
+                if accept != nil && !accept(cp):
+                    continue
+                utf8_append(&clean, cp)
+            field_insert(f, clean)
+            #delete(clean)
+            res = EDIT_CHANGED
+        else:
+            used = false
+        if used:
+            take_key_at(i)
+            if k.key == KEY_LEFT || k.key == KEY_RIGHT || k.key == KEY_HOME || k.key == KEY_END:
+                if !shift:
+                    f.anchor = f.caret
+                if f.caret != old_c && res == EDIT_NONE:
+                    res = EDIT_MOVED
+            f.blink_t0 = now()
+    // typed text
+    if text_count() > 0:
+        ref []char8 typed = #make([]char8, 0)
+        for i in 0..<text_count():
+            i32 cp = text_at(i)
+            if accept == nil || accept(cp):
+                utf8_append(&typed, cp)
+        if #len(typed) > 0:
+            field_insert(f, typed)
+            res = EDIT_CHANGED
+        #delete(typed)
+        take_text()
+        f.blink_t0 = now()
+    return res
+
+// Characters for a frequency (digits and one decimal point).
+bool accept_number(i32 cp):
+    return (cp >= 48 && cp <= 57) || cp == 46 || cp == 44
+
+// ── Text field widget ──────────────────────────────────────────────────────
+
+const i32 FIELD_FILLED = 0
+const i32 FIELD_OUTLINED = 1
+
+type FieldOut: (bool changed, bool submitted, bool focused, bool cancelled)
+
+type FieldOpts:
+    i32 kind
+    string8 label
+    string8 helper
+    string8 error
+    string8 leading
+    string8 trailing
+    string8 suffix
+    string8 placeholder
+    bool numeric
+    bool disabled
+    bool readonly
+    bool bare
+    [4]u8 behind
+
+FieldOpts field_opts(string8 label, i32 kind = 0):
+    FieldOpts o
+    o.kind = kind
+    o.label = label
+    o.behind = theme().surface
+    return o
+
+// The text field's height including its supporting text line.
+f32 field_height(FieldOpts o):
+    if #len(o.helper) > 0 || #len(o.error) > 0:
+        return 56.0 + 20.0
+    return 56.0
+
+// A text field in `r` (56 dp tall box; supporting text below it if any).
+FieldOut text_field(string8 key, Rect r, ^Field f, FieldOpts o):
+    ^Scheme t = theme()
+    FieldOut out
+    u64 uid = id(#format(key, "#tf"))
+    Rect box = Rect((r.x, r.y, r.w, 56.0))
+    Interact it = interact(uid, box, true, o.disabled)
+    bool focused = has_focus(uid)
+    out.focused = focused
+    bool has_err = #len(o.error) > 0
+    // input area
+    f32 lx = box.x + 16.0
+    f32 rx = right(box) - 16.0
+    if #len(o.leading) > 0:
+        lx = box.x + 52.0
+    if #len(o.trailing) > 0 || has_err:
+        rx = right(box) - 52.0
+    f32 sufw = 0.0
+    if #len(o.suffix) > 0:
+        sufw = text_width(BODY_LARGE, o.suffix) + 4.0
+    Rect input = Rect((lx, box.y + 8.0, rx - lx - sufw, 40.0))
+    if o.bare:
+        input = Rect((box.x, cy(box) - 12.0, box.w, 24.0))
+    else if #len(o.label) > 0 && o.kind == FIELD_FILLED:
+        input = Rect((lx, box.y + 24.0, rx - lx - sufw, 24.0))
+    else:
+        input = Rect((lx, box.y + 16.0, rx - lx - sufw, 24.0))
+    string8 s = f.text
+    if it.hover && !o.disabled:
+        set_cursor(CURSOR_IBEAM)
+    // mouse: place the caret, drag to select, double-click a word
+    if it.pressed:
+        i64 at = text_index_at(BODY_LARGE, s, mouse_x() - input.x + f.scroll_x)
+        if click_count() == 2:
+            field_select_word(f, at)
+        else if click_count() >= 3:
+            field_select_all(f)
+        else:
+            f.caret = at
+            if !shift_down():
+                f.anchor = at
+        f.selecting = true
+        f.blink_t0 = now()
+    if f.selecting:
+        if mouse_down(0) && is_active(uid) && click_count() == 1:
+            f.caret = text_index_at(BODY_LARGE, s, mouse_x() - input.x + f.scroll_x)
+        else:
+            f.selecting = false
+    // keyboard
+    if focused && !o.disabled && !o.readonly:
+        bool(i32) acc = nil
+        if o.numeric:
+            acc = accept_number
+        if take_key(KEY_ENTER) || take_key(KEY_KP_ENTER):
+            out.submitted = true
+        if take_key(KEY_ESCAPE):
+            out.cancelled = true
+        i32 r2 = field_keys(f, acc)
+        if r2 == EDIT_CHANGED:
+            out.changed = true
+        s = f.text
+    // keep the caret in view
+    f32 caret_x = text_x_at(BODY_LARGE, s, f.caret)
+    if caret_x - f.scroll_x > input.w - 2.0:
+        f.scroll_x = caret_x - input.w + 2.0
+    if caret_x - f.scroll_x < 0.0:
+        f.scroll_x = caret_x
+    f32 full = text_width(BODY_LARGE, s)
+    if full - f.scroll_x < input.w - 2.0:
+        f.scroll_x = maxf(0.0, full - input.w + 2.0)
+    // ── paint ──
+    bool floated = focused || #len(s) > 0 || #len(o.placeholder) > 0
+    f32 fl = animate(uid ~ u64(0xF10A), 1.0 if floated else 0.0, 0.15)
+    f32 fk = animate(uid ~ u64(0xF0C5), 1.0 if focused else 0.0, 0.15)
+    [4]u8 accent = t.error if has_err else t.primary
+    [4]u8 label_col = mix(t.on_surface_variant, accent, fk)
+    if has_err:
+        label_col = t.error
+    if o.disabled:
+        label_col = alpha(t.on_surface, DISABLED_CONTENT)
+    if !o.bare && o.kind == FIELD_FILLED:
+        Radii rad = Radii((4.0, 4.0, 0.0, 0.0))
+        fill_rrect4(box, rad, t.surface_container_highest if !o.disabled else alpha(t.on_surface, 0.04))
+        if it.hover && !focused && !o.disabled:
+            fill_rrect4(box, rad, alpha(t.on_surface, HOVER_OPACITY))
+        f32 lw = lerpf(1.0, 2.0, fk)
+        [4]u8 ic = t.on_surface_variant if !has_err else t.error
+        if it.hover && !focused:
+            ic = t.on_surface if !has_err else t.on_error_container
+        fill_rect(Rect((box.x, bottom(box) - 1.0, box.w, 1.0)), ic)
+        if fk > 0.01:
+            f32 ww = box.w * fk
+            fill_rect(Rect((cx(box) - ww * 0.5, bottom(box) - lw, ww, lw)), accent)
+    else if !o.bare:
+        [4]u8 oc = t.outline
+        if it.hover && !focused:
+            oc = t.on_surface
+        if has_err:
+            oc = t.error
+        if o.disabled:
+            oc = alpha(t.on_surface, DISABLED_CONTAINER)
+        stroke_rrect(box, 4.0, 1.0, oc)
+        if fk > 0.01:
+            stroke_rrect(box, 4.0, 2.0, alpha(accent, fk))
+    // label: body-large resting, body-small floated
+    if #len(o.label) > 0:
+        f32 rest_y = cy(box) - 12.0
+        f32 float_y = box.y + 8.0 - 2.0
+        if o.kind == FIELD_OUTLINED:
+            float_y = box.y - 8.0
+        f32 ly = lerpf(rest_y, float_y, fl)
+        f32 lsize = lerpf(16.0, 12.0, fl)
+        Style ls = Style((FACE_REGULAR, lsize, lerpf(24.0, 16.0, fl), false))
+        f32 lxx = lx
+        if o.kind == FIELD_OUTLINED && fl > 0.0 && #len(o.leading) > 0:
+            lxx = lerpf(lx, box.x + 16.0, fl)
+        if o.kind == FIELD_OUTLINED && fl > 0.01:
+            // cut the outline behind the floated label
+            f32 lw2 = text_width(ls, o.label)
+            fill_rect(Rect((lxx - 4.0, box.y - 2.0, lw2 + 8.0, 4.0)), o.behind)
+        _ = text(ls, lxx, ly, o.label, label_col)
+    if #len(o.leading) > 0:
+        icon(o.leading, box.x + 12.0, cy(box) - 12.0, 24.0, t.on_surface_variant)
+    if has_err:
+        icon("error", right(box) - 36.0, cy(box) - 12.0, 24.0, t.error, true)
+    else if #len(o.trailing) > 0:
+        icon(o.trailing, right(box) - 36.0, cy(box) - 12.0, 24.0, t.on_surface_variant)
+    // text, selection and caret, clipped to the input area
+    [4]u8 tc = t.on_surface if !o.disabled else alpha(t.on_surface, DISABLED_CONTENT)
+    push_clip(Rect((input.x - 1.0, box.y, input.w + 3.0, box.h)))
+    f32 tx = input.x - f.scroll_x
+    if focused && field_has_selection(f):
+        (i64 a, i64 b) = field_selection(f)
+        f32 x0 = text_x_at(BODY_LARGE, s, a)
+        f32 x1 = text_x_at(BODY_LARGE, s, b)
+        fill_rect(Rect((tx + x0, input.y, x1 - x0, 24.0)), alpha(t.primary, 0.28))
+    if #len(s) == 0 && #len(o.placeholder) > 0 && fl > 0.5:
+        _ = text(BODY_LARGE, input.x, input.y, o.placeholder, alpha(t.on_surface_variant, fl))
+    else if fl > 0.5 || #len(o.label) == 0:
+        _ = text(BODY_LARGE, tx, input.y, s, tc)
+    if focused && !o.readonly:
+        f64 ph = now() - f.blink_t0
+        bool on = ph < 0.5 || (i64(ph * 2.0) % 2) == 0
+        animating()
+        if on:
+            fill_rect(Rect((tx + caret_x - 1.0, input.y + 2.0, 2.0, 20.0)), accent)
+    pop_clip()
+    if #len(o.suffix) > 0 && fl > 0.5:
+        _ = text(BODY_LARGE, right(input) + 4.0, input.y, o.suffix, t.on_surface_variant)
+    // supporting text
+    string8 sup = o.error if has_err else o.helper
+    if #len(sup) > 0:
+        _ = text(BODY_SMALL, box.x + 16.0, bottom(box) + 4.0, sup, t.error if has_err else t.on_surface_variant)
+    return out
+
+// A field with no container, label or supporting text: just the editable
+// line (a search bar draws its own pill around it).
+FieldOut bare_field(string8 key, Rect r, ^Field f, FieldOpts o):
+    FieldOpts b = o
+    b.bare = true
+    b.label = ""
+    b.helper = ""
+    b.error = ""
+    return text_field(key, r, f, b)
+
+// ── Menus ──────────────────────────────────────────────────────────────────
+
+private u64 g_menu_open
+private Rect g_menu_anchor
+private i32 g_menu_hi = -1
+private f64 g_menu_t0
+private Scroll g_menu_scroll
+private bool g_menu_kbd
+
+private u64 g_menu_prev_focus
+
+// Open the menu `key` under `anchor`. While it is open it has the keyboard:
+// focus leaves the page and comes back when the menu closes.
+void menu_open(string8 key, Rect anchor, i32 highlight = -1):
+    if g_menu_open == 0:
+        g_menu_prev_focus = focus_id()
+    clear_focus()
+    g_menu_open = gid(key)
+    g_menu_anchor = anchor
+    g_menu_hi = highlight
+    g_menu_t0 = now()
+    Scroll fresh
+    g_menu_scroll = fresh
+    g_menu_kbd = highlight >= 0
+    request_frame()
+
+bool menu_is_open(string8 key):
+    return g_menu_open == gid(key)
+
+void menu_close():
+    g_menu_open = 0
+    if g_menu_prev_focus != 0:
+        set_focus(g_menu_prev_focus)
+        g_menu_prev_focus = 0
+    request_frame()
+
+// Draw the menu `key` if it is open, anchored under `g_menu_anchor`.
+// Answers the index chosen this frame, or -1. Up/Down/Home/End move the
+// highlight, Enter chooses, Esc or a click outside closes, typing a letter
+// jumps to the next item starting with it.
+i32 menu(string8 key, []string8 items, i32 current = -1, f32 width = 0.0, []string8 icons = nil, bool dense = false):
+    if g_menu_open != gid(key):
+        return -1
+    ^Scheme t = theme()
+    i32 base_layer = layer()
+    i32 old = set_layer(LAYER_MODAL_POPUP if base_layer >= LAYER_MODAL else LAYER_POPUP)
+    i32 n = i32(#len(items))
+    f32 ih = 40.0 if dense else 48.0
+    f32 w = maxf(width, g_menu_anchor.w)
+    for i in 0..<n:
+        w = maxf(w, text_width(BODY_LARGE, items[i]) + 24.0 + 24.0 + (36.0 if #len(icons) > 0 else 0.0))
+    w = minf(w, 360.0)
+    f32 full = f32(n) * ih + 16.0
+    f32 below = view_h() - bottom(g_menu_anchor) - 8.0
+    f32 above = g_menu_anchor.y - 8.0
+    f32 h = minf(full, maxf(below, above))
+    h = minf(h, 8.0 * ih + 16.0)
+    f32 y = bottom(g_menu_anchor) + 2.0
+    if h > below && above > below:
+        y = g_menu_anchor.y - h - 2.0
+    f32 x = clampf(g_menu_anchor.x, 8.0, view_w() - w - 8.0)
+    Rect r = Rect((x, y, w, h))
+    f32 k = ease_emphasized_decel(clampf(f32((now() - g_menu_t0) / 0.2), 0.0, 1.0))
+    if k < 1.0:
+        animating()
+    block(r)
+    i32 chosen = -1
+    // keyboard
+    if take_key(KEY_ESCAPE) || take_key(KEY_TAB):
+        menu_close()
+    for take_key(KEY_DOWN):
+        g_menu_hi = mini(n - 1, g_menu_hi + 1)
+        g_menu_kbd = true
+    for take_key(KEY_UP):
+        g_menu_hi = maxi(0, g_menu_hi - 1)
+        g_menu_kbd = true
+    if take_key(KEY_HOME):
+        g_menu_hi = 0
+        g_menu_kbd = true
+    if take_key(KEY_END):
+        g_menu_hi = n - 1
+        g_menu_kbd = true
+    if (take_key(KEY_ENTER) || take_key(KEY_KP_ENTER) || take_key(KEY_SPACE)) && g_menu_hi >= 0:
+        chosen = g_menu_hi
+    if text_count() > 0:
+        i32 c = text_at(0)
+        take_text()
+        for step in 1..=n:
+            i32 j = (g_menu_hi + i32(step)) % n
+            if #len(items[j]) > 0 && lower_ascii(i32(u8(items[j][0]))) == lower_ascii(c):
+                g_menu_hi = j
+                g_menu_kbd = true
+                break
+    if g_menu_kbd && g_menu_hi >= 0:
+        f32 iy0 = 8.0 + f32(g_menu_hi) * ih
+        if iy0 < g_menu_scroll.target:
+            g_menu_scroll.target = iy0 - 8.0
+        else if iy0 + ih > g_menu_scroll.target + h:
+            g_menu_scroll.target = iy0 + ih - h + 8.0
+        g_menu_kbd = false
+    _ = scroll_update(r, &g_menu_scroll, full)
+    // paint: grow downward from the anchor
+    Rect rr = Rect((r.x, r.y, r.w, r.h * (0.6 + 0.4 * k)))
+    shadow(rr, 4.0, 2, k)
+    fill_rrect(rr, 4.0, alpha(t.surface_container, k))
+    push_clip(rr)
+    for i in 0..<n:
+        f32 iy = r.y + 8.0 + f32(i) * ih - g_menu_scroll.y
+        if iy + ih < r.y || iy > bottom(r):
+            continue
+        Rect ir = Rect((r.x, iy, r.w, ih))
+        u64 uid = idn(#format(key, "#mi"), i64(i))
+        Interact it = interact(uid, ir, false, false)
+        if it.hover && (mouse_moved() || it.pressed):
+            g_menu_hi = i32(i)
+        if i32(i) == current:
+            fill_rect(ir, alpha(t.secondary_container, k))
+        if i32(i) == g_menu_hi:
+            fill_rect(ir, alpha(t.on_surface, HOVER_OPACITY * k))
+        draw_ripple(uid, ir, 0.0, t.on_surface)
+        f32 tx = ir.x + 12.0
+        if #len(icons) > i64(i) && #len(icons[i]) > 0:
+            icon(icons[i], tx, cy(ir) - 12.0, 24.0, alpha(t.on_surface_variant, k))
+            tx = tx + 36.0
+        text_in(Rect((tx, ir.y, ir.w - (tx - ir.x) - 12.0, ih)), BODY_LARGE, items[i], alpha(t.on_surface, k))
+        if it.clicked:
+            chosen = i32(i)
+    pop_clip()
+    scrollbar(#format(key, "#menu"), r, &g_menu_scroll)
+    // a click outside closes (the click still reaches what is under it? no:
+    // the menu swallows the press so the click does not also act below)
+    if mouse_pressed(0) && !contains(r, mouse_x(), mouse_y()) && !contains(g_menu_anchor, mouse_x(), mouse_y()):
+        menu_close()
+    if chosen >= 0:
+        menu_close()
+    _ = set_layer(old)
+    return chosen
+
+private i32 lower_ascii(i32 c):
+    if c >= 65 && c <= 90:
+        return c + 32
+    return c
+
+// ── Select (exposed dropdown menu) ─────────────────────────────────────────
+
+// A read-only field showing `options[sel]` with a dropdown arrow; clicking
+// it (or Enter/Space/Down when focused) opens the menu. Answers true when the
+// selection changed.
+bool select(string8 key, Rect r, ^i32 sel, []string8 options, FieldOpts o):
+    ^Scheme t = theme()
+    u64 uid = id(#format(key, "#sel"))
+    Rect box = Rect((r.x, r.y, r.w, 56.0))
+    Interact it = interact(uid, box, true, o.disabled)
+    string8 mkey = #format(key, "#menu")
+    bool open = menu_is_open(mkey)
+    if (it.pressed && !open) || (it.focused && !open && (take_key(KEY_DOWN) || take_key(KEY_SPACE) || take_key(KEY_ENTER))):
+        menu_open(mkey, box, sel^)
+        open = true
+    else if it.pressed && open:
+        menu_close()
+        open = false
+    f32 fk = animate(uid ~ u64(0xF0C5), 1.0 if (it.focused || open) else 0.0, 0.15)
+    [4]u8 accent = t.primary
+    if o.kind == FIELD_FILLED:
+        Radii rad = Radii((4.0, 4.0, 0.0, 0.0))
+        fill_rrect4(box, rad, t.surface_container_highest)
+        if it.hover:
+            fill_rrect4(box, rad, alpha(t.on_surface, HOVER_OPACITY))
+        fill_rect(Rect((box.x, bottom(box) - 1.0, box.w, 1.0)), t.on_surface_variant)
+        if fk > 0.01:
+            f32 ww = box.w * fk
+            fill_rect(Rect((cx(box) - ww * 0.5, bottom(box) - 2.0, ww, 2.0)), accent)
+    else:
+        stroke_rrect(box, 4.0, 1.0, t.on_surface if it.hover else t.outline)
+        if fk > 0.01:
+            stroke_rrect(box, 4.0, 2.0, alpha(accent, fk))
+    f32 lx = box.x + 16.0
+    if #len(o.leading) > 0:
+        icon(o.leading, box.x + 12.0, cy(box) - 12.0, 24.0, t.on_surface_variant)
+        lx = box.x + 52.0
+    [4]u8 lc = mix(t.on_surface_variant, accent, fk)
+    string8 cur = ""
+    if sel^ >= 0 && sel^ < i32(#len(options)):
+        cur = options[sel^]
+    if o.kind == FIELD_FILLED:
+        _ = text(BODY_SMALL, lx, box.y + 6.0, o.label, lc)
+        text_in(Rect((lx, box.y + 22.0, box.w - (lx - box.x) - 48.0, 24.0)), BODY_LARGE, cur, t.on_surface)
+    else:
+        f32 lw = text_width(BODY_SMALL, o.label)
+        fill_rect(Rect((box.x + 12.0, box.y - 2.0, lw + 8.0, 4.0)), o.behind)
+        _ = text(BODY_SMALL, box.x + 16.0, box.y - 8.0, o.label, lc)
+        text_in(Rect((lx, box.y + 16.0, box.w - (lx - box.x) - 48.0, 24.0)), BODY_LARGE, cur, t.on_surface)
+    // the arrow turns over when open
+    f32 rot = animate(uid ~ u64(0xA770), 1.0 if open else 0.0, 0.2)
+    icon("arrow_drop_down", right(box) - 36.0, cy(box) - 12.0, 24.0, t.on_surface_variant, false, rot > 0.5)
+    focus_ring(box, 4.0, it.focused)
+    if #len(o.helper) > 0:
+        _ = text(BODY_SMALL, box.x + 16.0, bottom(box) + 4.0, o.helper, t.on_surface_variant)
+    i32 c = menu(mkey, options, sel^, box.w)
+    if c >= 0 && c != sel^:
+        sel^ = c
+        set_focus(uid)
+        return true
+    return false

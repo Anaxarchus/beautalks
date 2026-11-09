@@ -1,0 +1,81 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Shipped folders are found in every package layout: flat (Windows zip),
+// bin/ beside the folders (Linux), a macOS bundle (Contents/MacOS ->
+// Contents/Resources), the working directory, and the override.
+package radio
+
+import "core:os/fs"
+import "core:strings"
+
+bool mk(string8 p):
+    try fs.make_dirs(p) else:
+        return false
+    return true
+
+// The first candidate ends with `want` ("" = no candidate expected).
+bool first_is(string8 dir, string8 env, string8 cwd, string8 exe_dir, string8 want):
+    ref [](ref []char8) c = shipped_candidates_in(dir, env, cwd, exe_dir)
+    defer free_paths(c)
+    if #len(want) == 0:
+        return #len(c) == 0
+    if #len(c) == 0:
+        return false
+    string8 got = c[0]
+    ref []char8 a = nil
+    try a = fs.canonical(got) else:
+        return false
+    ref []char8 b = nil
+    try b = fs.canonical(want) else:
+        #delete(a)
+        return false
+    string8 x = a
+    string8 y = b
+    bool same = x == y
+    #delete(a)
+    #delete(b)
+    return same
+
+i32 test():
+    string8 root = "build/layout"
+    if fs.exists(root):
+        try fs.remove_all(root) else:
+            return 1
+    bool ok = true
+    ok = mk("build/layout/empty") && ok
+    ok = mk("build/layout/flat/models") && ok
+    ok = mk("build/layout/linux/bin") && ok
+    ok = mk("build/layout/linux/models") && ok
+    ok = mk("build/layout/linux/drivers") && ok
+    ok = mk("build/layout/mac/beautalks.app/Contents/MacOS") && ok
+    ok = mk("build/layout/mac/beautalks.app/Contents/Resources/models") && ok
+    ok = mk("build/layout/cwd/models") && ok
+    ok = mk("build/layout/override") && ok
+    string8 e = "build/layout/empty"
+    ok = #expect(first_is("models", "", e, "build/layout/flat", "build/layout/flat/models"), "flat: <exe>/models") && ok
+    ok = #expect(first_is("models", "", e, "build/layout/linux/bin", "build/layout/linux/models"), "linux: <exe>/../models") && ok
+    ok = #expect(first_is("models", "", e, "build/layout/mac/beautalks.app/Contents/MacOS", "build/layout/mac/beautalks.app/Contents/Resources/models"), "mac bundle: <exe>/../Resources/models") && ok
+    ok = #expect(first_is("models", "", "build/layout/cwd", "build/layout/flat", "build/layout/cwd/models"), "working dir before the exe's") && ok
+    ok = #expect(first_is("models", "build/layout/override", "build/layout/cwd", "build/layout/flat", "build/layout/override"), "the override first") && ok
+    ok = #expect(first_is("models", "build/layout/missing", e, "build/layout/flat", "build/layout/flat/models"), "a missing override is skipped") && ok
+    ok = #expect(first_is("models", "", e, "build/layout/empty", ""), "nothing found") && ok
+    ok = #expect(first_is("drivers", "", e, "build/layout/linux/bin", "build/layout/linux/drivers"), "other folders too") && ok
+    // several existing candidates are all listed, in order, once each
+    ref [](ref []char8) all = shipped_candidates_in("models", "", "build/layout/linux", "build/layout/linux/bin")
+    ok = #expect(#len(all) == 1, "the same folder reached twice is listed once: ", #len(all)) && ok
+    free_paths(all)
+    ref [](ref []char8) two = shipped_candidates_in("models", "", "build/layout/cwd", "build/layout/flat")
+    ok = #expect(#len(two) == 2, "cwd and exe folders both listed: ", #len(two)) && ok
+    free_paths(two)
+    ref []char8 en = shipped_env_name("models")
+    string8 ens = en
+    ok = #expect(ens == "BEAUTALKS_MODELS", "override variable name") && ok
+    #delete(en)
+    // this process (dado test runs from the repo root): ./models
+    ref []char8 here = find_shipped("models")
+    string8 hs = here
+    ok = #expect(here != nil && strings.ends_with(hs, "models"), "find_shipped from the checkout") && ok
+    #delete(here)
+    return 0 if ok else 1

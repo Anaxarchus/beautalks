@@ -1,0 +1,31 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+// Template: build.sh fills @VERSION@ and @VERSION_COMMAS@ and compiles it
+// with `zig rc` into the .res linked into beautalks.exe (icon + version tab).
+1 ICON "beautalks.ico"
+
+1 VERSIONINFO
+FILEVERSION @VERSION_COMMAS@
+PRODUCTVERSION @VERSION_COMMAS@
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Anaxarchus"
+      VALUE "FileDescription", "beautalks radio programmer"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "InternalName", "beautalks"
+      VALUE "LegalCopyright", "Copyright (C) 2026 Anaxarchus. GNU GPL v3 or later."
+      VALUE "OriginalFilename", "beautalks.exe"
+      VALUE "ProductName", "beautalks"
+      VALUE "ProductVersion", "@VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

@@ -1,0 +1,149 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Library additions for the GUI: cancelling a transfer, session timing,
+// remember_choice, shared backups with a sidecar, ChannelList.copy.
+package radio
+
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+// Starts the emulator for `model_ini` serving `image`; `dump` receives its
+// memory after every write.
+bool start_emu(string8 model_ini, string8 image, string8 dump, string8 port_file, ^Emu out):
+    if fs.exists(port_file):
+        try fs.remove_file(port_file) else:
+            return false
+    [13]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--dump", dump, "--port-file", port_file, "--stats", "build/lib.stats", "")
+    try out^.d = proc.duplex(argv[0..<12]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists(port_file):
+            try out^.port = fs.read_file(port_file) else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+// A counter from the emulator's --stats file, -1 when unreadable.
+i64 emu_count(string8 key):
+    try ref []char8 t = fs.read_file("build/lib.stats") else:
+        return -1
+    defer #delete(t)
+    string8 s = t
+    string8 piece
+    strings.Splitter it = strings.splitter(s, "\n")
+    for strings.split_next(&it, &piece):
+        (string8 k, string8 v, bool found) = strings.split_first(piece, " ")
+        if found && k == key:
+            return parse_num(v, -1)
+    return -1
+
+void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        _ = 0
+    #delete(e^.port)
+
+
+// Cancels as soon as the second block arrives.
+void cancel_early(rawptr ctx, i64 done, i64 total):
+    if done >= 128:
+        request_cancel()
+
+i32 test():
+    ref []Model models = load_models("models")
+    defer #delete(models)
+    ^const Model rm = &models[find_model(models, "UV-5RM")]
+    ^const Model re = &models[find_model(models, "UV-5R")]
+    bool ok = true
+
+    // ── session timing
+    SessionInfo a = session_info(rm)
+    SessionInfo b = session_info(re)
+    ok = #expect(a.reuse_window_ms == -1 && a.reusable && a.survives_reopen && a.quiet_ms == 0, "UV-17Pro session info") && ok
+    ok = #expect(!b.reusable && b.quiet_ms == 6000 && b.reuse_window_ms > 0, "UV-5R session info") && ok
+
+    // ── cancel: stops at the next block, the UV-5RM stays in its session
+    //    and the next download reuses it
+    Emu e
+    if !start_emu("models/uv-5rm.ini", "testdata/uv5rm.img", "build/lib_dump.img", "build/lib.port", &e):
+        return 1
+    try SerialLink l = open_serial(e.port, 115200) else:
+        return 1
+    clear_cancel()
+    bool cancelled = false
+    ref []u8 x = nil
+    try x = download(&l, rm, Progress(fn: cancel_early, ctx: nil)) else why:
+        cancelled = why == LinkError.CANCELLED
+        x = nil
+    ok = #expect(cancelled, "download cancelled") && ok
+    #delete(x)
+    clear_cancel()
+    try ref []u8 y = download(&l, rm, no_progress()) else:
+        return 1
+    try ref []u8 orig = load_image("testdata/uv5rm.img") else:
+        return 1
+    ok = #expect(images_equal(y, orig), "download after a cancel") && ok
+    ok = #expect(emu_count("idents_accepted") == 1, "the cancelled session was reused") && ok
+    #delete(y)
+    close_serial(&l)
+    stop_emu(&e)
+
+    // ── shared backups: <data>/backups/<model>/<stamp>.img + .txt
+    string8 data = "build/lib_data"
+    if fs.exists(data):
+        try fs.remove_all(data) else:
+            return 1
+    ref []char8 bp = new_backup_path(data, rm)
+    string8 bps = bp
+    ok = #expect(bp != nil && strings.starts_with(bps, "build/lib_data/backups/uv-5rm/") && strings.ends_with(bps, "Z.img"), "backup path ", bps) && ok
+    ok = #expect(save_backup(bp, rm, orig), "backup saved") && ok
+    ref []char8 side = strings.concat(strings.trim_suffix(bps, ".img"), ".txt")
+    try ref []char8 st = fs.read_file(side) else:
+        return 1
+    string8 sts = st
+    ok = #expect(strings.contains(sts, "model = uv-5rm") && strings.contains(sts, "bytes = 33664") && strings.contains(sts, "sha256 = "), "sidecar text") && ok
+    #delete(st)
+    #delete(side)
+    #delete(bp)
+    #delete(orig)
+
+    // ── remember_choice: the record moves to the chosen model's id
+    Registry reg = open_registry(data)
+    defer reg.destroy()
+    [8]u8 f = (1, 2, 3, 4, 5, 6, 7, 8)
+    [5]u8 mreply = (0x35, 0x52, 0x48, 0x20, 0x20)
+    ref []char8 id1 = remember(&reg, "uv-17pro", "uv17pro", "PROGRAMBFNORMALU", nil, f[:], mreply[:], "/dev/x", CableInfo(vid: -1, pid: -1))
+    ok = #expect(rename_radio(&reg, id1, "Mine"), "nickname set") && ok
+    ref []char8 id2 = remember_choice(&reg, id1, "uv-5rm")
+    string8 i1 = id1
+    string8 i2 = id2
+    ok = #expect(id2 != nil && strings.starts_with(i2, "uv-5rm-") && i1 != i2, "moved to ", i2) && ok
+    KnownList k = list_known(&reg)
+    ok = #expect(#len(k.radios) == 1 && k.text(k.radios[0].model) == "uv-5rm" && k.text(k.radios[0].nickname) == "Mine" && k.text(k.radios[0].handshake) == "PROGRAMBFNORMALU", "record kept its fields") && ok
+    k.destroy()
+    // the same radio seen again as a UV-5RM lands on the same record
+    ref []char8 id3 = remember(&reg, "uv-5rm", "uv17pro", "PROGRAMBFNORMALU", nil, f[:], mreply[:], "/dev/x", CableInfo(vid: -1, pid: -1))
+    string8 i3 = id3
+    ok = #expect(i3 == i2, "later sightings match the chosen record") && ok
+    #delete(id1)
+    #delete(id2)
+    #delete(id3)
+
+    // ── ChannelList.copy is deep
+    try ref []u8 img = load_image("testdata/uv5re.img") else:
+        return 1
+    ChannelList l1 = extract(re, img)
+    ChannelList l2 = l1.copy()
+    l1.destroy()
+    ok = #expect(#len(l2.entries) == 40 && l2.text(l2.entries[0].name) == "FRS 1", "copy survives the original") && ok
+    l2.destroy()
+    #delete(img)
+    return 0 if ok else 1

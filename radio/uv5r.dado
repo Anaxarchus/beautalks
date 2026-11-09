@@ -10,8 +10,39 @@
 //   write: 58 aH aL len + data -> 06
 // Image = ident(8) + main 0x0000..0x1800 [+ aux 0x1EC0..0x2000].
 //
+// Sessions (owner's UV-5RE, probed on hardware): after the magic + ident
+// the radio stays in clone mode until ~2.5..5.5 s pass without traffic; in
+// that time a new magic is silently ignored (it holds no 0x53/0x58 bytes, so
+// it is harmless). So a silent magic is retried once after waiting until
+// UV5R_IDLE_MS have passed since our last traffic with the radio (tracked
+// in this process; unknown across processes, so then a full wait).
+// CHIRP has no end-of-session command for this family either.
+//
+// Byte audit: magics (50 BB FF ..) and our 02 / 06 hold no 0x58 ('X',
+// write) and no 0x53 ('S', read); X frames are only sent inside a session
+// we opened.
+//
 // Engine code depends only on Link, Model and Progress (see link.dado).
 package radio
+
+import "core:time"
+
+// How long the radio must be left alone before it takes a new magic.
+const i64 UV5R_IDLE_MS = 6000
+
+// When this process last exchanged bytes with a UV-5R-family radio
+// (time.Instant as i64), -1 when never.
+private i64 g_uv5r_last_traffic = -1
+
+private void touch():
+    g_uv5r_last_traffic = i64(time.instant())
+
+// Milliseconds to wait before a magic can be expected to be heard.
+i64 uv5r_wait_ms():
+    if g_uv5r_last_traffic < 0:
+        return UV5R_IDLE_MS
+    i64 since = time.as_milliseconds(time.elapsed(time.Instant(g_uv5r_last_traffic)))
+    return UV5R_IDLE_MS - since if since < UV5R_IDLE_MS else 0
 
 const i64 UV5R_MAIN = 0x1800
 const i64 UV5R_AUX_START = 0x1EC0
@@ -20,10 +51,16 @@ const i64 UV5R_AUX_END = 0x2000
 // Sends one magic and, when the radio acks it, reads the ident.
 // `second_ack` sends the closing 06 and wants 06 back (CHIRP secondack).
 LinkError!void uv5r_try_magic(^Link link, []u8 magic, bool second_ack, ^[8]u8 ident):
+    try uv5r_try_magic_t(link, magic, second_ack, ident, 1000)
+
+// uv5r_try_magic waiting `reply_ms` for the magic's 06 (detection scans
+// with a shorter wait).
+LinkError!void uv5r_try_magic_t(^Link link, []u8 magic, bool second_ack, ^[8]u8 ident, i32 reply_ms):
     for i in 0..<#len(magic):
         try send_all(link, magic[i..<i + 1])
         link.sleep_ms(10)
-    i32 ack = link.recv_byte(1000)
+    touch()
+    i32 ack = link.recv_byte(reply_ms)
     if ack < 0:
         fail LinkError.NO_ANSWER
     if ack != 0x06:
@@ -57,24 +94,37 @@ LinkError!void uv5r_try_magic(^Link link, []u8 magic, bool second_ack, ^[8]u8 id
         try send_all(link, six[:])
         if link.recv_byte(1000) != 0x06:
             fail LinkError.REFUSED
+    touch()
 
 // CHIRP _ident_radio: each of the model's magics in turn, 2 s apart after a
-// failure.
+// failure. When every magic met silence the radio may still be in its last
+// clone session: wait until it has been left alone UV5R_IDLE_MS, then go
+// through the magics once more.
 LinkError!void uv5r_ident(^Link link, ^const Model m, ^[8]u8 ident):
     i64 n = word_count(m^.magics)
     if n == 0:
         fail LinkError.BAD_MODEL
     LinkError last = LinkError.NO_ANSWER
-    for i in 0..<n:
-        [16]u8 mb
-        (i64 len, i64 _) = magic_at(m^.magics, i, mb[:])
-        if len <= 0:
-            fail LinkError.BAD_MODEL
-        try uv5r_try_magic(link, mb[0..<len], true, ident) else why:
-            last = why
-            link.sleep_ms(2000)
+    for round in 0..<2:
+        bool all_silent = true
+        for i in 0..<n:
+            [16]u8 mb
+            (i64 len, i64 _) = magic_at(m^.magics, i, mb[:])
+            if len <= 0:
+                fail LinkError.BAD_MODEL
+            link.discard()
+            try uv5r_try_magic(link, mb[0..<len], true, ident) else why:
+                last = why
+                if why != LinkError.NO_ANSWER:
+                    all_silent = false
+                if i + 1 < n:
+                    link.sleep_ms(2000)
+                continue
+            return
+        if round == 0 && all_silent:
+            link.sleep_ms(i32(uv5r_wait_ms()))
             continue
-        return
+        break
     fail last
 
 // CHIRP _read_block.
@@ -94,6 +144,7 @@ LinkError!void uv5r_read_block(^Link link, i64 addr, i64 size, bool first, []u8 
     try recv_exact(link, into[0..<size], 1500)
     [1]u8 six = [0x06]
     try send_all(link, six[:])
+    touch()
     link.sleep_ms(50)
 
 // CHIRP _send_block.
@@ -109,6 +160,7 @@ LinkError!void uv5r_send_block(^Link link, i64 addr, []u8 data):
     try send_all(link, frame[0..<4 + n])
     link.sleep_ms(50)
     i32 ack = link.recv_byte(1500)
+    touch()
     if ack < 0:
         fail LinkError.NO_ANSWER
     if ack != 0x06:
@@ -129,8 +181,10 @@ i64 bfb_version([]u8 tag):
             return v
     return -1
 
-// Downloads after a successful ident. The caller #deletes the image.
-LinkError!ref []u8 uv5r_read(^Link link, ^const Model m, [8]u8 ident, Progress pr):
+// Downloads after a successful ident. `first`: no block was read yet in
+// this session (the radio sends no leading 06 before the first answer).
+// The caller #deletes the image.
+LinkError!ref []u8 uv5r_read(^Link link, ^const Model m, [8]u8 ident, bool first, Progress pr):
     i64 size = m^.image_size
     ref []u8 img = #make([]u8, size)
     for k in 0..<8:
@@ -138,12 +192,12 @@ LinkError!ref []u8 uv5r_read(^Link link, ^const Model m, [8]u8 ident, Progress p
     [64]u8 blk
     bool dropped = false
     if !m^.aux:
-        try uv5r_read_block(link, 0x0000, 0x40, true, blk[:]) else why:
+        try uv5r_read_block(link, 0x0000, 0x40, first, blk[:]) else why:
             #delete(img)
             fail why
     else:
         // radios answer bad aux data unless another block is read first
-        try uv5r_read_block(link, 0x1E80, 0x40, true, blk[:]) else why:
+        try uv5r_read_block(link, 0x1E80, 0x40, first, blk[:]) else why:
             #delete(img)
             fail why
         try uv5r_read_block(link, 0x1EC0, 0x40, false, blk[:]) else why:
@@ -162,26 +216,30 @@ LinkError!ref []u8 uv5r_read(^Link link, ^const Model m, [8]u8 ident, Progress p
             fail why
         at += 0x40
         a += 0x40
-        report(pr, at, size)
+        try step(pr, at, size) else why:
+            #delete(img)
+            fail why
     if m^.aux:
         a = UV5R_AUX_START
         for a < UV5R_AUX_END:
-            i64 step = 0x40
+            i64 blk_len = 0x40
             if dropped && a >= 0x1FC0:
-                step = 0x10
-            try uv5r_read_block(link, a, step, false, img[at..<at + step]) else why:
+                blk_len = 0x10
+            try uv5r_read_block(link, a, blk_len, false, img[at..<at + blk_len]) else why:
                 #delete(img)
                 fail why
-            at += step
-            a += step
-            report(pr, at, size)
+            at += blk_len
+            a += blk_len
+            try step(pr, at, size) else why:
+                #delete(img)
+                fail why
     return img
 
 // Identifies and downloads. The caller #deletes the image.
 LinkError!ref []u8 uv5r_download(^Link link, ^const Model m, Progress pr):
     [8]u8 ident
     try uv5r_ident(link, m, &ident)
-    return uv5r_read(link, m, ident, pr)
+    return uv5r_read(link, m, ident, true, pr)
 
 // Whether the image comes from an "original" (pre-BFB291) radio, as the
 // model's CHIRP class decides (_is_orig): `bfb` parses the image's firmware
@@ -222,6 +280,13 @@ LinkError!void uv5r_upload(^Link link, ^const Model m, []u8 img, bool allow_unte
         fail LinkError.IMAGE_SIZE
     [8]u8 ident
     try uv5r_ident(link, m, &ident)
+    try uv5r_write(link, m, img, ident, true, pr)
+
+// The guarded upload inside an open session (after uv5r_ident). `first`:
+// no block was read yet in this session.
+LinkError!void uv5r_write(^Link link, ^const Model m, []u8 img, [8]u8 ident, bool first, Progress pr):
+    if #len(img) != m^.image_size:
+        fail LinkError.IMAGE_SIZE
     // 220 MHz radios only take 220 MHz images and the other way round
     u8 radio_band = ident[3]
     u8 image_band = img[3]
@@ -234,7 +299,7 @@ LinkError!void uv5r_upload(^Link link, ^const Model m, []u8 img, bool allow_unte
         try bool image_orig = uv5r_image_is_orig(m, img)
         // CHIRP _get_aux_data_from_radio
         [6][64]u8 b
-        try uv5r_read_block(link, 0x1E80, 0x40, true, b[0][:])
+        try uv5r_read_block(link, 0x1E80, 0x40, first, b[0][:])
         try uv5r_read_block(link, 0x1EC0, 0x40, false, b[1][:])
         try uv5r_read_block(link, 0x1F00, 0x40, false, b[2][:])
         try uv5r_read_block(link, 0x1F40, 0x40, false, b[3][:])
@@ -295,3 +360,29 @@ LinkError!void uv5r_upload(^Link link, ^const Model m, []u8 img, bool allow_unte
             i += 0x10
             done += 0x10
             report(pr, done, total)
+
+// The safe write in ONE clone session (CHIRP's _do_upload mixes reads and
+// writes in one session too): ident, read the radio's memory and save it
+// to `backup_path` (stop if that fails), write, read back and compare.
+LinkError!void uv5r_safe_session(^Link link, ^const Model m, []u8 img, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    [8]u8 ident
+    if phase != nil:
+        phase(ctx, WritePhase.BACKUP)
+    try uv5r_ident(link, m, &ident)
+    try ref []u8 before = uv5r_read(link, m, ident, true, pr)
+    bool saved = save_backup(backup_path, m, before)
+    #delete(before)
+    if !saved:
+        fail LinkError.BACKUP
+    link.sleep_ms(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.WRITE)
+    try uv5r_write(link, m, img, ident, false, pr)
+    link.sleep_ms(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.VERIFY)
+    try ref []u8 after = uv5r_read(link, m, ident, false, pr)
+    i64 bad = verify_mismatch(m, img, after)
+    #delete(after)
+    if bad >= 0:
+        fail LinkError.VERIFY

@@ -1,0 +1,185 @@
+@test
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The CLI flow exactly as a user runs it (the same `run` main calls),
+// back to back, against the pty emulator with real session behaviour and
+// no power-cycle in between, and a fresh data directory:
+//   UV-5RM, with a cable that loses the first 4 bytes after every open:
+//   read (full scan), read (open session reused), write identical
+//   image (--builtin, --allow-untested: no new ident), read; then
+//   power-cycle + detect (registry fast path: 1 attempt, and not one 0x57
+//   byte reaches the radio during detection); power-cycle + write: exactly
+//   one ident; write again through the scripted engine: still none.
+//   UV-5RE: read, read, write, read back to back (each command waits out the
+//   radio's clone-session timeout); the write uses exactly one magic.
+package main
+
+import "core:os/fs"
+import "core:os/proc"
+import "core:strings"
+import "core:time"
+import "../radio"
+
+type Emu:
+    proc.Duplex d
+    ref []char8 port
+
+// `drop`: the emulated cable loses the first 4 bytes after every open (so
+// every session probe right after an open is lost, as the CH340 did).
+bool start_emu(string8 model_ini, string8 image, bool drop, ^Emu out):
+    return start_emu_f(model_ini, image, drop, "", out)
+
+// `f_reply`: the 'F' reply the emulated UV-17Pro gives (another radio's
+// fingerprint), "" for the default.
+bool start_emu_f(string8 model_ini, string8 image, bool drop, string8 f_reply, ^Emu out):
+    for f in ["build/flow.port", "build/flow.capture", "build/flow.stats"]:
+        if fs.exists(f):
+            try fs.remove_file(f) else:
+                return false
+    [16]string8 argv = ("python3", "tools/emu.py", "--model", model_ini, "--image", image, "--port-file", "build/flow.port", "--stats", "build/flow.stats", "--capture", "build/flow.capture", "--power-file", "build/flow.power", "--drop-first", "4")
+    ref []string8 args = nil
+    defer #delete(args)
+    i64 n = 16 if drop else 14
+    for i in 0..<n:
+        args = #append(args, argv[i])
+    if #len(f_reply) != 0:
+        args = #append(args, "--f-reply")
+        args = #append(args, f_reply)
+    try out^.d = proc.duplex(args[:]) else:
+        return false
+    for _ in 0..<100:
+        if fs.exists("build/flow.port"):
+            try out^.port = fs.read_file("build/flow.port") else:
+                return false
+            return true
+        time.sleep(time.milliseconds(50))
+    return false
+
+void stop_emu(^Emu e):
+    try proc.Ended _ = proc.stop(&e^.d, 2000) else:
+        _ = 0
+    #delete(e^.port)
+
+// Power-cycles the emulated radio (it watches the file's mtime).
+void power_cycle():
+    time.sleep(time.milliseconds(20))
+    try fs.write_file("build/flow.power", "x") else:
+        return
+    // the emulator polls every 100 ms
+    time.sleep(time.milliseconds(400))
+
+i64 count(string8 key):
+    try ref []char8 t = fs.read_file("build/flow.stats") else:
+        return -1
+    defer #delete(t)
+    string8 s = t
+    string8 piece
+    strings.Splitter it = strings.splitter(s, "\n")
+    for strings.split_next(&it, &piece):
+        (string8 k, string8 v, bool found) = strings.split_first(piece, " ")
+        if found && k == key:
+            return radio.parse_num(v, -1)
+    return -1
+
+// Runs the CLI with `words` after the program name.
+i32 cli([]string8 words):
+    ref []string8 args = nil
+    defer #delete(args)
+    args = #append(args, "beautalks")
+    for w in words:
+        args = #append(args, w)
+    return run(args)
+
+bool same_file(string8 a, string8 b):
+    try ref []u8 x = fs.read_bytes(a) else:
+        return false
+    defer #delete(x)
+    try ref []u8 y = fs.read_bytes(b) else:
+        return false
+    defer #delete(y)
+    return radio.images_equal(x, y)
+
+bool no_w_byte(string8 file):
+    try ref []u8 x = fs.read_bytes(file) else:
+        return true
+    defer #delete(x)
+    for b in x:
+        if b == 0x57:
+            return false
+    return true
+
+i32 test():
+    bool ok = true
+    string8 data = "build/flow_data"
+    if fs.exists(data):
+        try fs.remove_all(data) else:
+            return 1
+    Emu e
+
+    // ── UV-5RM: sessions persist until power-cycle
+    if !start_emu("models/uv-5rm.ini", "testdata/uv5rm.img", true, &e):
+        _ = #expect(false, "emulator did not start")
+        return 1
+    string8 p = e.port
+    ok = #expect(cli(["--data", data, "read", "--port", p, "-o", "build/flow1.img"]) == 0, "read 1") && ok
+    ok = #expect(same_file("build/flow1.img", "testdata/uv5rm.img") && !g_last_session_reused, "read 1 image, full scan") && ok
+    ok = #expect(count("idents_accepted") == 1, "read 1: one ident") && ok
+    ok = #expect(cli(["--data", data, "read", "--port", p, "-o", "build/flow2.img"]) == 0, "read 2") && ok
+    ok = #expect(same_file("build/flow2.img", "testdata/uv5rm.img"), "read 2 image") && ok
+    // the probe right after the open is lost on the cable; the ident is then
+    // answered as an in-session read, recognised, and the session reused
+    ok = #expect(g_last_session_reused && g_last_attempts <= 1, "read 2 reused the open session, attempts ", g_last_attempts) && ok
+    ok = #expect(cli(["--data", data, "--builtin", "write", "build/flow2.img", "--port", p, "--allow-untested", "--backups", "build/flow_backups"]) == 0, "write (identical) in the open session") && ok
+    ok = #expect(cli(["--data", data, "read", "--port", p, "-o", "build/flow3.img"]) == 0 && same_file("build/flow3.img", "testdata/uv5rm.img"), "read 3") && ok
+    ok = #expect(count("idents_accepted") == 1, "still the one ident after read, read, write, read: ", count("idents_accepted")) && ok
+    // power-cycle: the registry's fast path finds it with one handshake, and
+    // detection sends no 0x57
+    power_cycle()
+    try fs.write_file("build/flow.capture", "") else:
+        return 1
+    ok = #expect(cli(["--data", data, "detect", "--port", p]) == 0, "detect after power-cycle") && ok
+    ok = #expect(g_last_fast_path && g_last_attempts == 1, "detect: remembered radio, attempts ", g_last_attempts) && ok
+    ok = #expect(no_w_byte("build/flow.capture"), "detect sent no 0x57") && ok
+    // the detection above left a session open (no download yet); power-cycle
+    // again and write: exactly one ident for backup + write + verify
+    power_cycle()
+    i64 before = count("idents_accepted")
+    ok = #expect(cli(["--data", data, "--builtin", "write", "build/flow2.img", "--port", p, "--allow-untested", "--backups", "build/flow_backups"]) == 0, "write after power-cycle") && ok
+    ok = #expect(count("idents_accepted") == before + 1, "write after power-cycle: exactly one ident, got ", count("idents_accepted") - before) && ok
+    // the scripted engine (drivers/engines/uv17pro.js) reuses the open session too
+    i64 before2 = count("idents_accepted")
+    ok = #expect(cli(["--data", data, "write", "build/flow2.img", "--port", p, "--allow-untested", "--backups", "build/flow_backups"]) == 0, "scripted write in the open session") && ok
+    ok = #expect(count("idents_accepted") == before2, "scripted write: no new ident") && ok
+    stop_emu(&e)
+
+    // ── UV-5RE: the clone session times out (~4 s); every command needs its
+    //    own magic, and waits the timeout out when it lands inside it
+    if !start_emu("models/uv-5r.ini", "testdata/uv5re.img", false, &e):
+        return 1
+    string8 q = e.port
+    ok = #expect(cli(["--data", data, "read", "--port", q, "--model", "UV-5R", "-o", "build/flow4.img"]) == 0 && same_file("build/flow4.img", "testdata/uv5re.img"), "5RE read 1") && ok
+    ok = #expect(cli(["--data", data, "read", "--port", q, "--model", "UV-5R", "-o", "build/flow5.img"]) == 0 && same_file("build/flow5.img", "testdata/uv5re.img"), "5RE read 2 (back to back)") && ok
+    i64 b5 = count("idents_accepted")
+    ok = #expect(cli(["--data", data, "--builtin", "write", "build/flow5.img", "--port", q, "--model", "UV-5R", "--allow-untested", "--backups", "build/flow_backups"]) == 0, "5RE write") && ok
+    ok = #expect(count("idents_accepted") == b5 + 1, "5RE write: exactly one magic, got ", count("idents_accepted") - b5) && ok
+    ok = #expect(cli(["--data", data, "read", "--port", q, "--model", "UV-5R", "-o", "build/flow6.img"]) == 0 && same_file("build/flow6.img", "testdata/uv5re.img"), "5RE read 3") && ok
+    stop_emu(&e)
+
+    // ── an untested model: verify (yes), then writes need no override for
+    //    this radio; a radio of the same model with another fingerprint does
+    if !start_emu("models/uv-17pro.ini", "testdata/uv5rm.img", false, &e):
+        return 1
+    string8 u = e.port
+    ok = #expect(cli(["--data", data, "write", "testdata/uv5rm.img", "--model", "UV-17Pro", "--port", u, "--backups", "build/flow_backups"]) == 4, "untested UV-17Pro: write refused before verify") && ok
+    ok = #expect(cli(["--data", data, "verify", "--port", u, "--model", "UV-17Pro", "--yes", "--answer", "yes"]) == 0, "verify UV-17Pro: yes") && ok
+    ok = #expect(cli(["--data", data, "write", "testdata/uv5rm.img", "--model", "UV-17Pro", "--port", u, "--backups", "build/flow_backups"]) == 0, "write after verify, no --allow-untested") && ok
+    ok = #expect(cli(["--data", data, "write", "testdata/uv5rm.img", "--model", "UV-17Pro", "--port", u, "--backups", "build/flow_backups"]) == 0, "and again (scripted engine, session reused)") && ok
+    stop_emu(&e)
+    if !start_emu_f("models/uv-17pro.ini", "testdata/uv5rm.img", false, "0136017404000520020002608084FFFF", &e):
+        return 1
+    string8 o = e.port
+    ok = #expect(cli(["--data", data, "--builtin", "write", "testdata/uv5rm.img", "--model", "UV-17Pro", "--port", o, "--backups", "build/flow_backups"]) == 4, "another fingerprint of the same model: refused") && ok
+    ok = #expect(cli(["--data", data, "--builtin", "write", "testdata/uv5rm.img", "--model", "UV-17Pro", "--port", o, "--allow-untested", "--backups", "build/flow_backups"]) == 0, "another fingerprint with --allow-untested") && ok
+    stop_emu(&e)
+    return 0 if ok else 1

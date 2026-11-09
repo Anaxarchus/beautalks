@@ -3,15 +3,28 @@
 //
 // Auto-detection: which model is on the cable?
 //
+// Open session first: a UV-17Pro-family radio that was not power-cycled
+// since its last programming session is still in it and would parse any
+// ident as commands (see uv17pro.dado). So detection begins with the
+// harmless read probe at 115200, before any other byte; when it is
+// answered, the session is reused and the model comes from the registry
+// (the radio last seen on this port with that protocol). With no record
+// the caller must ask for a power-cycle (`session_unknown`).
+//
 // Fast path: the radios in the registry are tried first — those last seen on
 // this port, then the rest, most recent first — each with exactly the
 // handshake that worked last time; the first answer wins.
 //
-// Full scan (when no known radio answers): the UV-5R family at 9600 baud
-// with each distinct magic of the model definitions, then the UV-17Pro
-// family at 115200 with each distinct PROGRAM... ident followed by 'F' and
-// 'M', whose replies narrow the model down. This order worked on the
-// owner's UV-5RM.
+// Full scan (when no known radio answers): the UV-17Pro family at 115200
+// first (each distinct PROGRAM... ident followed by 'F' and 'M', whose
+// replies narrow the model down; ~0.4 s each), then the UV-5R family at
+// 9600 with each distinct magic (2 s apart after a miss, as CHIRP). When
+// this process talked to a UV-5R in the last UV5R_IDLE_MS the UV-5R magics
+// go first instead (a UV-5R still in clone mode must not be sent 115200
+// bytes it could misread). Scan replies are awaited briefly; when the scan
+// finds nothing, the UV-17Pro idents are tried once more with a long wait
+// (a loaded machine or a slow radio). Every try is written to the
+// detection's `log`.
 //
 // A UV-5R that missed a magic needs ~2 s before the next one; the wait is
 // only paid right before another UV-5R magic, so a UV-17Pro attempt in
@@ -26,6 +39,46 @@ import "core:time"
 
 const i32 UV5R_RETRY_MS = 2000
 
+// How strongly a candidate matched (for a UI: show REMEMBERED/REPLY as
+// the answer, the rest as "also speaks this protocol").
+distinct enum i32 MatchKind:
+    // this exact handshake found this model on an earlier detection
+    REMEMBERED = 0,
+    // the model's model_reply / ident_reply is in what the radio answered
+    REPLY = 1,
+    // handshake only, model tested on hardware
+    TESTED = 2,
+    // handshake only
+    PROTOCOL = 3,
+    // handshake only, and the model's own reply text is NOT what the radio said
+    REPLY_DIFFERS = 4,
+
+string8 match_kind_name(MatchKind k):
+    switch k:
+        case MatchKind.REMEMBERED:
+            return "remembered radio"
+        case MatchKind.REPLY:
+            return "matched by reply"
+        case MatchKind.TESTED:
+            return "speaks the protocol (tested model)"
+        case MatchKind.PROTOCOL:
+            return "speaks the protocol"
+        case MatchKind.REPLY_DIFFERS:
+            return "speaks the protocol, but its reply differs"
+        else:
+            return "?"
+
+private MatchKind kind_of_score(i32 s):
+    if s <= 0:
+        return MatchKind.REMEMBERED
+    if s == 1:
+        return MatchKind.REPLY
+    if s == 2:
+        return MatchKind.TESTED
+    if s == 5:
+        return MatchKind.REPLY_DIFFERS
+    return MatchKind.PROTOCOL
+
 type Detection:
     bool found
     // "uv5r" or "uv17pro"
@@ -33,6 +86,8 @@ type Detection:
     i32 baud
     // indices into the models slice, best first
     ref []i64 candidates
+    // how each candidate matched (parallel to candidates)
+    ref []MatchKind matches
     // uv5r: the ident the radio sent
     [8]u8 ident
     // uv17pro: the identification so far (F and M replies)
@@ -43,11 +98,22 @@ type Detection:
     // open while found; close with close_detection
     SerialLink link
     bool link_open
-    // handshakes tried, and how long the whole detection took
+    // handshakes tried (each distinct handshake once), extra tries of a
+    // handshake after an unexpected or missing reply, and how long the whole
+    // detection took
     i32 attempts
+    i32 retries
     i64 elapsed_ms
     // the answer came from a remembered radio
     bool fast_path
+    // an open UV-17Pro programming session was found and reused (no ident)
+    bool session_reused
+    // an open session was found but no remembered radio says what it is:
+    // ask the user to power-cycle the radio
+    bool session_unknown
+    // one line per try: what was sent at which baud, the result, how long
+    // (for a UI's "details" and for bug reports)
+    ref []char8 log
 
 string8 detection_handshake(^Detection d):
     return string8(d^.hs_buf[0..<d^.hs_len])
@@ -58,6 +124,10 @@ void close_detection(^Detection d):
         d^.link_open = false
     #delete(d^.candidates)
     d^.candidates = nil
+    #delete(d^.matches)
+    d^.matches = nil
+    #delete(d^.log)
+    d^.log = nil
 
 private bool has_word(string8 list, string8 w):
     for i in 0..<word_count(list):
@@ -98,6 +168,8 @@ type Attempt:
     string8 word
     // the remembered model's id, "" in the full scan
     string8 model_id
+    // how long to wait for the first reply byte
+    i32 reply_ms
 
 // The port at the baud an attempt needs, opened lazily.
 private type Opened:
@@ -105,69 +177,158 @@ private type Opened:
     bool open
     i32 baud
 
-private LinkError!void ensure_baud(^Opened o, string8 port, i32 baud):
+// Opens the port at `baud` unless it already is; answers whether it was
+// (re)opened just now.
+private LinkError!bool ensure_baud(^Opened o, string8 port, i32 baud):
     if o^.open && o^.baud == baud:
-        return
+        return false
     if o^.open:
         close_serial(&o^.link)
         o^.open = false
     try o^.link = open_serial(port, baud)
     o^.open = true
     o^.baud = baud
+    return true
 
-// Tries one handshake; true when the radio answered (d filled in).
-private bool try_attempt(^Opened o, string8 port, Attempt a, ^Detection d, ^i64 uv5r_failed_at):
-    if a.uv5r:
-        try ensure_baud(o, port, 9600) else:
+// Tries one handshake, retrying it when `persist` is set (a remembered
+// radio, expected to answer) or when the radio answered something
+// unexpected. UV-17Pro: up to IDENT_TRIES, IDENT_RETRY_MS apart (an open
+// session is already handled by the probe). UV-5R: one retry once
+// UV5R_IDLE_MS passed since our last traffic, since a radio still in its
+// clone session ignores magics. Choice: a silent remembered UV-5R gets
+// that one retry (up to 6 s) before the full scan moves on; the scan
+// itself does not retry silent magics.
+private void log_try(^Detection d, Attempt a, i32 r, i64 ms):
+    strings.Builder b = strings.builder(96)
+    strings.append(&b, a.word)
+    strings.append(&b, " @9600" if a.uv5r else " @115200")
+    if #len(a.model_id) != 0:
+        strings.append(&b, " (remembered ")
+        strings.append(&b, a.model_id)
+        strings.append(&b, ")")
+    strings.append(&b, ": ")
+    if r == 1:
+        strings.append(&b, "answered")
+    else if r == 0:
+        strings.append(&b, "no reply")
+    else:
+        strings.append(&b, "unexpected reply")
+    strings.append(&b, " (wait ")
+    append_int(&b, i64(a.reply_ms))
+    strings.append(&b, " ms, took ")
+    append_int(&b, ms)
+    strings.append(&b, " ms)\n")
+    string8 t = strings.text(b)
+    for i in 0..<#len(t):
+        d^.log = #append(d^.log, t[i])
+    #delete(b)
+
+private void log_text(^Detection d, string8 t):
+    for i in 0..<#len(t):
+        d^.log = #append(d^.log, t[i])
+    d^.log = #append(d^.log, '\n')
+
+private bool try_attempt(^Opened o, string8 port, Attempt a, ^Detection d, ^i64 uv5r_failed_at, bool persist):
+    d^.attempts += 1
+    // a UV-5R in a clone session ignores magics until it has been left
+    // alone a few seconds: one retry, after that wait
+    i32 tries = 2 if a.uv5r else IDENT_TRIES
+    for k in 0..<tries:
+        if k > 0:
+            d^.retries += 1
+            if o^.open:
+                o^.link.discard()
+                if a.uv5r:
+                    o^.link.sleep_ms(i32(uv5r_wait_ms()))
+                else:
+                    o^.link.sleep_ms(IDENT_RETRY_MS)
+                o^.link.discard()
+        time.Instant t0 = time.instant()
+        i32 r = attempt_once(o, port, a, d, uv5r_failed_at)
+        log_try(d, a, r, time.as_milliseconds(time.elapsed(t0)))
+        if r == 1:
+            return true
+        if r == 0 && !persist:
             return false
+    return false
+
+// One try: 1 answered, 0 silence, -1 an unexpected reply.
+private i32 attempt_once(^Opened o, string8 port, Attempt a, ^Detection d, ^i64 uv5r_failed_at):
+    if a.uv5r:
+        try bool _ = ensure_baud(o, port, 9600) else:
+            return 0
         [16]u8 mb
         i64 n = decode_bytes(a.word, mb[:])
         if n <= 0:
-            return false
+            return 0
         // pay the UV-5R retry gap only now, right before another magic
         if uv5r_failed_at^ >= 0:
             i64 since = time.as_milliseconds(time.elapsed(time.Instant(uv5r_failed_at^)))
             if since < UV5R_RETRY_MS:
                 o^.link.sleep_ms(i32(UV5R_RETRY_MS - since))
-        d^.attempts += 1
         o^.link.discard()
-        try uv5r_try_magic(&o^.link, mb[0..<n], true, &d^.ident) else:
+        try uv5r_try_magic_t(&o^.link, mb[0..<n], true, &d^.ident, a.reply_ms) else why:
             uv5r_failed_at^ = i64(time.instant())
-            return false
+            return 0 if why == LinkError.NO_ANSWER else -1
         d^.engine = "uv5r"
         d^.baud = 9600
-        return true
-    try ensure_baud(o, port, 115200) else:
-        return false
+        return 1
+    bool fresh = false
+    try fresh = ensure_baud(o, port, 115200) else:
+        return 0
+    // the first bytes after an open are the likeliest to be lost on the
+    // cable; let the harmless session probe take that risk, not the ident
+    // (and an open session found here is reused, never sent an ident)
+    if fresh && uv17_session_open(&o^.link):
+        d^.hello.reused = true
+        d^.hello.f_len = 0
+        d^.hello.m_len = 0
+        d^.session_reused = true
+        d^.engine = "uv17pro"
+        d^.baud = 115200
+        return 1
     [32]u8 idb
     i64 n = decode_bytes(a.word, idb[:])
     if n <= 0:
-        return false
-    d^.attempts += 1
+        return 0
     o^.link.discard()
     try send_all(&o^.link, idb[0..<n]) else:
-        return false
-    if o^.link.recv_byte(1000) != 0x06:
-        return false
+        return 0
+    i32 ack = o^.link.recv_byte(a.reply_ms)
+    if ack < 0:
+        return 0
+    if ack != 0x06:
+        // an open session the first probe missed answers our ident as a
+        // read: drain, re-probe, and reuse it (never another ident into it)
+        drain(&o^.link, 300)
+        if uv17_session_open(&o^.link):
+            d^.hello.reused = true
+            d^.hello.f_len = 0
+            d^.hello.m_len = 0
+            d^.session_reused = true
+            d^.engine = "uv17pro"
+            d^.baud = 115200
+            return 1
+        return -1
     Uv17Hello h
     // 'F' then 'M', as every model of the family starts its magics
     [1]u8 f = [0x46]
     try send_all(&o^.link, f[:]) else:
-        return false
+        return 0
     try i64 fl = o^.link.recv(h.f_reply[0..<16], 1000) else:
-        return false
+        return 0
     h.f_len = fl
     [1]u8 mm = [0x4D]
     try send_all(&o^.link, mm[:]) else:
-        return false
+        return 0
     try i64 ml = o^.link.recv(h.m_reply[0..<32], 500) else:
-        return false
+        return 0
     h.m_len = ml
     h.magics_sent = 2
     d^.hello = h
     d^.engine = "uv17pro"
     d^.baud = 115200
-    return true
+    return 1
 
 // Ranks every model that answers to the handshake that worked.
 private void rank(^Detection d, []Model models, Attempt a):
@@ -201,12 +362,16 @@ private void rank(^Detection d, []Model models, Attempt a):
         if #len(a.model_id) != 0 && m^.id == a.model_id:
             score = 0
         add_ranked(&d^.candidates, &scores, mi, score)
+    for s in scores:
+        d^.matches = #append(d^.matches, kind_of_score(s))
 
-// The full-scan handshakes: distinct uv5r magics, then distinct uv17pro
-// idents, in model order (tested models first).
-private ref []Attempt full_scan([]Model models):
+// The full-scan handshakes: distinct uv17pro idents and distinct uv5r
+// magics (`uv5r_first` decides which family goes first), in model order
+// (tested models first), each with its scan reply wait.
+private ref []Attempt full_scan([]Model models, bool uv5r_first):
     ref []Attempt out = nil
-    for fam in 0..<2:
+    for f in 0..<2:
+        i32 fam = f if uv5r_first else 1 - f
         for pass in 0..<2:
             for mi in 0..<#len(models):
                 ^const Model m = &models[mi]
@@ -224,7 +389,7 @@ private ref []Attempt full_scan([]Model models):
                         if x.word == w:
                             seen = true
                     if !seen:
-                        out = #append(out, Attempt(uv5r: uv5r, word: w, model_id: ""))
+                        out = #append(out, Attempt(uv5r: uv5r, word: w, model_id: "", reply_ms: 500 if uv5r else 400))
     return out
 
 // The fast-path handshakes from the registry: radios last seen on `port`
@@ -247,7 +412,7 @@ ref []Attempt remembered_attempts(^KnownList known, []Model models, string8 port
                 if a.word == w && a.model_id == known^.text(x.model):
                     seen = true
             if !seen:
-                out = #append(out, Attempt(uv5r: eng == "uv5r", word: w, model_id: known^.text(x.model)))
+                out = #append(out, Attempt(uv5r: eng == "uv5r", word: w, model_id: known^.text(x.model), reply_ms: 1000))
     return out
 
 // Probes the radio on `port`: the remembered radios in `reg` first (nil for
@@ -262,21 +427,100 @@ LinkError!Detection detect_with(string8 port, []Model models, ^Registry reg, Pro
     if reg != nil:
         known = list_known(reg)
         fast = remembered_attempts(&known, models, port)
-    ref []Attempt scan = full_scan(models)
+    // a UV-5R this process talked to in the last few seconds may still be in
+    // clone mode: its magics go first then
+    bool uv5r_first = uv5r_wait_ms() > 0 && uv5r_wait_ms() < UV5R_IDLE_MS
+    ref []Attempt scan = full_scan(models, uv5r_first)
     defer #delete(scan)
+    // the slow pass: UV-17Pro idents again with a long wait
+    ref []Attempt slow = nil
+    defer #delete(slow)
+    for a in scan:
+        if !a.uv5r:
+            slow = #append(slow, Attempt(uv5r: false, word: a.word, model_id: "", reply_ms: 1500))
     Opened o
     i64 failed_at = -1
-    i64 planned = #len(fast) + #len(scan)
+    // ── an open UV-17Pro session? (first: nothing else may reach it before)
+    try bool _ = ensure_baud(&o, port, 115200)
+    time.Instant tp = time.instant()
+    bool open_session = uv17_session_open(&o.link)
+    strings.Builder pb = strings.builder(64)
+    strings.append(&pb, "session probe 52 00 00 40 @115200: ")
+    strings.append(&pb, "an open session answered" if open_session else "no open session")
+    strings.append(&pb, " (")
+    append_int(&pb, time.as_milliseconds(time.elapsed(tp)))
+    strings.append(&pb, " ms)")
+    log_text(&d, strings.text(pb))
+    #delete(pb)
+    if open_session:
+        d.engine = "uv17pro"
+        d.baud = 115200
+        for a in fast:
+            if a.uv5r:
+                continue
+            i64 ri = -1
+            for i in 0..<#len(known.radios):
+                if known.text(known.radios[i].handshake) == a.word && known.text(known.radios[i].model) == a.model_id:
+                    ri = i
+                    break
+            if ri < 0:
+                continue
+            KnownRadio x = known.radios[ri]
+            d.hello.f_len = decode_bytes(known.text(x.f_reply), d.hello.f_reply[:])
+            d.hello.m_len = decode_bytes(known.text(x.m_reply), d.hello.m_reply[:])
+            if d.hello.f_len < 0:
+                d.hello.f_len = 0
+            if d.hello.m_len < 0:
+                d.hello.m_len = 0
+            d.hello.reused = true
+            d.found = true
+            d.fast_path = true
+            d.session_reused = true
+            i64 n = #len(a.word)
+            if n > #len(d.hs_buf):
+                n = #len(d.hs_buf)
+            for k in 0..<n:
+                d.hs_buf[k] = a.word[k]
+            d.hs_len = n
+            d.link = o.link
+            d.link_open = true
+            rank(&d, models, a)
+            d.elapsed_ms = time.as_milliseconds(time.elapsed(started))
+            return d
+        d.session_unknown = true
+        close_serial(&o.link)
+        d.elapsed_ms = time.as_milliseconds(time.elapsed(started))
+        return d
+    i64 planned = #len(fast) + #len(scan) + #len(slow)
     i64 done = 0
-    for pass in 0..<2:
-        ref []Attempt list = fast if pass == 0 else scan
+    for pass in 0..<3:
+        []Attempt list = fast if pass == 0 else (scan if pass == 1 else slow)
+        if pass == 2 && #len(slow) != 0:
+            log_text(&d, "nothing answered quickly; trying the UV-17Pro idents again with a long wait")
         for a in list:
             done += 1
-            report(pr, done, planned)
-            if !try_attempt(&o, port, a, &d, &failed_at):
+            try step(pr, done, planned) else why:
+                if o.open:
+                    close_serial(&o.link)
+                fail why
+            // a remembered radio is expected to answer: persist with it
+            if !try_attempt(&o, port, a, &d, &failed_at, pass == 0):
                 continue
             d.found = true
             d.fast_path = pass == 0
+            // an open session found through the ident fingerprint: the F/M
+            // replies are the remembered radio's (so its record matches)
+            if d.session_reused && d.hello.m_len == 0 && #len(a.model_id) != 0:
+                for i in 0..<#len(known.radios):
+                    KnownRadio x = known.radios[i]
+                    if known.text(x.handshake) == a.word && known.text(x.model) == a.model_id:
+                        d.hello.f_len = decode_bytes(known.text(x.f_reply), d.hello.f_reply[:])
+                        d.hello.m_len = decode_bytes(known.text(x.m_reply), d.hello.m_reply[:])
+                        if d.hello.f_len < 0:
+                            d.hello.f_len = 0
+                        if d.hello.m_len < 0:
+                            d.hello.m_len = 0
+                        break
             i64 n = #len(a.word)
             if n > #len(d.hs_buf):
                 n = #len(d.hs_buf)
@@ -303,10 +547,10 @@ LinkError!ref []u8 download_detected(^Detection d, ^const Model m, Progress pr):
     if !d^.found || !d^.link_open || m^.engine != d^.engine:
         fail LinkError.BAD_MODEL
     if m^.engine == "uv5r":
-        return uv5r_read(&d^.link, m, d^.ident, pr)
+        return uv5r_read(&d^.link, m, d^.ident, true, pr)
     // the model's own magics after 'F' and 'M' (its SEND differs per model)
     Uv17Hello h = d^.hello
-    if word_count(m^.magics) < 2:
+    if word_count(m^.magics) < 2 || h.reused:
         h.magics_sent = word_count(m^.magics)
     try uv17_more_magics(&d^.link, m, &h, -1)
     return uv17_read(&d^.link, m, pr)

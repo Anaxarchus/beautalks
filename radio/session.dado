@@ -1,0 +1,49 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// How each protocol family's programming session behaves, as measured on
+// the owner's radios, for callers that schedule work (a UI) instead of
+// hard-coding it.
+package radio
+
+type SessionInfo:
+    // how long after its last traffic an open session can still be reused,
+    // in ms; -1 = until the radio is power-cycled
+    i64 reuse_window_ms
+    // whether the session survives closing and reopening the port
+    bool survives_reopen
+    // whether this process can find an open session and reuse it (UV-17Pro:
+    // the harmless read probe); otherwise a new ident is needed
+    bool reusable
+    // how long the radio must be left alone before it takes a new ident
+    // (0 = it never needs a pause)
+    i64 quiet_ms
+    // the port settles this long after opening before the first byte
+    i32 settle_ms
+    // a failed ident is retried this many times in all, this far apart
+    i32 ident_tries
+    i32 ident_retry_ms
+
+SessionInfo session_info(^const Model m):
+    SessionInfo s
+    s.settle_ms = 200
+    s.ident_tries = IDENT_TRIES
+    s.ident_retry_ms = IDENT_RETRY_MS
+    if m^.engine == "uv5r":
+        // UV-5RE: clone mode ends 2.5..5.5 s after the last traffic, survives
+        // a reopen meanwhile, ignores magics until then; one retry after
+        // UV5R_IDLE_MS of quiet
+        s.reuse_window_ms = 2500
+        s.survives_reopen = true
+        s.reusable = false
+        s.quiet_ms = UV5R_IDLE_MS
+        s.ident_tries = 2
+        s.ident_retry_ms = i32(UV5R_IDLE_MS)
+        return s
+    // UV-5RM: open for >60 s idle and across reopens (HUPCL or not), until
+    // power-cycled; found and reused by the read probe
+    s.reuse_window_ms = -1
+    s.survives_reopen = true
+    s.reusable = true
+    s.quiet_ms = 0
+    return s

@@ -1,0 +1,374 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Dialogs: friendly error checklists, "Which radio is this?", and the tone
+// picker.
+package main
+
+import "core:strings"
+import "core:time"
+import btui "../ui"
+import "../radio"
+
+i64 unix_now():
+    return time.unix()
+
+void dialogs():
+    error_dialog()
+    which_radio_dialog()
+    tone_dialog()
+    rename_dialog()
+    new_port_dialog()
+
+// ── error checklists ─────────────────────────────────────────────────────────
+
+const i32 EK_NO_ANSWER = 1
+const i32 EK_PORT = 2
+const i32 EK_SESSION = 3
+const i32 EK_PULLED = 4
+const i32 EK_OTHER = 5
+const i32 EK_CANCELLED = 6
+const i32 EK_NOT_MODEL = 7
+
+i32 g_err_kind
+ref []char8 g_err_port
+ref []char8 g_err_detail
+// what detection tried (radio.Detection.log), behind "Details"
+ref []char8 g_err_log
+bool g_err_show_log
+
+// The kind of trouble a failed job had, for the checklist.
+i32 error_kind(i32 err, i32 link):
+    if err == JERR_SESSION:
+        return EK_SESSION
+    if err == JERR_NO_RADIO:
+        return EK_NO_ANSWER
+    if err == JERR_NOT_THIS_MODEL:
+        return EK_NOT_MODEL
+    if err == JERR_LINK:
+        radio.LinkError le = radio.LinkError(link)
+        if le == radio.LinkError.NO_ANSWER:
+            return EK_NO_ANSWER
+        if le == radio.LinkError.IO:
+            // an I/O failure mid-transfer is a pulled cable; at open, the port
+            return EK_PULLED if g_last_phase_seen >= PH_READ else EK_PORT
+        if le == radio.LinkError.CANCELLED:
+            return EK_CANCELLED
+    return EK_OTHER
+
+i32 g_last_phase_seen
+
+void error_open(i32 err, i32 link, string8 port):
+    g_err_kind = error_kind(err, link)
+    using app_keep():
+        #delete(g_err_port)
+        #delete(g_err_detail)
+        g_err_port = strings.clone(port)
+        string8 d = ""
+        if err == JERR_LINK:
+            d = link_words(radio.LinkError(link))
+        else if err == JERR_BACKUP:
+            d = "The backup could not be saved, so nothing was written."
+        g_err_detail = strings.clone(d)
+        #delete(g_err_log)
+        g_err_log = nil
+        g_err_show_log = false
+        if job().detect_log != nil:
+            string8 lg = job().detect_log
+            g_err_log = strings.clone(lg)
+    if g_err_kind == EK_CANCELLED:
+        btui.snackbar_show("Stopped. The radio was left as it was.")
+        return
+    btui.dialog_open("error")
+
+private void check_line(btui.Rect r, f32 y, string8 s) :
+    ^btui.Scheme t = btui.theme()
+    btui.icon("check_circle", r.x, y + 2.0, 20.0, t.primary)
+    _ = btui.text_wrap(btui.rect(r.x + 32.0, y, r.w - 32.0, 48.0), btui.BODY_MEDIUM, s, t.on_surface)
+
+private void error_dialog():
+    string8 title = "The radio didn't answer"
+    string8 icon_name = "wifi_tethering"
+    [4]string8 steps
+    i32 n = 4
+    string8 port_line = #format("Make sure the cable is the one on ", g_err_port, ".")
+    string8 detail = g_err_detail
+    if g_err_kind == EK_NO_ANSWER:
+        steps = ["Turn the radio on and turn the volume up a little.", "Push the cable plug firmly into the radio; it needs to click all the way in.", port_line, "Wait a few seconds after turning the radio on, then try again."]
+    else if g_err_kind == EK_PORT:
+        title = "The cable's port couldn't be opened"
+        icon_name = "usb"
+        steps = ["Close other radio programs (CHIRP, the maker's software) that may be using the cable.", "Unplug the cable and plug it in again.", "On a Mac, some cables need the maker's driver (CH340, PL2303).", "On Linux, your user must be in the \"dialout\" group."]
+    else if g_err_kind == EK_SESSION:
+        title = "Please switch the radio off and on"
+        icon_name = "refresh"
+        steps = ["The radio is still in a programming session from before.", "Switch the radio off, wait two seconds, and switch it on again.", "Leave the cable plugged in.", "Then try again."]
+    else if g_err_kind == EK_PULLED:
+        title = "The connection was lost"
+        icon_name = "cable"
+        steps = ["The cable may have been pulled out, or the radio switched off.", "Plug the cable back in and check the radio is on.", "Nothing was changed if this happened while reading.", "If it happened while writing, use \"Restore\" to put the backup back."]
+    else if g_err_kind == EK_NOT_MODEL:
+        title = "This isn't the radio you read"
+        icon_name = "radio"
+        steps = ["The radio on the cable answers as a different model.", "Plug in the radio these channels came from,", "or read this radio first and edit its own channels.", "Nothing was written."]
+    else:
+        title = "Something went wrong"
+        icon_name = "error"
+        n = 2
+        steps = [detail, "Try again. If it keeps happening, the radio may need a power-cycle.", "", ""]
+    bool has_log = #len(g_err_log) > 0
+    f32 log_h = 196.0 if has_log && g_err_show_log else 0.0
+    (btui.Rect body, bool open) = btui.dialog_begin("error", title, 560.0, f32(n) * 48.0 + log_h, icon_name)
+    if !open:
+        return
+    for i in 0..<n:
+        check_line(body, body.y + f32(i32(i)) * 48.0, steps[i])
+    if log_h > 0.0:
+        // what was tried, for a helper or a bug report (newest at the bottom)
+        ^btui.Scheme t = btui.theme()
+        btui.Rect lr = btui.rect(body.x, body.y + f32(n) * 48.0 + 4.0, body.w, log_h - 12.0)
+        btui.fill_rrect(lr, 8.0, t.surface_container_highest)
+        btui.Rect li = btui.inset(lr, 12.0)
+        f32 need = btui.text_wrap(li, btui.BODY_SMALL, g_err_log, t.on_surface_variant, true)
+        btui.push_clip(li)
+        // show the end when it is longer than the box
+        f32 off = need - li.h if need > li.h else 0.0
+        _ = btui.text_wrap(btui.rect(li.x, li.y - off, li.w, need), btui.BODY_SMALL, g_err_log, t.on_surface_variant)
+        btui.pop_clip()
+    btui.Rect acts = btui.dialog_actions(body)
+    if has_log:
+        string8 dl = "Hide details" if g_err_show_log else "Details"
+        f32 dw = btui.button_width(dl, "", btui.BTN_TEXT)
+        if btui.button(dl, btui.rect(acts.x, acts.y, dw, 40.0), btui.BTN_TEXT):
+            g_err_show_log = !g_err_show_log
+    f32 w1 = btui.button_width("Try again", "", btui.BTN_TEXT)
+    if btui.button("Try again", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+        retry_last()
+    f32 w2 = btui.button_width("Close", "", btui.BTN_TEXT)
+    if btui.button("Close", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()
+
+private void retry_last():
+    if g_last_kind == JOB_READ:
+        start_read(g_err_port, "")
+    else if g_last_kind == JOB_DETECT:
+        start_detect(g_err_port)
+
+// ── which radio is this? ─────────────────────────────────────────────────────
+
+ref []i64 g_which
+ref []radio.MatchKind g_which_kinds
+i32 g_which_sel
+ref []char8 g_which_how
+i32 g_which_job
+
+void which_radio_open(^Job j):
+    using app_keep():
+        #delete(g_which)
+        #delete(g_which_kinds)
+        #delete(g_which_how)
+        g_which = nil
+        g_which_kinds = nil
+        for c in j.cands:
+            g_which = #append(g_which, c)
+        for k in j.matches:
+            g_which_kinds = #append(g_which_kinds, k)
+        g_which_how = strings.clone(j.how)
+    g_which_sel = 0
+    g_which_job = j.kind
+    btui.dialog_open("which")
+
+private string8 evidence(radio.MatchKind k):
+    if k == radio.MatchKind.REMEMBERED:
+        return "This radio chose it before"
+    if k == radio.MatchKind.REPLY:
+        return "Its reply names this model"
+    if k == radio.MatchKind.TESTED:
+        return "Speaks the same language · tested model"
+    if k == radio.MatchKind.REPLY_DIFFERS:
+        return "Speaks the same language, but its reply differs"
+    return "Speaks the same language"
+
+private void which_radio_dialog():
+    ^btui.Scheme t = btui.theme()
+    i32 n = i32(#len(g_which))
+    f32 bh = 52.0 + f32(mini(n, 6)) * 64.0
+    (btui.Rect body, bool open) = btui.dialog_begin("which", "Which radio is this?", 560.0, bh, "radio")
+    if !open:
+        return
+    _ = btui.text_wrap(btui.rect(body.x, body.y, body.w, 44.0), btui.BODY_MEDIUM, #format("Several models answer the same way (", g_which_how, "). Pick yours; beautalks remembers the choice for this radio."), t.on_surface_variant)
+    for i in 0..<mini(n, 6):
+        btui.Rect rr = btui.rect(body.x - 8.0, body.y + 52.0 + f32(i32(i)) * 64.0, body.w + 16.0, 60.0)
+        i64 mi = g_which[i]
+        bool on = g_which_sel == i32(i)
+        if btui.list_item(rr, model_label(mi), evidence(g_which_kinds[i]), "radio", tested_word(mi), on, true, #format("which", i)):
+            g_which_sel = i32(i)
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("This one", "", btui.BTN_FILLED)
+    if btui.button("This one", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_FILLED):
+        btui.dialog_close()
+        string8 id = g_models[g_which[g_which_sel]].id
+        if g_which_job == JOB_DETECT:
+            start_detect_as(id)
+        else:
+            start_read(g_job_port, id)
+    f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()
+
+// Detect, taking `id` as the model (the choice is remembered by the read).
+private void start_detect_as(string8 id):
+    start_read(g_job_port, id)
+
+string8 tested_word(i64 mi):
+    radio.Tested tt = g_models[mi].tested
+    if tt == radio.Tested.WRITE:
+        return "Tested"
+    if tt == radio.Tested.READ:
+        return "Read tested"
+    return "Untested"
+
+i32 mini(i32 a, i32 b):
+    return a if a < b else b
+
+// ── tone picker ──────────────────────────────────────────────────────────────
+
+[50]i32 CTCSS_TENTHS = [670, 693, 719, 744, 770, 797, 825, 854, 885, 915, 948, 974, 1000, 1035, 1072, 1109, 1148, 1188, 1230, 1273, 1318, 1365, 1413, 1462, 1500, 1514, 1567, 1598, 1622, 1655, 1679, 1713, 1738, 1773, 1799, 1835, 1862, 1899, 1928, 1966, 1995, 2035, 2065, 2107, 2181, 2257, 2291, 2336, 2418, 2503]
+
+radio.Tone g_tone
+i32 g_tone_kind
+i32 g_tone_pol
+i32 g_tone_row
+i32 g_tone_col
+btui.Scroll g_tone_scroll
+// what to do with the choice: 0 the channel editor, 1 the profile editor
+i32 g_tone_target
+
+void tone_open(radio.Tone cur, i32 row, i32 col, i32 target):
+    g_tone = cur
+    g_tone_kind = i32(cur.kind)
+    g_tone_pol = 1 if cur.inverted else 0
+    g_tone_row = row
+    g_tone_col = col
+    g_tone_target = target
+    btui.Scroll z
+    g_tone_scroll = z
+    btui.dialog_open("tone")
+
+private void tone_dialog():
+    ^btui.Scheme t = btui.theme()
+    (btui.Rect body, bool open) = btui.dialog_begin("tone", "Choose a tone", 600.0, 380.0, "")
+    if !open:
+        return
+    _ = btui.text_wrap(btui.rect(body.x, body.y, body.w, 40.0), btui.BODY_MEDIUM, "A tone keeps other groups' chatter quiet: \"TX tone\" is sent with your voice, \"RX tone\" is what the radio waits to hear.", t.on_surface_variant)
+    [3]string8 kinds = ["Off", "CTCSS (Hz)", "DCS code"]
+    _ = btui.segmented("tonekind", btui.rect(body.x, body.y + 52.0, 420.0, 40.0), kinds[:], &g_tone_kind)
+    btui.Rect grid = btui.rect(body.x, body.y + 108.0, body.w, 260.0)
+    if g_tone_kind == 0:
+        btui.text_in(grid, btui.BODY_LARGE, "No tone: the radio hears everyone on the channel.", t.on_surface_variant, btui.ALIGN_CENTER)
+        g_tone = radio.Tone(kind: radio.ToneKind.OFF, value: 0, inverted: false)
+    else:
+        [2]string8 pols = ["Normal (N)", "Inverted (I)"]
+        if g_tone_kind == 2:
+            _ = btui.segmented("tonepol", btui.rect(right_of(body) - 300.0, body.y + 52.0, 300.0, 40.0), pols[:], &g_tone_pol)
+        i32 n = 50 if g_tone_kind == 1 else 105
+        f32 cw = 92.0
+        i32 per = i32((grid.w + 8.0) / (cw + 8.0))
+        f32 content = f32((n + per - 1) / per) * 40.0
+        _ = btui.scroll_update(grid, &g_tone_scroll, content)
+        btui.push_clip(grid)
+        for i in 0..<n:
+            i32 col = i32(i) % per
+            i32 row = i32(i) / per
+            f32 x = grid.x + f32(col) * (cw + 8.0)
+            f32 y = grid.y + f32(row) * 40.0 - g_tone_scroll.y
+            if y + 32.0 < grid.y || y > btui.bottom(grid):
+                continue
+            radio.Tone cand
+            if g_tone_kind == 1:
+                cand = radio.Tone(kind: radio.ToneKind.CTCSS, value: CTCSS_TENTHS[i], inverted: false)
+            else:
+                cand = radio.Tone(kind: radio.ToneKind.DCS, value: radio.DCS_CODES[i], inverted: g_tone_pol == 1)
+            bool on = radio.tone_equal(cand, g_tone)
+            ref []char8 label = tone_text(cand)
+            if btui.chip(label, btui.rect(x, y, cw, 32.0), btui.CHIP_FILTER, "", &on):
+                g_tone = cand
+            #delete(label)
+        btui.pop_clip()
+        btui.scrollbar("tonegrid", grid, &g_tone_scroll)
+        if g_tone_kind == 2 && g_tone.kind == radio.ToneKind.DCS:
+            g_tone.inverted = g_tone_pol == 1
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("Use this tone", "", btui.BTN_FILLED)
+    if btui.button("Use this tone", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_FILLED):
+        btui.dialog_close()
+        if g_tone_kind == 0:
+            g_tone = radio.Tone(kind: radio.ToneKind.OFF, value: 0, inverted: false)
+        if g_tone_target == 0:
+            channels_set_tone(g_tone_row, g_tone_col, g_tone)
+        else:
+            profile_set_tone(g_tone_row, g_tone_col, g_tone)
+    f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()
+
+f32 right_of(btui.Rect r):
+    return r.x + r.w
+
+// ── rename a remembered radio ───────────────────────────────────────────────
+
+btui.Field g_rename
+ref []char8 g_rename_id
+
+void rename_open(string8 id, string8 current):
+    using app_keep():
+        #delete(g_rename_id)
+        g_rename_id = strings.clone(id)
+    btui.field_set(&g_rename, current)
+    btui.field_select_all(&g_rename)
+    btui.dialog_open("rename")
+    btui.set_focus(btui.id("rename#tf"))
+
+private void rename_dialog():
+    ^btui.Scheme t = btui.theme()
+    (btui.Rect body, bool open) = btui.dialog_begin("rename", "Name this radio", 440.0, 100.0, "")
+    if !open:
+        return
+    btui.FieldOpts o = btui.field_opts("Nickname", btui.FIELD_OUTLINED)
+    o.behind = t.surface_container_high
+    o.helper = "Shown instead of the model, e.g. \"Truck radio\""
+    btui.FieldOut fo = btui.text_field("rename", btui.rect(body.x, body.y + 8.0, body.w, 76.0), &g_rename, o)
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("Save", "", btui.BTN_TEXT)
+    if btui.button("Save", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT) || fo.submitted:
+        btui.dialog_close()
+        radios_rename(g_rename_id, btui.field_text(&g_rename))
+    f32 w2 = btui.button_width("Cancel", "", btui.BTN_TEXT)
+    if btui.button("Cancel", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()
+
+// ── a new port that is not a known cable ────────────────────────────────────
+
+private void new_port_dialog():
+    if g_new_port_prompt && !btui.any_dialog_open() && !job_busy():
+        g_new_port_prompt = false
+        btui.dialog_open("newport")
+    ^btui.Scheme t = btui.theme()
+    (btui.Rect body, bool open) = btui.dialog_begin("newport", "A new port appeared", 460.0, 64.0, "usb")
+    if !open:
+        return
+    _ = btui.text_wrap(body, btui.BODY_MEDIUM, #format(g_new_port, " isn't a programming cable beautalks knows, so it wasn't probed. Look for a radio on it?"), t.on_surface_variant)
+    btui.Rect acts = btui.dialog_actions(body)
+    f32 w1 = btui.button_width("Detect", "", btui.BTN_TEXT)
+    if btui.button("Detect", btui.rect(btui.right(acts) - w1, acts.y, w1, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+        start_detect(g_new_port)
+    f32 w2 = btui.button_width("Not now", "", btui.BTN_TEXT)
+    if btui.button("Not now", btui.rect(btui.right(acts) - w1 - 8.0 - w2, acts.y, w2, 40.0), btui.BTN_TEXT):
+        btui.dialog_close()
+    btui.dialog_end()

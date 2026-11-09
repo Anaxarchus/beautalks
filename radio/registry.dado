@@ -242,6 +242,9 @@ type KnownRadio:
     Span usb
     Span image_sha256
     Span backup
+    // the same fingerprint verification records use ("" when the record
+    // does not hold enough: no replies, or a UV-5R never read)
+    Span fingerprint
     i64 first_seen
     i64 last_seen
     i64 seen
@@ -287,6 +290,9 @@ KnownList list_known(^Registry r):
         x.usb = k.keep(cfg.get_string(r^.c, sec, "usb", ""))
         x.image_sha256 = k.keep(cfg.get_string(r^.c, sec, "image_sha256", ""))
         x.backup = k.keep(cfg.get_string(r^.c, sec, "backup", ""))
+        ref []char8 fp = record_fingerprint(cfg.get_string(r^.c, sec, "engine", ""), cfg.get_string(r^.c, sec, "ident", ""), cfg.get_string(r^.c, sec, "f_reply", ""), cfg.get_string(r^.c, sec, "m_reply", ""), cfg.get_string(r^.c, sec, "firmware", ""))
+        x.fingerprint = k.keep(fp)
+        #delete(fp)
         x.first_seen = cfg.get_i64(r^.c, sec, "first_seen", 0)
         x.last_seen = cfg.get_i64(r^.c, sec, "last_seen", 0)
         x.seen = cfg.get_i64(r^.c, sec, "seen", 0)
@@ -300,3 +306,86 @@ KnownList list_known(^Registry r):
             k.radios[j - 1] = t
             j -= 1
     return k
+
+// The user chose `model_id` for known radio `radio_id` (e.g. from the
+// detection's candidates, later, without the Detection at hand). The record
+// moves to the id that model gives it (radio_id hashes the model), keeping
+// everything else: nickname, first/last seen, count, port, backups.
+// Answers the record's id now (the caller #deletes it), nil when there is
+// no such radio.
+ref []char8 remember_choice(^Registry r, string8 rid, string8 model_id):
+    ref []char8 sec = section_of(rid)
+    defer #delete(sec)
+    if cfg.get_i64(r^.c, sec, "first_seen", 0) == 0:
+        return nil
+    // what identifies it
+    [16]u8 ident
+    [32]u8 f
+    [32]u8 mr
+    ref []char8 eng = strings.clone(cfg.get_string(r^.c, sec, "engine", ""))
+    defer #delete(eng)
+    i64 ni = decode_bytes(cfg.get_string(r^.c, sec, "ident", ""), ident[:])
+    i64 nf = decode_bytes(cfg.get_string(r^.c, sec, "f_reply", ""), f[:])
+    i64 nm = decode_bytes(cfg.get_string(r^.c, sec, "m_reply", ""), mr[:])
+    ref []char8 id = radio_id(model_id, eng, ident[0..<(ni if ni > 0 else 0)], f[0..<(nf if nf > 0 else 0)], mr[0..<(nm if nm > 0 else 0)])
+    string8 ids = id
+    if ids == rid:
+        cfg.set_string(&r^.c, sec, "model", model_id)
+        return id
+    // copy every key (cloned first: setting keys may move the map's text)
+    ref [](ref []char8) owned = nil
+    string8 secs = sec
+    for s, keys_map in r^.c:
+        if s != secs:
+            continue
+        for k, v in keys_map:
+            owned = #append(owned, strings.clone(k))
+            string8 vs = v
+            owned = #append(owned, strings.clone(vs))
+    ref []char8 nsec = section_of(id)
+    for i in 0..<#len(owned) / 2:
+        cfg.set_string(&r^.c, nsec, owned[2 * i], owned[2 * i + 1])
+    cfg.set_string(&r^.c, nsec, "model", model_id)
+    _ = cfg.remove_section(&r^.c, sec)
+    for o in owned:
+        #delete(o)
+    #delete(owned)
+    #delete(nsec)
+    return id
+
+private string8 strip_hex(string8 s):
+    return strings.trim_prefix(s, "hex:")
+
+// A known radio's fingerprint from its stored replies (the format of
+// fingerprint_of). The caller #deletes it.
+ref []char8 record_fingerprint(string8 engine, string8 ident, string8 f_reply, string8 m_reply, string8 firmware):
+    strings.Builder b = strings.builder(96)
+    if engine == "uv5r":
+        string8 id = strip_hex(ident)
+        if #len(id) == 0:
+            #delete(b)
+            return strings.clone("")
+        strings.append(&b, "uv5r:ident=")
+        strings.append(&b, id)
+        strings.append(&b, " fw=")
+        strings.append(&b, firmware)
+        return strings.finish(&b)
+    string8 f = strip_hex(f_reply)
+    string8 m = strip_hex(m_reply)
+    if #len(f) == 0 || #len(m) == 0:
+        #delete(b)
+        return strings.clone("")
+    strings.append(&b, engine)
+    strings.append(&b, ":F=")
+    strings.append(&b, f)
+    strings.append(&b, " M=")
+    strings.append(&b, m)
+    return strings.finish(&b)
+
+// Whether writing to known radio `i` counts as tested (its model shipped
+// tested = write, or a local verification for its fingerprint).
+WriteStatus known_write_status(^KnownList k, i64 i, []Model models, ^TestedStore store):
+    i64 mi = find_model(models, k^.text(k^.radios[i].model))
+    if mi < 0:
+        return WriteStatus(by: TestedBy.NONE, detail: "unknown model")
+    return write_status(&models[mi], k^.text(k^.radios[i].fingerprint), store)

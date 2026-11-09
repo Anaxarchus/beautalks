@@ -1,0 +1,164 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Radio page: "plug in your radio" with the port status, detection and
+// reading with progress and cancel, and the identity card of the radio on
+// the cable.
+package main
+
+import btui "../ui"
+import "../radio"
+
+i32 g_port_sel
+
+string8 phase_words(i32 ph):
+    if ph == PH_DETECT:
+        return "Looking for the radio"
+    if ph == PH_READ:
+        return "Reading the channels"
+    if ph == PH_BACKUP:
+        return "Backing up the radio"
+    if ph == PH_WRITE:
+        return "Writing"
+    if ph == PH_VERIFY:
+        return "Reading back to check"
+    if ph == PH_SAVE:
+        return "Saving the backup"
+    if ph == PH_NET:
+        return "Contacting the update server"
+    return "Starting"
+
+// Title bar of a page: title and an optional subtitle.
+void page_header(btui.Rect r, string8 title, string8 sub):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.text(btui.HEADLINE_SMALL, r.x, r.y, title, t.on_surface)
+    if #len(sub) > 0:
+        _ = btui.text(btui.BODY_MEDIUM, r.x, r.y + 36.0, sub, t.on_surface_variant)
+
+// The identity card of the radio on the cable (Radio and Channels pages).
+void identity_card(btui.Rect r, bool actions):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(r, btui.CARD_OUTLINED)
+    btui.Rect ib = btui.inset(r, 20.0)
+    btui.fill_circle(ib.x + 32.0, btui.cy(r), 32.0, t.primary_container)
+    btui.icon("radio", ib.x + 20.0, btui.cy(r) - 12.0, 24.0, t.on_primary_container, true)
+    f32 x = ib.x + 84.0
+    f32 nx = btui.text(btui.TITLE_LARGE, x, ib.y + 2.0, radio_title(), t.on_surface)
+    status_badge(nx + 12.0, ib.y + 4.0)
+    // the title is the model when there is no nickname: don't repeat it
+    string8 line2 = "First time on this computer"
+    if g_radio.seen > 1:
+        line2 = #format("Seen ", g_radio.seen, " times")
+    if #len(g_radio.nickname) > 0:
+        line2 = #format(model_label(g_radio.mi), "  ·  ", line2)
+    _ = btui.text(btui.BODY_MEDIUM, x, ib.y + 34.0, line2, t.on_surface_variant)
+    btui.icon("usb", x, ib.y + 60.0, 18.0, t.on_surface_variant)
+    f32 ux = btui.text(btui.BODY_SMALL, x + 22.0, ib.y + 61.0, g_radio.port, t.on_surface_variant)
+    if #len(g_radio.how) > 0:
+        btui.icon("info", ux + 16.0, ib.y + 60.0, 18.0, t.on_surface_variant)
+        _ = btui.text(btui.BODY_SMALL, ux + 38.0, ib.y + 61.0, g_radio.how, t.on_surface_variant)
+    if !actions:
+        return
+    f32 bw = btui.button_width("Read channels", "download")
+    btui.Rect rb = btui.rect(btui.right(ib) - bw, btui.cy(r) - 20.0, bw, 40.0)
+    if btui.button("Read channels", rb, btui.BTN_FILLED, "download", job_busy()):
+        start_read(radio_port(), g_models[g_radio.mi].id)
+    f32 dw = btui.button_width("Detect again", "refresh", btui.BTN_TEXT)
+    if btui.button("Detect again", btui.rect(rb.x - 8.0 - dw, rb.y, dw, 40.0), btui.BTN_TEXT, "refresh", job_busy()):
+        start_detect(radio_port())
+
+// "Tested · write OK", "Verified on this computer", or "Not tested for writing".
+void status_badge(f32 x, f32 y):
+    if !g_radio.known:
+        return
+    ^const radio.Model m = &g_models[g_radio.mi]
+    if m.tested == radio.Tested.WRITE:
+        _ = btui.status_chip(x, y, "Tested · write OK", btui.TONE_SUCCESS, "verified", true)
+    else if g_doc.open && g_doc.status_by == i32(radio.TestedBy.LOCAL):
+        _ = btui.status_chip(x, y, "Verified on this computer", btui.TONE_SUCCESS, "verified", true)
+    else:
+        _ = btui.status_chip(x, y, "Not tested for writing", btui.TONE_WARNING, "lock", true)
+
+void radio_page(btui.Rect sheet):
+    btui.Rect body = btui.inset(sheet, 32.0)
+    page_header(body, "Radio", "Connect a radio to read, edit and write its channels.")
+    f32 y = body.y + 76.0
+    if job_busy() && g_last_kind_running() != JOB_UPDATE:
+        busy_card(btui.rect(body.x, y, body.w, 150.0))
+        y = y + 174.0
+    else if g_radio.known:
+        identity_card(btui.rect(body.x, y, body.w, 120.0), true)
+        y = y + 144.0
+        if g_doc.open:
+            f32 w = btui.button_width("Open channels", "table_rows", btui.BTN_TONAL)
+            if btui.button("Open channels", btui.rect(body.x, y, w, 40.0), btui.BTN_TONAL, "table_rows"):
+                g_page = PAGE_CHANNELS
+            y = y + 64.0
+    if !g_radio.known || !job_busy():
+        plug_in_card(btui.rect(body.x, y, body.w, 300.0))
+
+i32 g_last_kind_running():
+    return job().kind
+
+private void busy_card(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(r, btui.CARD_FILLED)
+    btui.Rect ib = btui.inset(r, 24.0)
+    (i32 ph, i64 done, i64 total) = job_progress()
+    g_last_phase_seen = ph
+    f32 v = -1.0
+    if total > 0:
+        v = btui.clampf(f32(done) / f32(total), 0.0, 1.0)
+    btui.progress_circular(ib.x + 24.0, ib.y + 24.0, 48.0, v)
+    _ = btui.text(btui.TITLE_LARGE, ib.x + 72.0, ib.y, #format(phase_words(ph), "…"), t.on_surface)
+    string8 sub = #format("On ", g_job_port, ". Keep the radio on and the cable plugged in.")
+    if ph == PH_READ && total > 0:
+        sub = #format(done * 100 / total, "% · ", done / 1024, " of ", total / 1024, " KB")
+    _ = btui.text(btui.BODY_MEDIUM, ib.x + 72.0, ib.y + 32.0, sub, t.on_surface_variant)
+    btui.progress_linear(btui.rect(ib.x, ib.y + 72.0, ib.w - 140.0, 8.0), v)
+    f32 cw = btui.button_width("Cancel", "", btui.BTN_OUTLINED)
+    if btui.button("Cancel", btui.rect(btui.right(ib) - cw, ib.y + 56.0, cw, 40.0), btui.BTN_OUTLINED):
+        job_cancel()
+        btui.snackbar_show("Stopping at the next safe point…")
+
+private void plug_in_card(btui.Rect r):
+    ^btui.Scheme t = btui.theme()
+    _ = btui.card(r, btui.CARD_OUTLINED)
+    btui.Rect ib = btui.inset(r, 28.0)
+    btui.fill_circle(ib.x + 40.0, ib.y + 40.0, 40.0, t.secondary_container)
+    btui.icon("cable", ib.x + 28.0, ib.y + 28.0, 24.0, t.on_secondary_container)
+    f32 x = ib.x + 104.0
+    _ = btui.text(btui.TITLE_LARGE, x, ib.y, "Plug in your radio" if !g_radio.known else "Another radio?", t.on_surface)
+    [3]string8 steps = ["Connect the programming cable to the computer and to the radio.", "Turn the radio on and the volume up a little.", "beautalks finds the radio by itself when it sees a programming cable."]
+    for i in 0..<3:
+        f32 sy = ib.y + 40.0 + f32(i32(i)) * 32.0
+        btui.fill_circle(x + 12.0, sy + 12.0, 12.0, t.primary_container)
+        btui.text_in(btui.rect(x, sy, 24.0, 24.0), btui.LABEL_MEDIUM, #format(i + 1), t.on_primary_container, btui.ALIGN_CENTER)
+        _ = btui.text(btui.BODY_LARGE, x + 36.0, sy, steps[i], t.on_surface)
+    // the ports
+    f32 py = ib.y + 150.0
+    _ = btui.text(btui.TITLE_SMALL, x, py, "Ports", t.on_surface)
+    py = py + 28.0
+    if #len(g_ports) == 0:
+        _ = btui.text(btui.BODY_MEDIUM, x, py, "No serial ports yet. Plug in the cable; on a Mac the CH340 cable may need its driver.", t.on_surface_variant)
+    i32 shown = 0
+    for i in 0..<#len(g_ports):
+        if shown >= 3:
+            break
+        PortSeen p = g_ports[i]
+        f32 rx = x
+        btui.icon("usb" if p.cable else "cable", rx, py + 2.0, 20.0, t.primary if p.cable else t.on_surface_variant)
+        f32 ex = btui.text(btui.BODY_LARGE, rx + 30.0, py, p.path, t.on_surface)
+        if p.cable:
+            _ = btui.status_chip(ex + 12.0, py, chip_name(p), btui.TONE_SUCCESS, "", true)
+        f32 dw = btui.button_width("Detect", "", btui.BTN_TEXT)
+        if btui.button("Detect", btui.rect(btui.right(ib) - dw, py - 8.0, dw, 40.0), btui.BTN_TEXT, "", job_busy(), #format("detect", i)):
+            start_detect(p.path)
+        py = py + 36.0
+        shown += 1
+
+string8 chip_name(PortSeen p):
+    string8 n = radio.cable_chip_name(p.vid, p.pid)
+    if #len(n) == 0:
+        return "programming cable"
+    return #format(n, " cable")

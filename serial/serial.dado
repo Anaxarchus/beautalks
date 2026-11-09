@@ -6,11 +6,212 @@
 // The port is opened raw, 8 data bits, no parity, 1 stop bit, no flow control,
 // with DTR and RTS raised (several cables power their level shifter from them).
 // Reads take a timeout in milliseconds and answer however many bytes arrived.
+//
+// After opening, and after any DTR/RTS change, the port settles SETTLE_MS
+// and pending input is thrown away before the first byte is sent: USB
+// cables (CH340) can drop or garble bytes written right after an open or a
+// line change.
 package serial
 
 import "core:time"
 
 private @c_body("""
+    #if defined(_WIN32)
+    /* Windows: COM ports through the documented Win32 comm API.
+       Ports are kept in a small table; the Dado side holds its index. */
+    #include <windows.h>
+    #include <stdio.h>
+    #include <string.h>
+
+    static HANDLE bt_ports[64];
+
+    static int bt_baud_ok(int baud) {
+        switch (baud) {
+            case 1200: case 2400: case 4800: case 9600: case 19200:
+            case 38400: case 57600: case 115200: return 1;
+            default: return 0;
+        }
+    }
+
+    __attribute__((unused)) static int bt_serial_open(const char *path, int baud) {
+        if (!bt_baud_ok(baud)) return -2;
+        char full[300];
+        /* "COM10" and above need the \\.\ prefix; it works for every port */
+        if (strncmp(path, "\\\\.\\", 4) == 0) snprintf(full, sizeof full, "%s", path);
+        else snprintf(full, sizeof full, "\\\\.\\%s", path);
+        HANDLE h = CreateFileA(full, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        DCB dcb;
+        memset(&dcb, 0, sizeof dcb);
+        dcb.DCBlength = sizeof dcb;
+        if (!GetCommState(h, &dcb)) { CloseHandle(h); return -1; }
+        dcb.BaudRate = (DWORD)baud;
+        dcb.ByteSize = 8;
+        dcb.Parity = NOPARITY;
+        dcb.StopBits = ONESTOPBIT;
+        dcb.fBinary = TRUE;
+        dcb.fParity = FALSE;
+        dcb.fOutxCtsFlow = FALSE;
+        dcb.fOutxDsrFlow = FALSE;
+        dcb.fDsrSensitivity = FALSE;
+        dcb.fDtrControl = DTR_CONTROL_ENABLE;
+        dcb.fRtsControl = RTS_CONTROL_ENABLE;
+        dcb.fOutX = FALSE;
+        dcb.fInX = FALSE;
+        dcb.fNull = FALSE;
+        dcb.fAbortOnError = FALSE;
+        if (!SetCommState(h, &dcb)) { CloseHandle(h); return -1; }
+        COMMTIMEOUTS t;
+        memset(&t, 0, sizeof t);
+        t.ReadIntervalTimeout = MAXDWORD;   /* reads return what has arrived */
+        t.WriteTotalTimeoutConstant = 2000;
+        SetCommTimeouts(h, &t);
+        EscapeCommFunction(h, SETDTR);
+        EscapeCommFunction(h, SETRTS);
+        PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+        for (int i = 0; i < 64; i++) {
+            if (bt_ports[i] == NULL) { bt_ports[i] = h; return i; }
+        }
+        CloseHandle(h);
+        return -1;
+    }
+
+    static HANDLE bt_h(int fd) { return (fd >= 0 && fd < 64) ? bt_ports[fd] : NULL; }
+
+    __attribute__((unused)) static int bt_serial_set_lines(int fd, int dtr, int rts) {
+        HANDLE h = bt_h(fd);
+        if (!h) return -1;
+        if (!EscapeCommFunction(h, dtr ? SETDTR : CLRDTR)) return -1;
+        if (!EscapeCommFunction(h, rts ? SETRTS : CLRRTS)) return -1;
+        return 0;
+    }
+
+    __attribute__((unused)) static long bt_serial_write(int fd, const unsigned char *buf, long n) {
+        HANDLE h = bt_h(fd);
+        if (!h) return -1;
+        long done = 0;
+        while (done < n) {
+            DWORD w = 0;
+            if (!WriteFile(h, buf + done, (DWORD)(n - done), &w, NULL)) return -1;
+            if (w == 0) return -1;
+            done += (long)w;
+        }
+        FlushFileBuffers(h);
+        return done;
+    }
+
+    /* Reads until `n` bytes arrived or `timeout_ms` passed; answers the count.
+       ReadIntervalTimeout = MAXDWORD with ReadTotalTimeoutMultiplier =
+       MAXDWORD and a constant: ReadFile returns at once with what is there,
+       or waits up to the constant for the first byte. */
+    __attribute__((unused)) static long bt_serial_read(int fd, unsigned char *buf, long n, int timeout_ms) {
+        HANDLE h = bt_h(fd);
+        if (!h) return -1;
+        long got = 0;
+        ULONGLONG deadline = GetTickCount64() + (ULONGLONG)(timeout_ms > 0 ? timeout_ms : 0);
+        while (got < n) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) break;
+            COMMTIMEOUTS t;
+            memset(&t, 0, sizeof t);
+            t.ReadIntervalTimeout = MAXDWORD;
+            t.ReadTotalTimeoutMultiplier = MAXDWORD;
+            t.ReadTotalTimeoutConstant = (DWORD)(deadline - now);
+            t.WriteTotalTimeoutConstant = 2000;
+            if (!SetCommTimeouts(h, &t)) return -1;
+            DWORD k = 0;
+            if (!ReadFile(h, buf + got, (DWORD)(n - got), &k, NULL)) return -1;
+            if (k == 0) break;
+            got += (long)k;
+        }
+        return got;
+    }
+
+    __attribute__((unused)) static int bt_serial_flush(int fd) {
+        HANDLE h = bt_h(fd);
+        if (!h) return -1;
+        return PurgeComm(h, PURGE_RXCLEAR) ? 0 : -1;
+    }
+
+    __attribute__((unused)) static int bt_serial_close(int fd) {
+        HANDLE h = bt_h(fd);
+        if (!h) return -1;
+        bt_ports[fd] = NULL;
+        return CloseHandle(h) ? 0 : -1;
+    }
+
+    /* Serial ports with USB IDs, one per line: "COM3\t1A86\t7523\n" (IDs
+       "-" when not USB). From HARDWARE\DEVICEMAP\SERIALCOMM (every port) and
+       SYSTEM\CurrentControlSet\Enum\USB\VID_xxxx&PID_yyyy\<instance>\
+       Device Parameters\PortName (which port a USB device is). */
+    static int bt_append(unsigned char *out, int cap, int at, const char *s) {
+        int n = (int)strlen(s);
+        if (at + n >= cap) return at;
+        memcpy(out + at, s, (size_t)n);
+        out[at + n] = 0;
+        return at + n;
+    }
+
+    __attribute__((unused)) static int bt_list_ports(unsigned char *out, int cap) {
+        int at = 0;
+        if (cap > 0) out[0] = 0;
+        char usb_port[64][32];
+        char usb_ids[64][16];
+        int nusb = 0;
+        HKEY usb;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Enum\\USB", 0, KEY_READ, &usb) == ERROR_SUCCESS) {
+            char dev[256];
+            for (DWORD i = 0; ; i++) {
+                DWORD dl = sizeof dev;
+                if (RegEnumKeyExA(usb, i, dev, &dl, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+                if (strncmp(dev, "VID_", 4) != 0 || strlen(dev) < 17 || strncmp(dev + 8, "&PID_", 5) != 0) continue;
+                HKEY dk;
+                if (RegOpenKeyExA(usb, dev, 0, KEY_READ, &dk) != ERROR_SUCCESS) continue;
+                char inst[256];
+                for (DWORD j = 0; ; j++) {
+                    DWORD il = sizeof inst;
+                    if (RegEnumKeyExA(dk, j, inst, &il, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) break;
+                    char sub[400];
+                    snprintf(sub, sizeof sub, "%s\\Device Parameters", inst);
+                    HKEY pk;
+                    if (RegOpenKeyExA(dk, sub, 0, KEY_READ, &pk) != ERROR_SUCCESS) continue;
+                    char name[32];
+                    DWORD nl = sizeof name, type = 0;
+                    if (RegQueryValueExA(pk, "PortName", NULL, &type, (LPBYTE)name, &nl) == ERROR_SUCCESS && type == REG_SZ && nusb < 64) {
+                        name[sizeof name - 1] = 0;
+                        snprintf(usb_port[nusb], 32, "%s", name);
+                        snprintf(usb_ids[nusb], 16, "%.4s\t%.4s", dev + 4, dev + 13);
+                        nusb++;
+                    }
+                    RegCloseKey(pk);
+                }
+                RegCloseKey(dk);
+            }
+            RegCloseKey(usb);
+        }
+        HKEY sc;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &sc) == ERROR_SUCCESS) {
+            char vname[256];
+            char data[64];
+            for (DWORD i = 0; ; i++) {
+                DWORD vl = sizeof vname, dl = sizeof data, type = 0;
+                if (RegEnumValueA(sc, i, vname, &vl, NULL, &type, (LPBYTE)data, &dl) != ERROR_SUCCESS) break;
+                if (type != REG_SZ) continue;
+                data[sizeof data - 1] = 0;
+                const char *ids = "-\t-";
+                for (int k = 0; k < nusb; k++) if (strcmp(usb_port[k], data) == 0) ids = usb_ids[k];
+                at = bt_append(out, cap, at, data);
+                at = bt_append(out, cap, at, "\t");
+                at = bt_append(out, cap, at, ids);
+                at = bt_append(out, cap, at, "\n");
+            }
+            RegCloseKey(sc);
+        }
+        return at;
+    }
+
+    #else
+
     #include <errno.h>
     #include <fcntl.h>
     #include <poll.h>
@@ -104,15 +305,33 @@ private @c_body("""
 
     __attribute__((unused)) static int bt_serial_flush(int fd) { return tcflush(fd, TCIFLUSH); }
     __attribute__((unused)) static int bt_serial_close(int fd) { return close(fd); }
-    """) i32 g_serial_shim = 0
+    
+    /* (POSIX lists ports in Dado: radio/ports.dado.) */
+    __attribute__((unused)) static int bt_list_ports(unsigned char *out, int cap) {
+        if (cap > 0) out[0] = 0;
+        return 0;
+    }
+    #endif
+""") i32 g_serial_shim = 0
 
-private foreign sx "termios.h" define "_DEFAULT_SOURCE=1" define "_DARWIN_C_SOURCE=1":
-    i32 bt_serial_open(cstring path, i32 baud)
-    i32 bt_serial_set_lines(i32 fd, i32 dtr, i32 rts)
-    #c.long bt_serial_write(i32 fd, ^const u8 buf, #c.long n)
-    #c.long bt_serial_read(i32 fd, ^u8 buf, #c.long n, i32 timeout_ms)
-    i32 bt_serial_flush(i32 fd)
-    i32 bt_serial_close(i32 fd)
+when #OS == #WINDOWS:
+    private foreign sx "windows.h":
+        i32 bt_serial_open(cstring path, i32 baud)
+        i32 bt_serial_set_lines(i32 fd, i32 dtr, i32 rts)
+        #c.long bt_serial_write(i32 fd, ^const u8 buf, #c.long n)
+        #c.long bt_serial_read(i32 fd, ^u8 buf, #c.long n, i32 timeout_ms)
+        i32 bt_serial_flush(i32 fd)
+        i32 bt_serial_close(i32 fd)
+        i32 bt_list_ports(^u8 out, i32 cap)
+else:
+    private foreign sx "termios.h" define "_DEFAULT_SOURCE=1" define "_DARWIN_C_SOURCE=1":
+        i32 bt_serial_open(cstring path, i32 baud)
+        i32 bt_serial_set_lines(i32 fd, i32 dtr, i32 rts)
+        #c.long bt_serial_write(i32 fd, ^const u8 buf, #c.long n)
+        #c.long bt_serial_read(i32 fd, ^u8 buf, #c.long n, i32 timeout_ms)
+        i32 bt_serial_flush(i32 fd)
+        i32 bt_serial_close(i32 fd)
+        i32 bt_list_ports(^u8 out, i32 cap)
 
 // Why an operation on the port failed.
 distinct enum i32 Error:
@@ -135,7 +354,12 @@ Error!Port open(cstring path, i32 baud):
         fail Error.BAUD
     if fd < 0:
         fail Error.OPEN
-    return Port(fd: fd, baud: baud)
+    Port p = Port(fd: fd, baud: baud)
+    pause(SETTLE_MS)
+    discard_input(p)
+    return p
+
+const i32 SETTLE_MS = 200
 
 void close(^Port p):
     if p^.fd >= 0:
@@ -146,6 +370,8 @@ void close(^Port p):
 Error!void set_lines(Port p, bool dtr, bool rts):
     if sx.bt_serial_set_lines(p.fd, 1 if dtr else 0, 1 if rts else 0) != 0:
         fail Error.IO
+    pause(SETTLE_MS)
+    discard_input(p)
 
 // Writes every byte of `data`.
 Error!void write(Port p, []const u8 data):
@@ -170,3 +396,16 @@ void discard_input(Port p):
 // Waits `ms` milliseconds.
 void pause(i32 ms):
     time.sleep(time.milliseconds(ms))
+
+// Windows: every COM port with its USB vendor/product IDs, one per line,
+// "COM3<TAB>1A86<TAB>7523" ("-" for a port that is not USB). Empty on
+// macOS and Linux, whose ports radio/ports.dado finds in /dev.
+// The caller #deletes the text.
+ref []char8 windows_ports():
+    ref []u8 buf = #make([]u8, 8192)
+    i32 n = sx.bt_list_ports(&buf[0], 8192)
+    ref []char8 out = #make([]char8, i64(n))
+    for i in 0..<i64(n):
+        out[i] = char8(buf[i])
+    #delete(buf)
+    return out

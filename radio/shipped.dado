@@ -1,0 +1,97 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Finding the folders shipped with the program (models, drivers, data,
+// assets) in every layout it is run from:
+//   $BEAUTALKS_<DIR>      an explicit override (BEAUTALKS_MODELS, ...)
+//   ./<dir>               the working directory (a source checkout)
+//   <exe dir>/<dir>       a flat folder (Windows zip)
+//   <exe dir>/../<dir>    bin/ beside the folders (Linux tarball)
+//   <exe dir>/../Resources/<dir>   a macOS bundle (Contents/MacOS/..)
+// One helper, so the CLI, the engines and the app agree.
+package radio
+
+import "core:os"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+
+// The environment variable that overrides `dir`: BEAUTALKS_ + upper case
+// (`models` -> BEAUTALKS_MODELS). The caller #deletes it.
+ref []char8 shipped_env_name(string8 dir):
+    ref []char8 up = strings.to_upper(dir)
+    ref []char8 out = strings.concat("BEAUTALKS_", up)
+    #delete(up)
+    return out
+
+// Every existing candidate for `dir`, in search order, given the override
+// (`env_value`, "" for none), the working directory and the executable's
+// directory ("" when unknown). For tests and for callers that want more
+// than the first (driver sets). The caller #deletes each and the list.
+ref [](ref []char8) shipped_candidates_in(string8 dir, string8 env_value, string8 cwd, string8 exe_dir):
+    ref [](ref []char8) out = nil
+    [5]ref []char8 c
+    c[0] = strings.clone(env_value)
+    c[1] = path.join(cwd, dir) if #len(cwd) != 0 else strings.clone(dir)
+    c[2] = path.join(exe_dir, dir) if #len(exe_dir) != 0 else nil
+    c[3] = path.join(exe_dir, "..", dir) if #len(exe_dir) != 0 else nil
+    c[4] = path.join(exe_dir, "..", "Resources", dir) if #len(exe_dir) != 0 else nil
+    for i in 0..<5:
+        string8 cand = c[i]
+        bool keep = #len(cand) != 0 && fs.is_dir(cand)
+        if keep:
+            // the same folder reached twice (cwd == exe dir) is listed once
+            ref []char8 canon = nil
+            try canon = fs.canonical(cand) else:
+                canon = strings.clone(cand)
+            for o in out:
+                ref []char8 oc = nil
+                try oc = fs.canonical(o) else:
+                    oc = strings.clone(o)
+                string8 a = oc
+                string8 b = canon
+                if a == b:
+                    keep = false
+                #delete(oc)
+            #delete(canon)
+        if keep:
+            out = #append(out, strings.clone(cand))
+    for i in 0..<5:
+        #delete(c[i])
+    return out
+
+// Every existing candidate for `dir` for this process.
+ref [](ref []char8) shipped_candidates(string8 dir):
+    ref []char8 envname = shipped_env_name(dir)
+    ref []char8 env = nil
+    try env = os.get_env(envname) else:
+        env = nil
+    #delete(envname)
+    ref []char8 cwd = nil
+    try cwd = fs.current_dir() else:
+        cwd = nil
+    ref []char8 exe_dir = nil
+    string8 exe = ""
+    try exe = os.executable_path() else:
+        exe = ""
+    if #len(exe) != 0:
+        exe_dir = path.dir(exe)
+    ref [](ref []char8) out = shipped_candidates_in(dir, env, cwd, exe_dir)
+    #delete(env)
+    #delete(cwd)
+    #delete(exe_dir)
+    return out
+
+void free_paths(ref [](ref []char8) list):
+    for p in list:
+        #delete(p)
+    #delete(list)
+
+// The first existing candidate for `dir`, or nil. The caller #deletes it.
+ref []char8 find_shipped(string8 dir):
+    ref [](ref []char8) all = shipped_candidates(dir)
+    ref []char8 out = nil
+    if #len(all) != 0:
+        out = strings.clone(all[0])
+    free_paths(all)
+    return out

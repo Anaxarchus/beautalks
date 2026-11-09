@@ -1,0 +1,483 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Guided verification of untested hardware ("Verify this radio"), step by
+// step for a UI (nothing here prints):
+//
+//   1. verify_begin: detect, download, save a backup; answers the radio's
+//      fingerprint and its channels so the user recognises the radio.
+//   2. verify_write: a safe write of the IDENTICAL image (backup, write,
+//      read back) and a byte-for-byte compare of a fresh full read.
+//   3. the user power-cycles the radio and checks it.
+//   4. record_verification(confirmed): yes -> a local "tested" record for
+//      this model + fingerprint; no (or a failure) -> a failed record and a
+//      text report in <data>/reports/, and verify_restore writes the backup
+//      back through the same safe-write path.
+//
+// "Tested" records are LOCAL ONLY (<data>/tested.ini); nothing is sent
+// anywhere. They are keyed by model id + fingerprint, so a verified
+// firmware does not vouch for another:
+//   UV-5R family: the 8-byte ident + the firmware tag (image 0x1838, the
+//   aux block's copy of it);  UV-17Pro family: the 'F' and 'M' replies.
+package radio
+
+import "core:cfg"
+import "core:hash"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:time"
+
+// ── fingerprints ─────────────────────────────────────────────────────────────
+
+// The fingerprint of the radio a detection found (and, for the UV-5R
+// family, of the image read from it). "" when the detection does not tell
+// enough (a UV-17Pro session reused without remembered replies).
+// The caller #deletes it.
+ref []char8 fingerprint_of(^Detection d, ^const Model m, []u8 img):
+    strings.Builder b = strings.builder(96)
+    strings.append(&b, m^.engine)
+    strings.append_char(&b, ':')
+    if d^.engine == "uv5r":
+        strings.append(&b, "ident=")
+        append_hex(&b, d^.ident[:])
+        strings.append(&b, " fw=")
+        strings.append(&b, image_firmware(m, img))
+    else:
+        if d^.hello.f_len <= 0 || d^.hello.m_len <= 0:
+            #delete(b)
+            return strings.clone("")
+        strings.append(&b, "F=")
+        append_hex(&b, d^.hello.f_reply[0..<d^.hello.f_len])
+        strings.append(&b, " M=")
+        append_hex(&b, d^.hello.m_reply[0..<d^.hello.m_len])
+    return strings.finish(&b)
+
+// ── local test records ───────────────────────────────────────────────────────
+
+const string8 TESTED_PREFIX = "tested "
+
+type TestedStore:
+    cfg.Config c
+    ref []char8 dir
+    ref []char8 file
+
+    void destroy(^self):
+        cfg.destroy(&self.c)
+        #delete(self.dir)
+        #delete(self.file)
+
+TestedStore open_tested(string8 data_dir):
+    TestedStore t
+    t.dir = strings.clone(data_dir)
+    t.file = path.join(data_dir, "tested.ini")
+    if fs.exists(t.file):
+        (cfg.Config c, bool ok, i32 _) = cfg.load(t.file)
+        if ok:
+            t.c = c
+            return t
+    t.c = cfg.empty()
+    return t
+
+bool save_tested(^TestedStore t):
+    try fs.make_dirs(t^.dir) else:
+        return false
+    return cfg.save(t^.c, t^.file)
+
+// The record id for a model + fingerprint. The caller #deletes it.
+ref []char8 tested_id(string8 model_id, string8 fingerprint):
+    u32 h = hash.fnv1a32_text(fingerprint)
+    [4]u8 hb = (u8((h >> 24) & 0xFF), u8((h >> 16) & 0xFF), u8((h >> 8) & 0xFF), u8(h & 0xFF))
+    strings.Builder b = strings.builder(32)
+    strings.append(&b, model_id)
+    strings.append_char(&b, '-')
+    append_hex(&b, hb[:])
+    ref []char8 out = strings.to_lower(strings.text(b))
+    #delete(b)
+    return out
+
+distinct enum i32 TestedBy:
+    NONE = 0,
+    // the shipped model definition says tested = write
+    SHIPPED = 1,
+    // verified on this computer for this radio's fingerprint
+    LOCAL = 2,
+
+type WriteStatus:
+    TestedBy by
+    // "verified on this computer 2026-11-08 · firmware ..." or why not; a
+    // view of the store's text or a constant
+    string8 detail
+
+// Whether writing `m` to the radio with `fingerprint` counts as tested:
+// a shipped `tested = write` definition, or a local "ok" record for exactly
+// this model and fingerprint (one for another fingerprint does not count).
+// `store` may be nil (shipped status only).
+WriteStatus write_status(^const Model m, string8 fingerprint, ^TestedStore store):
+    if m^.tested == Tested.WRITE:
+        return WriteStatus(by: TestedBy.SHIPPED, detail: "tested by the beautalks project")
+    if store == nil || #len(fingerprint) == 0:
+        return WriteStatus(by: TestedBy.NONE, detail: "not tested for writing")
+    ref []char8 id = tested_id(m^.id, fingerprint)
+    ref []char8 sec = strings.concat(TESTED_PREFIX, id)
+    #delete(id)
+    string8 result = cfg.get_string(store^.c, sec, "result", "")
+    string8 fp = cfg.get_string(store^.c, sec, "fingerprint", "")
+    WriteStatus s = WriteStatus(by: TestedBy.NONE, detail: "not tested for writing")
+    if result == "ok" && fp == fingerprint:
+        s = WriteStatus(by: TestedBy.LOCAL, detail: cfg.get_string(store^.c, sec, "summary", "verified on this computer"))
+    else if #len(result) != 0:
+        s = WriteStatus(by: TestedBy.NONE, detail: "a verification on this computer did not pass")
+    #delete(sec)
+    return s
+
+bool forget_tested(^TestedStore t, string8 id):
+    ref []char8 sec = strings.concat(TESTED_PREFIX, id)
+    defer #delete(sec)
+    return cfg.remove_section(&t^.c, sec)
+
+type TestedRecord:
+    Span id
+    Span model
+    Span fingerprint
+    Span result
+    Span summary
+    Span backup
+    Span report
+    Span app_version
+    i64 date
+
+type TestedList:
+    ref []TestedRecord records
+    ref []char8 pool
+
+    Span keep(^self, string8 s):
+        i64 at = #len(self.pool)
+        for i in 0..<#len(s):
+            self.pool = #append(self.pool, s[i])
+        return Span(at: at, len: #len(s))
+
+    string8 text(^self, Span s):
+        if s.len == 0:
+            return ""
+        return string8(self.pool[s.at..<s.at + s.len])
+
+    void destroy(^self):
+        #delete(self.records)
+        #delete(self.pool)
+        self.records = nil
+        self.pool = nil
+
+// Every local record, newest first.
+TestedList list_tested(^TestedStore t):
+    TestedList l
+    for sec, keys in t^.c:
+        if !strings.starts_with(sec, TESTED_PREFIX):
+            continue
+        TestedRecord r
+        r.id = l.keep(sec[#len(TESTED_PREFIX)..<#len(sec)])
+        r.model = l.keep(cfg.get_string(t^.c, sec, "model", ""))
+        r.fingerprint = l.keep(cfg.get_string(t^.c, sec, "fingerprint", ""))
+        r.result = l.keep(cfg.get_string(t^.c, sec, "result", ""))
+        r.summary = l.keep(cfg.get_string(t^.c, sec, "summary", ""))
+        r.backup = l.keep(cfg.get_string(t^.c, sec, "backup", ""))
+        r.report = l.keep(cfg.get_string(t^.c, sec, "report", ""))
+        r.app_version = l.keep(cfg.get_string(t^.c, sec, "app_version", ""))
+        r.date = cfg.get_i64(t^.c, sec, "date", 0)
+        l.records = #append(l.records, r)
+    for i in 1..<#len(l.records):
+        i64 j = i
+        for j > 0 && l.records[j].date > l.records[j - 1].date:
+            TestedRecord x = l.records[j]
+            l.records[j] = l.records[j - 1]
+            l.records[j - 1] = x
+            j -= 1
+    return l
+
+// ── the procedure ────────────────────────────────────────────────────────────
+
+distinct enum i32 VerifyState:
+    // read and backed up; nothing written yet
+    BEGUN = 1,
+    // identical image written, verified, and a fresh read matched byte for byte
+    WRITTEN = 2,
+    // the user confirmed the radio works: recorded as tested
+    CONFIRMED = 3,
+    // a write/compare failed or the user said no
+    FAILED = 4,
+    // the backup was written back
+    RESTORED = 5,
+
+type Verification:
+    Model model
+    ref []char8 port
+    ref []char8 data_dir
+    ref []char8 fingerprint
+    // the image read at the start (the backup's bytes)
+    ref []u8 image
+    ref []char8 backup_path
+    ref []char8 report_path
+    ChannelList channels
+    VerifyState state
+    // what went wrong (0 when nothing)
+    LinkError error
+    // the first differing offset of the byte compare, -1 when identical
+    i64 mismatch_at
+
+    void destroy(^self):
+        #delete(self.port)
+        #delete(self.data_dir)
+        #delete(self.fingerprint)
+        #delete(self.image)
+        #delete(self.backup_path)
+        #delete(self.report_path)
+        self.channels.destroy()
+        self.port = nil
+        self.image = nil
+
+// Step 1: detect the radio on `port` (remembered radios first), take model
+// `model_id` (or the best candidate when ""), download its image, save the
+// backup in <data>/backups/ and list its channels. Fails NO_ANSWER when no
+// radio answered, BAD_MODEL when the model does not speak what answered (or
+// no model was given and several candidates match equally),
+// BAD_REPLY when the radio is in an open session nobody remembers (ask for
+// a power-cycle), BACKUP when the backup cannot be saved.
+LinkError!Verification verify_begin(string8 port, []Model models, string8 model_id, ^Registry reg, string8 data_dir, Progress pr):
+    try Detection d = detect_with(port, models, reg, pr)
+    defer close_detection(&d)
+    if d.session_unknown:
+        fail LinkError.BAD_REPLY
+    if !d.found || #len(d.candidates) == 0:
+        fail LinkError.NO_ANSWER
+    i64 mi = d.candidates[0]
+    // the model must be certain: a remembered radio or a reply match, or
+    // the caller's choice (a UI shows the candidates first)
+    if #len(model_id) == 0 && #len(d.candidates) > 1 && d.matches[0] != MatchKind.REMEMBERED && d.matches[0] != MatchKind.REPLY:
+        fail LinkError.BAD_MODEL
+    if #len(model_id) != 0:
+        mi = -1
+        for c in d.candidates:
+            if answers_to(&models[c], model_id):
+                mi = c
+        if mi < 0:
+            fail LinkError.BAD_MODEL
+    ^const Model m = &models[mi]
+    try ref []u8 img = download_detected(&d, m, pr)
+    Verification v
+    v.model = m^
+    v.port = strings.clone(port)
+    v.data_dir = strings.clone(data_dir)
+    v.fingerprint = fingerprint_of(&d, m, img)
+    v.image = img
+    v.mismatch_at = -1
+    v.backup_path = new_backup_path(data_dir, m)
+    if v.backup_path == nil || !save_backup(v.backup_path, m, img):
+        v.destroy()
+        fail LinkError.BACKUP
+    v.channels = extract(m, img)
+    v.state = VerifyState.BEGUN
+    if reg != nil:
+        ref []char8 rid = remember_detection(reg, &d, m, port)
+        remember_image(reg, rid, m, img, v.backup_path)
+        #delete(rid)
+    return v
+
+// Step 2: write the identical image through `eng` (the sanctioned write for
+// a model not yet tested here: backup, write, read back), then read the
+// whole radio again and compare byte for byte. Sets state WRITTEN, or
+// FAILED with `error` / `mismatch_at`.
+LinkError!void verify_write_with(^Verification v, ^Engine eng, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    try ref []char8 bk = verify_prepare(v)
+    defer #delete(bk)
+    try safe_write_with(eng, &v^.model, v^.image, true, bk, pause_ms, phase, ctx, pr) else why:
+        v^.state = VerifyState.FAILED
+        v^.error = why
+        fail why
+    eng.pause(pause_ms)
+    try verify_compare(v, eng, pr)
+
+// verify_write_with the built-in engine over `link` (one session for the
+// UV-5R family, see safe_write).
+LinkError!void verify_write(^Verification v, ^Link link, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    try ref []char8 bk = verify_prepare(v)
+    defer #delete(bk)
+    try safe_write(link, &v^.model, v^.image, true, bk, pause_ms, phase, ctx, pr) else why:
+        v^.state = VerifyState.FAILED
+        v^.error = why
+        fail why
+    link.sleep_ms(pause_ms)
+    BuiltinEngine eng
+    eng.link = link
+    try verify_compare(v, &eng, pr)
+
+// The backup path for the verification write's own backup.
+private LinkError!ref []char8 verify_prepare(^Verification v):
+    if v^.state != VerifyState.BEGUN:
+        fail LinkError.BAD_MODEL
+    ref []char8 bk = new_backup_path(v^.data_dir, &v^.model)
+    if bk == nil:
+        v^.state = VerifyState.FAILED
+        v^.error = LinkError.BACKUP
+        fail LinkError.BACKUP
+    return bk
+
+// A fresh full read compared byte for byte with the image of step 1.
+private LinkError!void verify_compare(^Verification v, ^Engine eng, Progress pr):
+    try ref []u8 now = eng.download(&v^.model, pr) else code:
+        v^.state = VerifyState.FAILED
+        v^.error = LinkError(code)
+        fail LinkError(code)
+    v^.mismatch_at = -1
+    if #len(now) != #len(v^.image):
+        v^.mismatch_at = 0
+    else:
+        for i in 0..<#len(now):
+            if now[i] != v^.image[i]:
+                v^.mismatch_at = i
+                break
+    #delete(now)
+    if v^.mismatch_at >= 0:
+        v^.state = VerifyState.FAILED
+        v^.error = LinkError.VERIFY
+        fail LinkError.VERIFY
+    v^.state = VerifyState.WRITTEN
+
+private ref []char8 utc_text(i64 unix):
+    time.DateTime t = time.utc(unix * 1000000000)
+    strings.Builder b = strings.builder(32)
+    append_padded(&b, t.year, 4)
+    strings.append_char(&b, '-')
+    append_padded(&b, i64(t.month), 2)
+    strings.append_char(&b, '-')
+    append_padded(&b, i64(t.day), 2)
+    strings.append_char(&b, ' ')
+    append_padded(&b, i64(t.hour), 2)
+    strings.append_char(&b, ':')
+    append_padded(&b, i64(t.minute), 2)
+    strings.append(&b, " UTC")
+    return strings.finish(&b)
+
+// Writes the text report <data>/reports/<model>-<stamp>.txt; answers its
+// path (the caller #deletes it), nil when it cannot be written.
+private ref []char8 write_report(^Verification v, bool confirmed, string8 app_version):
+    ref []char8 dir = path.join(v^.data_dir, "reports")
+    try fs.make_dirs(dir) else:
+        #delete(dir)
+        return nil
+    i64 now = time.unix()
+    strings.Builder name = strings.builder(64)
+    strings.append(&name, v^.model.id)
+    strings.append_char(&name, '-')
+    append_int(&name, now)
+    strings.append(&name, ".txt")
+    ref []char8 file = path.join(dir, strings.text(name))
+    #delete(name)
+    #delete(dir)
+    strings.Builder b = strings.builder(512)
+    strings.append(&b, "beautalks verification report (kept on this computer only)\n")
+    ref []char8 when = utc_text(now)
+    strings.append(&b, "date: ")
+    strings.append(&b, when)
+    #delete(when)
+    strings.append(&b, "\napp version: ")
+    strings.append(&b, app_version)
+    strings.append(&b, "\nmodel: ")
+    strings.append(&b, v^.model.id)
+    strings.append(&b, " (")
+    strings.append(&b, v^.model.vendor)
+    strings.append(&b, " ")
+    strings.append(&b, v^.model.name)
+    strings.append(&b, ", engine ")
+    strings.append(&b, v^.model.engine)
+    strings.append(&b, ")\nradio fingerprint: ")
+    strings.append(&b, v^.fingerprint)
+    strings.append(&b, "\nport: ")
+    strings.append(&b, v^.port)
+    strings.append(&b, "\nchannels read: ")
+    append_int(&b, #len(v^.channels.entries))
+    strings.append(&b, "\nbackup: ")
+    strings.append(&b, v^.backup_path)
+    strings.append(&b, "\nidentical write + verify: ")
+    if v^.state == VerifyState.WRITTEN || v^.state == VerifyState.CONFIRMED:
+        strings.append(&b, "passed")
+    else:
+        strings.append(&b, "FAILED: ")
+        strings.append(&b, link_error_message(v^.error))
+        if v^.mismatch_at >= 0:
+            strings.append(&b, " (first difference at byte ")
+            append_int(&b, v^.mismatch_at)
+            strings.append(&b, ")")
+    strings.append(&b, "\nuser's check after power-cycling: ")
+    strings.append(&b, "works normally" if confirmed else "NOT confirmed")
+    strings.append(&b, "\nresult: ")
+    strings.append(&b, "tested" if confirmed && v^.state == VerifyState.WRITTEN else "not tested; restore the backup")
+    strings.append_char(&b, '\n')
+    bool ok = true
+    try fs.write_file(file, strings.text(b)) else:
+        ok = false
+    #delete(b)
+    if !ok:
+        #delete(file)
+        return nil
+    return file
+
+// Step 4: the user's answer after power-cycling the radio. Confirmed after a
+// passed write: a local "ok" record (this model + fingerprint now counts as
+// tested). Otherwise: a "failed" record and a text report; offer
+// verify_restore. A report is written either way; `report_path` names it.
+// Answers whether the radio now counts as tested.
+bool record_verification(^Verification v, ^TestedStore t, bool confirmed, string8 app_version):
+    bool pass = confirmed && v^.state == VerifyState.WRITTEN && #len(v^.fingerprint) != 0
+    #delete(v^.report_path)
+    v^.report_path = write_report(v, confirmed, app_version)
+    ref []char8 id = tested_id(v^.model.id, v^.fingerprint)
+    ref []char8 sec = strings.concat(TESTED_PREFIX, id)
+    i64 now = time.unix()
+    cfg.set_string(&t^.c, sec, "model", v^.model.id)
+    cfg.set_string(&t^.c, sec, "fingerprint", v^.fingerprint)
+    cfg.set_i64(&t^.c, sec, "date", now)
+    cfg.set_string(&t^.c, sec, "result", "ok" if pass else "failed")
+    cfg.set_string(&t^.c, sec, "backup", v^.backup_path)
+    cfg.set_string(&t^.c, sec, "app_version", app_version)
+    if v^.report_path != nil:
+        cfg.set_string(&t^.c, sec, "report", v^.report_path)
+    strings.Builder s = strings.builder(96)
+    strings.append(&s, "verified on this computer ")
+    ref []char8 when = utc_text(now)
+    strings.append(&s, when)
+    #delete(when)
+    string8 fw = image_firmware(&v^.model, v^.image)
+    if #len(fw) != 0:
+        strings.append(&s, " · firmware ")
+        strings.append(&s, fw)
+    cfg.set_string(&t^.c, sec, "summary", strings.text(s))
+    #delete(s)
+    #delete(sec)
+    #delete(id)
+    v^.state = VerifyState.CONFIRMED if pass else VerifyState.FAILED
+    return pass
+
+// After a failure or a "no": writes the backup taken in verify_begin back
+// to the radio through the safe-write path (which itself backs up the
+// radio's present memory first and verifies). Sets state RESTORED.
+LinkError!void verify_restore_with(^Verification v, ^Engine eng, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    try ref []u8 saved = load_image(v^.backup_path) else:
+        fail LinkError.BACKUP
+    defer #delete(saved)
+    ref []char8 bk = new_backup_path(v^.data_dir, &v^.model)
+    defer #delete(bk)
+    if bk == nil:
+        fail LinkError.BACKUP
+    try safe_write_with(eng, &v^.model, saved, true, bk, pause_ms, phase, ctx, pr)
+    v^.state = VerifyState.RESTORED
+
+LinkError!void verify_restore(^Verification v, ^Link link, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    try ref []u8 saved = load_image(v^.backup_path) else:
+        fail LinkError.BACKUP
+    defer #delete(saved)
+    ref []char8 bk = new_backup_path(v^.data_dir, &v^.model)
+    defer #delete(bk)
+    if bk == nil:
+        fail LinkError.BACKUP
+    try safe_write(link, &v^.model, saved, true, bk, pause_ms, phase, ctx, pr)
+    v^.state = VerifyState.RESTORED

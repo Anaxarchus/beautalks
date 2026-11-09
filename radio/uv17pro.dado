@@ -8,6 +8,29 @@
 //   write: 57 aH aL 40 + 0x40 scrambled bytes -> 06
 // The image is the model's regions concatenated, descrambled.
 //
+// Sessions (owner's UV-5RM, probed on hardware): after the ident the radio
+// stays in its programming session until it is power-cycled. In a session
+// it executes every R and W frame it can parse out of what arrives and
+// ignores other bytes; it does NOT accept a new ident (which it would parse
+// as commands: "PROGRAM..." holds `R O G R`, a read). So before any ident
+// we probe with a harmless read of block 0 (`52 00 00 40`); an answer
+// `52 00 00 40` + 64 bytes means a session is open and is reused as is.
+//
+// Byte audit (nothing we send outside a write may parse as a W frame,
+// 0x57 'W'):
+//  * the probe 52 00 00 40: no 0x57.
+//  * every PROGRAM...U ident in the model files: no 0x57 ('W'); they hold
+//    'R' (0x52), so in an open session they cause reads, never writes.
+//  * the magics 'F' 46, 'M' 4D and the three SEND strings in the model
+//    files: no 0x57 and no 0x52.
+//  * the UV-5R magics detection sends at 9600 (50 BB FF ...): no 0x57 or
+//    0x52 as bytes; at 115200 a 9600 byte arrives as framing junk of
+//    unpredictable value, which is why detection probes for an open session
+//    at 115200 FIRST and stops there when one answers.
+//  * read frames 52 aH aL 40 may hold 0x57 as an address byte (0x5700..);
+//    they are only sent inside a session we opened or confirmed, in step.
+// models_test checks the idents and magics of every model file for 0x57.
+
 // Engine code depends only on Link, Model and Progress (see link.dado).
 package radio
 
@@ -22,6 +45,8 @@ type Uv17Hello:
     i64 m_len
     // how many of the model's magics were sent
     i64 magics_sent
+    // an open session was found and reused (no ident sent)
+    bool reused
 
 // CHIRP's _crypt: XOR with the 4-byte key, skipping 0x00, 0xFF, the key byte,
 // its complement, and every position whose key byte is a space. The same
@@ -55,29 +80,92 @@ private LinkError!i64 send_magic(^Link link, []u8 magic, []u8 reply, i32 timeout
         fail LinkError.IO
     return n
 
+// Reads and throws away whatever arrives until `quiet_ms` pass in silence
+// (at most ~3 s).
+void drain(^Link link, i32 quiet_ms):
+    [256]u8 junk
+    for _ in 0..<40:
+        try i64 n = link.recv(junk[:], quiet_ms) else:
+            return
+        if n == 0:
+            return
+
+// One probe: 1 session open, 0 silence, -1 a partial or garbled reply.
+private i32 probe_once(^Link link):
+    link.discard()
+    [4]u8 probe = (0x52, 0x00, 0x00, 0x40)
+    try send_all(link, probe[:]) else:
+        return 0
+    [68]u8 reply
+    try i64 n = link.recv(reply[:], 600) else:
+        return 0
+    if n == 0:
+        return 0
+    if n == 68 && reply[0] == 0x52 && reply[1] == 0x00 && reply[2] == 0x00 && reply[3] == 0x40:
+        drain(link, 100)
+        return 1
+    return -1
+
+// Whether a programming session is already open: a read of block 0 is
+// answered. A partial or garbled answer is drained (300 ms of silence) and
+// the probe tried once more. Leaves nothing unread behind.
+bool uv17_session_open(^Link link):
+    i32 r = probe_once(link)
+    if r < 0:
+        drain(link, 300)
+        r = probe_once(link)
+        if r < 0:
+            drain(link, 300)
+    return r == 1
+
+// The fingerprint of an ident sent into an open session: the radio parses
+// "PROGRAM..." as commands and answers `R O G R` (52 4F 47 52 ...) as a read.
+bool uv17_in_session_reply(i32 first_byte):
+    return first_byte == 0x52
+
 // Puts the radio in program mode: each of the model's idents is tried until
 // one is answered with 06, then the first `upto` magics are sent (all when
 // upto < 0). Detection stops after 'F' and 'M' (upto = 2).
 LinkError!Uv17Hello uv17_hello(^Link link, ^const Model m, i64 upto):
     Uv17Hello h
     h.ident_index = -1
+    if uv17_session_open(link):
+        // already in a session (not power-cycled since the last one): reuse it
+        h.reused = true
+        h.magics_sent = word_count(m^.magics)
+        return h
     i64 nid = word_count(m^.ident)
     if nid == 0:
         fail LinkError.BAD_MODEL
     bool saw_data = false
-    for i in 0..<nid:
-        string8 id = word_at(m^.ident, i)
-        link.discard()
-        [32]u8 idb
-        i64 n = decode_bytes(id, idb[:])
-        if n <= 0:
-            fail LinkError.BAD_MODEL
-        try send_all(link, idb[0..<n])
-        i32 ack = link.recv_byte(1500)
-        if ack >= 0:
-            saw_data = true
-        if ack == 0x06:
-            h.ident_index = i
+    for round in 0..<IDENT_TRIES:
+        if round > 0:
+            link.discard()
+            link.sleep_ms(IDENT_RETRY_MS)
+            link.discard()
+        for i in 0..<nid:
+            string8 id = word_at(m^.ident, i)
+            link.discard()
+            [32]u8 idb
+            i64 n = decode_bytes(id, idb[:])
+            if n <= 0:
+                fail LinkError.BAD_MODEL
+            try send_all(link, idb[0..<n])
+            i32 ack = link.recv_byte(1500)
+            if ack >= 0:
+                saw_data = true
+            if ack == 0x06:
+                h.ident_index = i
+                break
+            if ack >= 0:
+                // anything but 06: was a session open after all (the probe
+                // lost on the cable)? Never send another ident into one.
+                drain(link, 300)
+                if uv17_session_open(link):
+                    h.reused = true
+                    h.magics_sent = word_count(m^.magics)
+                    return h
+        if h.ident_index >= 0:
             break
     if h.ident_index < 0:
         if saw_data:
@@ -146,7 +234,9 @@ LinkError!ref []u8 uv17_read(^Link link, ^const Model m, Progress pr):
                 uv17_crypt(key[:], img[at..<at + block])
             at += block
             a += block
-            report(pr, at, m^.image_size)
+            try step(pr, at, m^.image_size) else why:
+                #delete(img)
+                fail why
     if at != m^.image_size:
         #delete(img)
         fail LinkError.BAD_MODEL

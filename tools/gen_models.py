@@ -88,9 +88,9 @@ def write(fid, cls, model, link, detect, ch):
 
 # ---------------- UV-17Pro family ----------------
 FIVE = "108-135.999999 136-174 200-260 350-390 400-520"
-uv17("uv-5rm", "UV-5RM", "BF5RM", aliases="5RM, BF-5RM", tested="read",
+uv17("uv-5rm", "UV-5RM", "BF5RM", aliases="5RM, BF-5RM", tested="write",
      powers="High, Low, Medium", watts="8, 1, 5", rx_bands=FIVE, am=True, model_reply="5RH",
-     notes="Owner's radio; download confirmed on hardware (M reply '5RH     +L00000').")
+     notes="Download and full safe write (backup, 526-block write, verify) confirmed on hardware 2026-11-08 (M reply '5RH     +L00000').")
 uv17("uv-17pro", "UV-17Pro", "UV17Pro")
 uv17("uv-21prov2", "UV-21ProV2", "UV21ProV2", am=True,
      rx_bands="108-135.999999 136-174 220-260 350-390 400-479.999999 480-520",
@@ -145,9 +145,9 @@ uv17("uv-5g-mini", "UV-5G Mini", "UV5GMini", notes="Channels 1-30 are fixed GMRS
      rx_bands="108-135.999999 136-174 350-390 400-480 480-520", tx_bands="136-174 400-480")
 
 # ---------------- UV-5R family ----------------
-uv5r("uv-5r", "UV-5R", "BaofengUV5R / BaofengUV5RGeneric", tested="read",
+uv5r("uv-5r", "UV-5R", "BaofengUV5R / BaofengUV5RGeneric", tested="write",
      aliases="UV-5RE, UV-5X, RT5R, RT5RV, RT5, RH5R, UV-5R EX, A-5R, BaofengUV5R",
-     notes="Owner's UV-5RE (firmware HN5RV011); download confirmed on hardware.")
+     notes="UV-5RE (firmware HN5RV011, BFB291+ magic): download and guarded safe write (backup, write, verify) confirmed on hardware 2026-11-08. Other firmware generations are untested.")
 uv5r("uv-5g-pro", "UV-5G Pro", "BaofengUV5GPro", modes="FM,NFM,AM", am_bands="108-135.999999",
      bands="108-135.999999 136-174 220-260 350-390 400-520")
 uv5r("f-11", "F-11", "BaofengF11Radio", magics=(M_F11,), orig="never", basetype="USA")

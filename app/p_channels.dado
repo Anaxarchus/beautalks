@@ -1,0 +1,514 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The Channels editor: the open radio image in the data table. Name, RX,
+// duplex + offset (F6: raw RX / TX), tones (picker), power, mode, scan, BCL;
+// add / duplicate / delete / move; undo and redo; the library's validation
+// (hardware limits are errors) and licence notes as grey advisory chips.
+package main
+
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+btui.TableState g_ct
+bool g_table_dirty
+bool g_show_empty
+i32 g_raw
+ref []i32 g_view
+ref []btui.Column g_ccols
+
+// column ids (independent of position, which changes with F6)
+const i32 K_SLOT = 0
+const i32 K_NAME = 1
+const i32 K_RX = 2
+const i32 K_DUP = 3
+const i32 K_OFF = 4
+const i32 K_TX = 5
+const i32 K_TXT = 6
+const i32 K_RXT = 7
+const i32 K_POW = 8
+const i32 K_MODE = 9
+const i32 K_SCAN = 10
+const i32 K_BCL = 11
+const i32 K_INFO = 12
+
+ref []i32 g_ckind
+
+void channels_init():
+    using app_keep():
+        g_ct = btui.table_state()
+        g_ct.frozen = 2
+        g_ct.footer = true
+
+private ref []string8 g_pow_names
+private ref []string8 g_mode_names
+
+private void build_columns():
+    ^const radio.Model m = doc_model()
+    using app_keep():
+        #delete(g_ccols)
+        #delete(g_ckind)
+        #delete(g_pow_names)
+        #delete(g_mode_names)
+        g_ccols = nil
+        g_ckind = nil
+        g_pow_names = nil
+        g_mode_names = nil
+        for i in 0..<radio.power_count(m):
+            g_pow_names = #append(g_pow_names, radio.power_name(m, i64(i)))
+        strings.Splitter it = strings.splitter(m.modes, ",")
+        string8 piece
+        for strings.split_next(&it, &piece):
+            string8 tp = strings.trim(piece)
+            if #len(tp) > 0:
+                g_mode_names = #append(g_mode_names, tp)
+        if #len(g_mode_names) == 0:
+            g_mode_names = #append(g_mode_names, "FM")
+            g_mode_names = #append(g_mode_names, "NFM")
+        add_col(K_SLOT, btui.column("#", 72.0, btui.COL_INDEX, false))
+        add_col(K_NAME, btui.column("Name", 150.0, btui.COL_TEXT))
+        add_col(K_RX, btui.column("RX (MHz)", 128.0, btui.COL_NUM))
+        if g_raw == 0:
+            btui.Column d = btui.column("Duplex", 116.0, btui.COL_CHOICE)
+            d.choices = DUP_NAMES[:]
+            add_col(K_DUP, d)
+            add_col(K_OFF, btui.column("Offset", 96.0, btui.COL_NUM))
+        else:
+            add_col(K_TX, btui.column("TX (MHz)", 128.0, btui.COL_NUM))
+        add_col(K_TXT, btui.column("TX tone", 100.0, btui.COL_CUSTOM))
+        add_col(K_RXT, btui.column("RX tone", 100.0, btui.COL_CUSTOM))
+        btui.Column p = btui.column("Power", 92.0, btui.COL_CHOICE)
+        p.choices = g_pow_names[:]
+        add_col(K_POW, p)
+        btui.Column md = btui.column("Mode", 84.0, btui.COL_CHOICE)
+        md.choices = g_mode_names[:]
+        add_col(K_MODE, md)
+        add_col(K_SCAN, btui.column("Scan", 64.0, btui.COL_CHECK, true, false))
+        add_col(K_BCL, btui.column("BCL", 60.0, btui.COL_CHECK, true, false))
+        add_col(K_INFO, btui.column("Info", 150.0, btui.COL_STATUS, false, false))
+
+private void add_col(i32 kind, btui.Column c):
+    g_ccols = #append(g_ccols, c)
+    g_ckind = #append(g_ckind, kind)
+
+private void build_view():
+    using app_keep():
+        if g_view == nil:
+            g_view = #make([]i32, 0)
+        g_view = #resize(g_view, 0)
+        for i in 0..<doc_count():
+            if g_show_empty || !g_doc.rows[i].empty || !g_doc.base_rows[i].empty:
+                g_view = #append(g_view, i32(i))
+
+private i32 slot_of(i32 row):
+    if row < 0 || row >= i32(#len(g_view)):
+        return -1
+    return g_view[row]
+
+// ── the table's view of the document ────────────────────────────────────────
+
+private string8 ctext(i32 row, i32 col):
+    i32 s = slot_of(row)
+    if s < 0:
+        return ""
+    ^radio.Channel c = &g_doc.rows[s]
+    i32 k = g_ckind[col]
+    if k == K_SLOT:
+        return #format(c.number)
+    if c.empty:
+        return "Empty" if k == K_NAME else ""
+    if k == K_NAME:
+        return #format(radio.channel_name(c))
+    if k == K_RX:
+        return mhz_text(c.rx_hz)
+    if k == K_DUP:
+        return DUP_NAMES[dup_of(c)]
+    if k == K_OFF:
+        i32 d = dup_of(c)
+        if d == 1 || d == 2:
+            i64 off = c.tx_hz - c.rx_hz
+            return mhz_text(off if off > 0 else 0 - off)
+        if d == 3:
+            return mhz_text(c.tx_hz)
+        return ""
+    if k == K_TX:
+        if c.tx_hz < 0:
+            return "Off"
+        return mhz_text(c.tx_hz)
+    if k == K_TXT:
+        return tone_text(c.tx_tone)
+    if k == K_RXT:
+        return tone_text(c.rx_tone)
+    if k == K_POW:
+        return radio.power_name(doc_model(), i64(c.power))
+    if k == K_MODE:
+        return radio.mode_name(c.mode)
+    if k == K_SCAN:
+        return "1" if c.scan else "0"
+    if k == K_BCL:
+        return "1" if c.bcl else "0"
+    if k == K_INFO:
+        (string8 note, i32 _) = service_note(c.rx_hz)
+        return note
+    return ""
+
+// Which column a library issue belongs to.
+private bool issue_in(radio.Issue is, i32 k):
+    if is == radio.Issue.RX_BAND || is == radio.Issue.FREQ_STEP:
+        return k == K_RX
+    if is == radio.Issue.TX_BAND:
+        return k == K_OFF || k == K_DUP || k == K_TX
+    if is == radio.Issue.RX_TONE:
+        return k == K_RXT
+    if is == radio.Issue.TX_TONE:
+        return k == K_TXT
+    if is == radio.Issue.NAME_LONG || is == radio.Issue.NAME_CHARS:
+        return k == K_NAME
+    if is == radio.Issue.POWER:
+        return k == K_POW
+    return false
+
+private i32 cdeco(i32 row, i32 col):
+    i32 s = slot_of(row)
+    if s < 0:
+        return btui.DECO_NONE
+    ^radio.Channel c = &g_doc.rows[s]
+    i32 k = g_ckind[col]
+    if k == K_SLOT && row_changed(s):
+        return btui.DECO_CHANGED
+    if c.empty:
+        return btui.DECO_DIM if k == K_NAME else btui.DECO_NONE
+    if k == K_INFO:
+        (string8 _, i32 tone) = service_note(c.rx_hz)
+        return btui.DECO_TONE + tone
+    [12]radio.Issue is
+    i64 n = row_issues(s, is[:])
+    for i in 0..<n:
+        if issue_in(is[i], k):
+            return btui.DECO_WARNING if is[i] == radio.Issue.FREQ_STEP else btui.DECO_ERROR
+    if (k == K_TXT && c.tx_tone.kind == radio.ToneKind.OFF) || (k == K_RXT && c.rx_tone.kind == radio.ToneKind.OFF):
+        return btui.DECO_DIM
+    if (k == K_DUP && c.tx_hz < 0) || (k == K_TX && c.tx_hz < 0):
+        return btui.DECO_DIM
+    return btui.DECO_NONE
+
+private string8 cmsg(i32 row, i32 col):
+    i32 s = slot_of(row)
+    if s < 0:
+        return ""
+    i32 k = g_ckind[col]
+    if k == K_INFO:
+        if g_doc.rows[s].empty:
+            return ""
+        return service_full(g_doc.rows[s].rx_hz)
+    [12]radio.Issue is
+    i64 n = row_issues(s, is[:])
+    for i in 0..<n:
+        if issue_in(is[i], k):
+            string8 base = radio.issue_message(is[i])
+            if is[i] == radio.Issue.RX_BAND || is[i] == radio.Issue.TX_BAND:
+                ^const radio.Model m = doc_model()
+                string8 bl = m.tx_bands
+                if is[i] == radio.Issue.RX_BAND && #len(m.rx_bands) > 0:
+                    bl = m.rx_bands
+                ref []char8 bw = band_words(bl)
+                string8 bws = bw
+                return #format(sentence(base), " (this radio: ", bws, "). It will not be written.")
+            if is[i] == radio.Issue.NAME_LONG:
+                return #format(sentence(base), " (", radio.name_width(doc_model()), " characters on this radio).")
+            return #format(sentence(base), ". It will not be written.")
+    return ""
+
+// ── edits ────────────────────────────────────────────────────────────────────
+
+private ^radio.Channel edit_slot(i32 s):
+    doc_snapshot()
+    ^radio.Channel c = &g_doc.rows[s]
+    if c.empty:
+        // a new channel in an empty slot: sensible defaults
+        i32 number = c.number
+        radio.Channel n = radio.empty_channel(number)
+        n.empty = false
+        n.rx_hz = 146520000
+        n.tx_hz = 146520000
+        n.power = 0
+        n.mode = radio.Mode.FM
+        n.scan = true
+        g_doc.rows[s] = n
+    return c
+
+private void apply_event(btui.TableEvent ev):
+    i32 s = slot_of(ev.row)
+    if s < 0 || ev.col < 0:
+        return
+    i32 k = g_ckind[ev.col]
+    if ev.kind == btui.TEV_CUSTOM:
+        if k == K_TXT || k == K_RXT:
+            radio.Tone cur = g_doc.rows[s].tx_tone if k == K_TXT else g_doc.rows[s].rx_tone
+            tone_open(cur, s, k, 0)
+        return
+    if ev.kind == btui.TEV_TOGGLE:
+        if g_doc.rows[s].empty:
+            return
+        ^radio.Channel c = edit_slot(s)
+        if k == K_SCAN:
+            c.scan = !c.scan
+        else if k == K_BCL:
+            c.bcl = !c.bcl
+        return
+    if ev.kind == btui.TEV_CLEAR:
+        if k == K_SLOT || k == K_NAME && g_doc.rows[s].empty:
+            return
+        if k == K_NAME:
+            ^radio.Channel c = edit_slot(s)
+            radio.set_channel_name(c, "")
+        return
+    if ev.kind == btui.TEV_CHOICE:
+        ^radio.Channel c = edit_slot(s)
+        if k == K_DUP:
+            set_dup(c, ev.choice)
+        else if k == K_POW:
+            c.power = ev.choice
+        else if k == K_MODE:
+            radio.Mode md
+            if radio.parse_mode(ev.text, &md):
+                c.mode = md
+        return
+    if ev.kind != btui.TEV_COMMIT:
+        return
+    string8 txt = strings.trim(ev.text)
+    if k == K_NAME:
+        ^radio.Channel c = edit_slot(s)
+        i64 w = radio.name_width(doc_model())
+        if #len(txt) > w:
+            btui.snackbar_show(#format("Names are ", w, " characters on this radio: \"", txt[0..<w], "\""))
+            txt = txt[0..<w]
+        radio.set_channel_name(c, txt)
+        return
+    i64 hz = radio.parse_mhz(txt)
+    if hz <= 0:
+        if #len(txt) > 0:
+            btui.snackbar_show(#format("\"", txt, "\" isn't a frequency. Type it in MHz, like 146.520"))
+        return
+    ^radio.Channel c = edit_slot(s)
+    if k == K_RX:
+        i64 d = c.tx_hz - c.rx_hz
+        bool off = c.tx_hz < 0
+        c.rx_hz = hz
+        if !off:
+            c.tx_hz = hz + d
+    else if k == K_TX:
+        c.tx_hz = hz
+    else if k == K_OFF:
+        i32 dd = dup_of(c)
+        if dd == 3:
+            c.tx_hz = hz
+        else if dd == 2:
+            c.tx_hz = c.rx_hz - hz
+        else:
+            c.tx_hz = c.rx_hz + hz
+
+private void set_dup(^radio.Channel c, i32 d):
+    i64 off = c.tx_hz - c.rx_hz
+    if off < 0:
+        off = 0 - off
+    if c.tx_hz < 0 || off == 0 || off > 10000000:
+        off = band_offset(c.rx_hz)
+    if d == 0:
+        c.tx_hz = c.rx_hz
+    else if d == 1:
+        c.tx_hz = c.rx_hz + off
+    else if d == 2:
+        c.tx_hz = c.rx_hz - off
+    else if d == 3:
+        if c.tx_hz < 0:
+            c.tx_hz = c.rx_hz
+    else:
+        c.tx_hz = -1
+
+void channels_set_tone(i32 s, i32 k, radio.Tone t):
+    ^radio.Channel c = edit_slot(s)
+    if k == K_TXT:
+        c.tx_tone = t
+    else:
+        c.rx_tone = t
+
+// ── row operations ───────────────────────────────────────────────────────────
+
+private i32 cur_slot():
+    return slot_of(g_ct.cur_row)
+
+private i32 empty_after(i32 s):
+    for i in (s + 1)..<doc_count():
+        if g_doc.rows[i].empty:
+            return i32(i)
+    for i in 0..<doc_count():
+        if g_doc.rows[i].empty:
+            return i32(i)
+    return -1
+
+private void focus_slot(i32 s):
+    build_view()
+    for i in 0..<#len(g_view):
+        if g_view[i] == s:
+            g_ct.cur_row = i32(i)
+    btui.set_focus(btui.id("chan"))
+
+void ch_add():
+    i32 s = empty_after(cur_slot())
+    if s < 0:
+        btui.snackbar_show("Every channel slot on this radio is in use.")
+        return
+    ^radio.Channel c = edit_slot(s)
+    radio.set_channel_name(c, "NEW")
+    focus_slot(s)
+    g_ct.cur_col = 1
+
+void ch_duplicate():
+    i32 s = cur_slot()
+    if s < 0 || g_doc.rows[s].empty:
+        return
+    i32 d = empty_after(s)
+    if d < 0:
+        btui.snackbar_show("No empty slot to copy into.")
+        return
+    doc_snapshot()
+    i32 number = g_doc.rows[d].number
+    g_doc.rows[d] = g_doc.rows[s]
+    g_doc.rows[d].number = number
+    focus_slot(d)
+
+void ch_delete():
+    doc_snapshot()
+    i32 n = 0
+    for i in 0..<#len(g_view):
+        if btui.table_row_selected(&g_ct, i32(i)):
+            i32 s = g_view[i]
+            g_doc.rows[s] = radio.empty_channel(g_doc.rows[s].number)
+            n += 1
+    if n == 0:
+        i32 s = cur_slot()
+        if s >= 0:
+            g_doc.rows[s] = radio.empty_channel(g_doc.rows[s].number)
+            n = 1
+    btui.snackbar_show(#format("Deleted ", n, " channel", "" if n == 1 else "s", ". Ctrl+Z puts ", "it" if n == 1 else "them", " back."), "Undo")
+    g_undo_snack = true
+
+bool g_undo_snack
+
+void ch_move(i32 dir):
+    i32 s = cur_slot()
+    i32 t = s + dir
+    if s < 0 || t < 0 || t >= doc_count():
+        return
+    doc_snapshot()
+    radio.Channel a = g_doc.rows[s]
+    radio.Channel b = g_doc.rows[t]
+    i32 na = a.number
+    i32 nb = b.number
+    a.number = nb
+    b.number = na
+    g_doc.rows[t] = a
+    g_doc.rows[s] = b
+    focus_slot(t)
+
+// ── the page ─────────────────────────────────────────────────────────────────
+
+void channels_page(btui.Rect sheet):
+    ^btui.Scheme t = btui.theme()
+    btui.Rect body = btui.inset(sheet, 24.0)
+    if !g_doc.open:
+        empty_state(body, "table_rows", "No channels open", "Read your radio on the Radio page, or open a backup.", "Go to Radio")
+        return
+    // header: what is open, and the write button
+    // the title is the radio's own name (or "Unnamed radio"); the model is
+    // on the line under it, so it is never shown twice
+    string8 dtitle = g_doc.title
+    if g_doc.source == SRC_RADIO:
+        dtitle = "Unnamed radio"
+        if #len(g_radio.nickname) > 0:
+            dtitle = g_radio.nickname
+    f32 tx = btui.text(btui.HEADLINE_SMALL, body.x, body.y, dtitle, t.on_surface)
+    if g_doc.source == SRC_RADIO && g_radio.known && #len(g_radio.rid) > 0:
+        string8 tip = "Name this radio" if #len(g_radio.nickname) == 0 else "Rename this radio"
+        if btui.icon_button("edit", btui.rect(tx + 4.0, body.y - 8.0, 40.0, 40.0), btui.ICON_STANDARD, false, false, tip):
+            rename_open(g_radio.rid, g_radio.nickname)
+    string8 sub = #format(model_label(g_doc.mi), "  ·  ", used_count(), " of ", doc_count(), " channels used")
+    if g_doc.source == SRC_BACKUP:
+        sub = #format(sub, "  ·  from a backup")
+    _ = btui.text(btui.BODY_MEDIUM, body.x, body.y + 36.0, sub, t.on_surface_variant)
+    i32 nchg = changed_count()
+    string8 wl = "Write to radio"
+    if nchg > 0:
+        wl = #format("Write ", nchg, " change", "" if nchg == 1 else "s")
+    f32 ww = btui.button_width(wl, "upload")
+    if btui.button(wl, btui.rect(btui.right(body) - ww, body.y + 8.0, ww, 40.0), btui.BTN_FILLED, "upload", job_busy() || (nchg == 0 && g_doc.source == SRC_RADIO)):
+        write_flow_open()
+    f32 pw = btui.button_width("Save as profile", "playlist_add", btui.BTN_TONAL)
+    if btui.button("Save as profile", btui.rect(btui.right(body) - ww - 12.0 - pw, body.y + 8.0, pw, 40.0), btui.BTN_TONAL, "playlist_add"):
+        profile_from_doc()
+    // toolbar
+    f32 ty = body.y + 72.0
+    f32 x = body.x - 4.0
+    if btui.icon_button("undo", btui.rect(x, ty, 48.0, 48.0), btui.ICON_STANDARD, false, #len(g_doc.undo) == 0, #format("Undo (", btui.cmd_label(), "Z)")):
+        _ = doc_undo()
+    x = x + 44.0
+    if btui.icon_button("redo", btui.rect(x, ty, 48.0, 48.0), btui.ICON_STANDARD, false, #len(g_doc.redo) == 0, "Redo"):
+        _ = doc_redo()
+    x = x + 52.0
+    btui.vline(x, ty + 12.0, ty + 36.0, 1.0, t.outline_variant)
+    x = x + 8.0
+    (bool a1, f32 aw) = btui.button_at(x, ty + 4.0, "Add", btui.BTN_TEXT, "add")
+    if a1:
+        ch_add()
+    x = x + aw + 4.0
+    (bool a2, f32 dw) = btui.button_at(x, ty + 4.0, "Duplicate", btui.BTN_TEXT, "content_copy")
+    if a2:
+        ch_duplicate()
+    x = x + dw + 4.0
+    (bool a3, f32 dlw) = btui.button_at(x, ty + 4.0, "Delete", btui.BTN_TEXT, "delete")
+    if a3:
+        ch_delete()
+    x = x + dlw + 4.0
+    if btui.icon_button("arrow_upward", btui.rect(x, ty, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Move up"):
+        ch_move(-1)
+    x = x + 44.0
+    if btui.icon_button("arrow_downward", btui.rect(x, ty, 48.0, 48.0), btui.ICON_STANDARD, false, false, "Move down"):
+        ch_move(1)
+    // right side: problems, raw toggle, empty slots
+    f32 rx = btui.right(body)
+    _ = btui.switch_("empties", rx - 52.0, ty + 8.0, &g_show_empty)
+    f32 lw = btui.text_width(btui.BODY_MEDIUM, "Empty slots")
+    _ = btui.text(btui.BODY_MEDIUM, rx - 64.0 - lw, ty + 14.0, "Empty slots", t.on_surface)
+    [2]string8 modes = ["Duplex + offset", "RX + TX"]
+    if btui.segmented("raw", btui.rect(rx - 64.0 - lw - 24.0 - 280.0, ty + 4.0, 280.0, 40.0), modes[:], &g_raw):
+        g_table_dirty = true
+    i32 np = problem_count()
+    if np > 0:
+        f32 px = rx - 64.0 - lw - 24.0 - 280.0 - 16.0 - btui.status_chip_width(#format(np, " can't be stored"), "error")
+        _ = btui.status_chip(px, ty + 8.0, #format(np, " can't be stored"), btui.TONE_ERROR, "error")
+    if btui.take_key(KEY_F6_CODE):
+        g_raw = 1 - g_raw
+    // the table
+    build_columns()
+    build_view()
+    btui.Rect tr = btui.rect(body.x, ty + 64.0, body.w, btui.bottom(body) - ty - 64.0)
+    btui.TableEvent ev = btui.table("chan", tr, g_ccols[:], i32(#len(g_view)), &g_ct, ctext, cdeco, cmsg)
+    if ev.kind != btui.TEV_NONE:
+        apply_event(ev)
+
+const i32 KEY_F6_CODE = 295
+
+void empty_state(btui.Rect body, string8 icon_name, string8 title, string8 sub, string8 action):
+    ^btui.Scheme t = btui.theme()
+    f32 cxp = btui.cx(body)
+    f32 y = body.y + body.h * 0.28
+    btui.fill_circle(cxp, y, 44.0, t.secondary_container)
+    btui.icon(icon_name, cxp - 12.0, y - 12.0, 24.0, t.on_secondary_container)
+    btui.text_in(btui.rect(body.x, y + 64.0, body.w, 32.0), btui.TITLE_LARGE, title, t.on_surface, btui.ALIGN_CENTER)
+    btui.text_in(btui.rect(body.x, y + 100.0, body.w, 24.0), btui.BODY_MEDIUM, sub, t.on_surface_variant, btui.ALIGN_CENTER)
+    if #len(action) > 0:
+        f32 w = btui.button_width(action, "", btui.BTN_TONAL)
+        if btui.button(action, btui.rect(cxp - w * 0.5, y + 144.0, w, 40.0), btui.BTN_TONAL):
+            g_page = PAGE_RADIO

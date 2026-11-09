@@ -1,0 +1,118 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The write gate, in one place for every front end. A write may go ahead
+// without the user's explicit override when write_status says the radio is
+// tested: a shipped `tested = write` definition, or a local "ok" record
+// (beautalks verify) for this model AND this radio's fingerprint. The
+// fingerprint is established inside the write's own session, from the
+// detection's replies and the radio's own memory (the backup read), never
+// from the image about to be written. When it cannot be established the
+// radio is treated as untested.
+//
+// Order inside one session: finish the identification -> read the radio
+// (backup, saved) -> gate -> write -> read back and compare. Refused by the
+// gate, nothing is written (the backup was only read).
+package radio
+
+// Completes the identification a detection started, leaving the radio in
+// its session: UV-17Pro, the model's remaining magics after 'F' and 'M'
+// (its own SEND); UV-5R and reused sessions, nothing.
+LinkError!void finish_handshake(^Detection d, ^const Model m):
+    if !d^.found || !d^.link_open || m^.engine != d^.engine:
+        fail LinkError.BAD_MODEL
+    if m^.engine != "uv17pro":
+        return
+    if word_count(m^.magics) < 2 || d^.hello.reused:
+        d^.hello.magics_sent = word_count(m^.magics)
+    if d^.hello.magics_sent < word_count(m^.magics):
+        try uv17_more_magics(&d^.link, m, &d^.hello, -1)
+
+// The gate: true when writing may go ahead (tested, or the user's
+// explicit override). `status` says why.
+bool gate_allows(^const Model m, string8 fingerprint, ^TestedStore store, bool allow_untested, ^WriteStatus status):
+    status^ = write_status(m, fingerprint, store)
+    return status^.by != TestedBy.NONE || allow_untested
+
+// The safe write on the detection's open link with the built-in engine,
+// gated as above. Answers the write status that let it through.
+LinkError!WriteStatus safe_write_detected(^Detection d, ^const Model m, []u8 img, ^TestedStore store, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    if #len(img) != m^.image_size:
+        fail LinkError.IMAGE_SIZE
+    if phase != nil:
+        phase(ctx, WritePhase.BACKUP)
+    try finish_handshake(d, m)
+    ref []u8 before = nil
+    if m^.engine == "uv5r":
+        try before = uv5r_read(&d^.link, m, d^.ident, true, pr)
+    else:
+        try before = uv17_read(&d^.link, m, pr)
+    bool saved = save_backup(backup_path, m, before)
+    ref []char8 fp = fingerprint_of(d, m, before)
+    #delete(before)
+    if !saved:
+        #delete(fp)
+        fail LinkError.BACKUP
+    WriteStatus st
+    bool ok = gate_allows(m, fp, store, allow_untested, &st)
+    #delete(fp)
+    if !ok:
+        fail LinkError.UNTESTED
+    d^.link.sleep_ms(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.WRITE)
+    if m^.engine == "uv5r":
+        try uv5r_write(&d^.link, m, img, d^.ident, false, pr)
+    else:
+        try uv17_write(&d^.link, m, img, pr)
+    d^.link.sleep_ms(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.VERIFY)
+    ref []u8 after = nil
+    if m^.engine == "uv5r":
+        try after = uv5r_read(&d^.link, m, d^.ident, false, pr)
+    else:
+        try after = uv17_read(&d^.link, m, pr)
+    i64 bad = verify_mismatch(m, img, after)
+    #delete(after)
+    if bad >= 0:
+        fail LinkError.VERIFY
+    return st
+
+// The same through any engine (a scripted driver): the detection's
+// handshake is finished first so the engine finds the radio in its open
+// session; the engine's own download/upload run inside it.
+LinkError!WriteStatus safe_write_detected_with(^Engine eng, ^Detection d, ^const Model m, []u8 img, ^TestedStore store, bool allow_untested, string8 backup_path, i32 pause_ms, PhaseFn phase, rawptr ctx, Progress pr):
+    if #len(img) != m^.image_size:
+        fail LinkError.IMAGE_SIZE
+    if phase != nil:
+        phase(ctx, WritePhase.BACKUP)
+    try finish_handshake(d, m)
+    try ref []u8 before = eng.download(m, pr) else code:
+        fail LinkError(code)
+    bool saved = save_backup(backup_path, m, before)
+    ref []char8 fp = fingerprint_of(d, m, before)
+    #delete(before)
+    if !saved:
+        #delete(fp)
+        fail LinkError.BACKUP
+    WriteStatus st
+    bool ok = gate_allows(m, fp, store, allow_untested, &st)
+    #delete(fp)
+    if !ok:
+        fail LinkError.UNTESTED
+    eng.pause(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.WRITE)
+    try eng.upload(m, img, pr) else code:
+        fail LinkError(code)
+    eng.pause(pause_ms)
+    if phase != nil:
+        phase(ctx, WritePhase.VERIFY)
+    try ref []u8 after = eng.download(m, pr) else code:
+        fail LinkError(code)
+    i64 bad = verify_mismatch(m, img, after)
+    #delete(after)
+    if bad >= 0:
+        fail LinkError.VERIFY
+    return st

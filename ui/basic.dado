@@ -1,0 +1,289 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// btui: the beautalks widget toolkit. Small shared things: rectangles in dp,
+// colours, easing, UTF-8.
+//
+// Units. Every coordinate a caller hands btui is in dp (density-independent
+// pixels, the CSS px of a browser). The painter multiplies by `scale()` (the
+// window's backing scale: 1 on a normal screen, 2 on Retina) and rounds to
+// whole device pixels, so edges land on pixel boundaries and the atlas tiles
+// are sampled texel for texel.
+package btui
+
+import "core:math"
+
+type Rect: (f32 x, f32 y, f32 w, f32 h)
+
+// Corner radii in dp: top-left, top-right, bottom-right, bottom-left (CSS order).
+type Radii: (f32 tl, f32 tr, f32 br, f32 bl)
+
+Radii radii(f32 r):
+    return Radii((r, r, r, r))
+
+Radii radii4(f32 tl, f32 tr, f32 br, f32 bl):
+    return Radii((tl, tr, br, bl))
+
+Rect rect(f32 x, f32 y, f32 w, f32 h):
+    return Rect((x, y, w, h))
+
+f32 right(Rect r):
+    return r.x + r.w
+
+f32 bottom(Rect r):
+    return r.y + r.h
+
+f32 cx(Rect r):
+    return r.x + r.w * 0.5
+
+f32 cy(Rect r):
+    return r.y + r.h * 0.5
+
+bool contains(Rect r, f32 x, f32 y):
+    return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h
+
+Rect inset(Rect r, f32 d):
+    return Rect((r.x + d, r.y + d, maxf(0.0, r.w - d - d), maxf(0.0, r.h - d - d)))
+
+Rect inset4(Rect r, f32 l, f32 t, f32 rr, f32 b):
+    return Rect((r.x + l, r.y + t, maxf(0.0, r.w - l - rr), maxf(0.0, r.h - t - b)))
+
+Rect expand(Rect r, f32 d):
+    return Rect((r.x - d, r.y - d, r.w + d + d, r.h + d + d))
+
+Rect offset(Rect r, f32 dx, f32 dy):
+    return Rect((r.x + dx, r.y + dy, r.w, r.h))
+
+Rect intersect(Rect a, Rect b):
+    f32 x0 = maxf(a.x, b.x)
+    f32 y0 = maxf(a.y, b.y)
+    f32 x1 = minf(a.x + a.w, b.x + b.w)
+    f32 y1 = minf(a.y + a.h, b.y + b.h)
+    return Rect((x0, y0, maxf(0.0, x1 - x0), maxf(0.0, y1 - y0)))
+
+// Rect cutting: take a strip off one side of `r` and answer it.
+Rect cut_top(^Rect r, f32 h):
+    f32 hh = minf(h, r.h)
+    Rect out = Rect((r.x, r.y, r.w, hh))
+    r.y = r.y + hh
+    r.h = r.h - hh
+    return out
+
+Rect cut_bottom(^Rect r, f32 h):
+    f32 hh = minf(h, r.h)
+    r.h = r.h - hh
+    return Rect((r.x, r.y + r.h, r.w, hh))
+
+Rect cut_left(^Rect r, f32 w):
+    f32 ww = minf(w, r.w)
+    Rect out = Rect((r.x, r.y, ww, r.h))
+    r.x = r.x + ww
+    r.w = r.w - ww
+    return out
+
+Rect cut_right(^Rect r, f32 w):
+    f32 ww = minf(w, r.w)
+    r.w = r.w - ww
+    return Rect((r.x + r.w, r.y, ww, r.h))
+
+// A rectangle of size (w, h) centred in `r`.
+Rect center_in(Rect r, f32 w, f32 h):
+    return Rect((r.x + (r.w - w) * 0.5, r.y + (r.h - h) * 0.5, w, h))
+
+f32 minf(f32 a, f32 b):
+    return a if a < b else b
+
+f32 maxf(f32 a, f32 b):
+    return a if a > b else b
+
+f32 clampf(f32 v, f32 lo, f32 hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+f32 absf(f32 v):
+    return 0.0 - v if v < 0.0 else v
+
+f32 lerpf(f32 a, f32 b, f32 t):
+    return a + (b - a) * t
+
+i32 mini(i32 a, i32 b):
+    return a if a < b else b
+
+i32 maxi(i32 a, i32 b):
+    return a if a > b else b
+
+i32 clampi(i32 v, i32 lo, i32 hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+f32 sqrtf(f32 v):
+    return f32(math.root(f64(v)))
+
+f32 sinf(f32 v):
+    return f32(math.sine(f64(v)))
+
+f32 cosf(f32 v):
+    return f32(math.cosine(f64(v)))
+
+f32 floorf(f32 v):
+    return f32(math.down(f64(v)))
+
+f32 ceilf(f32 v):
+    return f32(math.up(f64(v)))
+
+f32 roundf(f32 v):
+    return f32(math.down(f64(v) + 0.5))
+
+i32 iround(f32 v):
+    return i32(math.down(f64(v) + 0.5))
+
+const f32 PI = 3.14159265358979
+
+// ── Colour ─────────────────────────────────────────────────────────────────
+// Colours are straight (not premultiplied) RGBA8, the form app:draw tints with.
+
+[4]u8 rgb(u32 hex):
+    return [u8((hex >> 16) & 0xff), u8((hex >> 8) & 0xff), u8(hex & 0xff), 255]
+
+[4]u8 rgba(u32 hex, f32 alpha):
+    [4]u8 c = rgb(hex)
+    c[3] = u8(clampf(alpha, 0.0, 1.0) * 255.0 + 0.5)
+    return c
+
+// `c` with its alpha multiplied by `a` (0..1).
+[4]u8 alpha([4]u8 c, f32 a):
+    [4]u8 o = c
+    o[3] = u8(clampf(f32(c[3]) * a, 0.0, 255.0) + 0.5)
+    return o
+
+// Mix two opaque colours: t = 0 is `a`, 1 is `b`.
+[4]u8 mix([4]u8 a, [4]u8 b, f32 t):
+    f32 u = clampf(t, 0.0, 1.0)
+    [4]u8 o
+    for i in 0..<4:
+        o[i] = u8(lerpf(f32(a[i]), f32(b[i]), u) + 0.5)
+    return o
+
+// The colour a state layer of `layer` at opacity `op` paints over `base`
+// (Material's hover 8%, focus 10%, pressed 10%, dragged 16%).
+[4]u8 over([4]u8 base, [4]u8 layer, f32 op):
+    [4]u8 o = mix(base, layer, op)
+    o[3] = base[3]
+    return o
+
+const [4]u8 TRANSPARENT = [0, 0, 0, 0]
+const [4]u8 WHITE = [255, 255, 255, 255]
+const [4]u8 BLACK = [0, 0, 0, 255]
+
+// ── Easing ─────────────────────────────────────────────────────────────────
+
+// cubic-bezier(x1, y1, x2, y2) at progress `t`, as CSS evaluates it.
+f32 cubic_bezier(f32 x1, f32 y1, f32 x2, f32 y2, f32 t):
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    // Solve x(s) = t for s by Newton, then answer y(s).
+    f32 s = t
+    for i in 0..<8:
+        f32 x = bez(x1, x2, s) - t
+        f32 dx = bez_d(x1, x2, s)
+        if absf(x) < 0.0001:
+            break
+        if absf(dx) < 0.000001:
+            break
+        s = clampf(s - x / dx, 0.0, 1.0)
+    return bez(y1, y2, s)
+
+private f32 bez(f32 a, f32 b, f32 s):
+    f32 u = 1.0 - s
+    return 3.0 * u * u * s * a + 3.0 * u * s * s * b + s * s * s
+
+private f32 bez_d(f32 a, f32 b, f32 s):
+    f32 u = 1.0 - s
+    return 3.0 * u * u * a + 6.0 * u * s * (b - a) + 3.0 * s * s * (1.0 - b)
+
+// Material 3 easing tokens.
+f32 ease_standard(f32 t):
+    return cubic_bezier(0.2, 0.0, 0.0, 1.0, t)
+
+f32 ease_emphasized_decel(f32 t):
+    return cubic_bezier(0.05, 0.7, 0.1, 1.0, t)
+
+f32 ease_emphasized_accel(f32 t):
+    return cubic_bezier(0.3, 0.0, 0.8, 0.15, t)
+
+// ── UTF-8 ──────────────────────────────────────────────────────────────────
+
+// Decode one code point at `at`; answers it and its length in bytes. A bad
+// byte decodes as U+FFFD, one byte long, so a walk always moves forward.
+(i32 cp, i32 n) utf8_at(string8 s, i64 at):
+    i64 len = #len(s)
+    if at >= len:
+        return (0, 0)
+    u32 b0 = u32(u8(s[at]))
+    if b0 < 0x80:
+        return (i32(b0), 1)
+    i32 need = 0
+    u32 cp = 0
+    if (b0 & 0xE0) == 0xC0:
+        need = 1
+        cp = b0 & 0x1F
+    else if (b0 & 0xF0) == 0xE0:
+        need = 2
+        cp = b0 & 0x0F
+    else if (b0 & 0xF8) == 0xF0:
+        need = 3
+        cp = b0 & 0x07
+    else:
+        return (0xFFFD, 1)
+    for k in 1..=need:
+        if at + i64(k) >= len:
+            return (0xFFFD, 1)
+        u32 b = u32(u8(s[at + i64(k)]))
+        if (b & 0xC0) != 0x80:
+            return (0xFFFD, 1)
+        cp = (cp << 6) | (b & 0x3F)
+    return (i32(cp), need + 1)
+
+// The byte index of the code point before `at` (0 at the start).
+i64 utf8_prev(string8 s, i64 at):
+    i64 i = at - 1
+    for i > 0 && (u32(u8(s[i])) & 0xC0) == 0x80:
+        i -= 1
+    return i if i > 0 else 0
+
+// The byte index of the code point after `at`.
+i64 utf8_next(string8 s, i64 at):
+    if at >= #len(s):
+        return #len(s)
+    (i32 cp, i32 n) = utf8_at(s, at)
+    _ = cp
+    return at + i64(n)
+
+// Append the UTF-8 encoding of `cp`.
+void utf8_append(^ref []char8 buf, i32 cp):
+    u32 c = u32(cp)
+    if c < 0x80:
+        buf^ = #append(buf^, char8(c))
+    else if c < 0x800:
+        buf^ = #append(buf^, char8(0xC0 | (c >> 6)))
+        buf^ = #append(buf^, char8(0x80 | (c & 0x3F)))
+    else if c < 0x10000:
+        buf^ = #append(buf^, char8(0xE0 | (c >> 12)))
+        buf^ = #append(buf^, char8(0x80 | ((c >> 6) & 0x3F)))
+        buf^ = #append(buf^, char8(0x80 | (c & 0x3F)))
+    else:
+        buf^ = #append(buf^, char8(0xF0 | (c >> 18)))
+        buf^ = #append(buf^, char8(0x80 | ((c >> 12) & 0x3F)))
+        buf^ = #append(buf^, char8(0x80 | ((c >> 6) & 0x3F)))
+        buf^ = #append(buf^, char8(0x80 | (c & 0x3F)))
+
+f64 math_angle(f64 y, f64 x):
+    return math.angle(y, x)

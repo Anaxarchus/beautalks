@@ -1,0 +1,210 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// Icons (Material Symbols, rounded, Apache-2.0) and brand images.
+//
+// tools/make_icons.py rasterises every icon at 18, 20 and 24 dp for 1x and
+// 2x screens into an alpha sheet (`assets/icons/icons@Nx.bta`, with a CSV
+// index). btui loads the sheet for the screen's scale and copies an icon into
+// the shared atlas the first time it is drawn at a size. At 1x and 2x an icon
+// is drawn texel for texel; at other scales (1.5x, 1.25x) the 2x bitmap is
+// filtered down.
+package btui
+
+import "core:fmt"
+import "core:os/fs"
+import "core:path"
+import "core:strings"
+import "core:strings/parse"
+
+type IconRec: (i32 x, i32 y, i32 w, i32 h)
+type Sheet: (ref []u8 px, i32 w, i32 h, i32 ch)
+
+private [3]Sheet g_sheets
+private [3]{u64: IconRec} g_icon_index
+private {u64: u64} g_icon_names
+private ref []char8 g_assets_dir
+private bool g_icons_ok
+
+private (Sheet, bool) read_bta(string8 file):
+    Sheet s
+    try ref []u8 b = fs.read_bytes(file) else:
+        return (s, false)
+    if #len(b) < 16 || b[0] != u8('B') || b[1] != u8('T') || b[2] != u8('A') || b[3] != u8('1'):
+        #delete(b)
+        return (s, false)
+    s.w = i32(rd32b(b[:], 4))
+    s.h = i32(rd32b(b[:], 8))
+    s.ch = i32(rd32b(b[:], 12))
+    s.px = #make([]u8, i64(s.w) * i64(s.h) * i64(s.ch))
+    for i in 0..<#len(s.px):
+        s.px[i] = b[16 + i]
+    #delete(b)
+    return (s, true)
+
+private u32 rd32b([]u8 b, i64 at):
+    return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+
+private u64 name_key(string8 name, bool fill, i32 dp):
+    u64 h = u64(14695981039346656037)
+    for i in 0..<#len(name):
+        h = (h ~ u64(u8(name[i]))) * u64(1099511628211)
+    h = (h ~ (u64(1) if fill else u64(0))) * u64(1099511628211)
+    h = (h ~ u64(dp)) * u64(1099511628211)
+    return h
+
+private bool load_sheet(i32 k, string8 dir):
+    string8 base = path.join(dir, #format("icons@", k, "x"))
+    (Sheet s, bool ok) = read_bta(#format(base, ".bta"))
+    if !ok:
+        return false
+    g_sheets[k] = s
+    try ref []char8 csv = fs.read_file(#format(base, ".csv")) else:
+        return false
+    strings.Splitter it = strings.splitter(csv, "\n")
+    string8 ln
+    bool first = true
+    for strings.split_next(&it, &ln):
+        if first || #len(ln) == 0:
+            first = false
+            continue
+        ref []string8 f = strings.split(ln, ",")
+        if #len(f) >= 7:
+            i32 fill = 0
+            try fill = parse.to_i32(f[1]) else:
+                fill = 0
+            i32 dp = 24
+            try dp = parse.to_i32(f[2]) else:
+                dp = 24
+            i32 x = 0
+            try x = parse.to_i32(f[3]) else:
+                x = 0
+            i32 y = 0
+            try y = parse.to_i32(f[4]) else:
+                y = 0
+            i32 w = 0
+            try w = parse.to_i32(f[5]) else:
+                w = 0
+            i32 h = 0
+            try h = parse.to_i32(f[6]) else:
+                h = 0
+            g_icon_index[k][name_key(f[0], fill == 1, dp)] = IconRec((x, y, w, h))
+        #delete(f)
+    #delete(csv)
+    return true
+
+// Find the assets directory: $BEAUTALKS_ASSETS, ./assets, next to the
+// executable (../assets, assets), or a macOS bundle's Resources/assets.
+string8 find_assets():
+    if g_assets_dir == nil:
+        using keep():
+            g_assets_dir = locate_assets()
+    string8 out = g_assets_dir
+    return out
+
+private ref []char8 locate_assets():
+    string8 env = os_env("BEAUTALKS_ASSETS")
+    if #len(env) > 0 && fs.is_dir(path.join(env, "fonts")):
+        return strings.clone(env)
+    if fs.is_dir("assets/fonts"):
+        return strings.clone("assets")
+    string8 exe = exe_dir()
+    [3]string8 rel = ["../assets", "assets", "../Resources/assets"]
+    for r in rel:
+        ref []char8 cand = path.join(exe, r)
+        if fs.is_dir(path.join(cand, "fonts")):
+            return cand
+    return strings.clone("assets")
+
+// Load fonts and icons. Answers false (and prints why) if fonts are missing;
+// the toolkit still runs, with placeholder text.
+bool load_assets():
+    string8 dir = find_assets()
+    bool ok = true
+    using keep():
+        if !load_fonts(path.join(dir, "fonts")):
+            fmt.println("btui: no fonts in ", dir, "/fonts (set BEAUTALKS_ASSETS)")
+            ok = false
+        bool a = load_sheet(1, path.join(dir, "icons"))
+        bool b = load_sheet(2, path.join(dir, "icons"))
+        g_icons_ok = a || b
+        if !g_icons_ok:
+            fmt.println("btui: no icon sheets in ", dir, "/icons")
+    return ok
+
+// Draw icon `name` (Material Symbols name) `size` dp square with its top-left
+// at (x, y), tinted `col`. `fill` picks the filled variant.
+void icon(string8 name, f32 x, f32 y, f32 size, [4]u8 col, bool fill = false, bool flip_v = false):
+    if !g_icons_ok || col[3] == 0:
+        return
+    f32 sc = scale()
+    i32 k = 2 if sc > 1.25 else 1
+    if g_sheets[k].px == nil:
+        k = 3 - k
+    i32 dp = 24
+    if size <= 18.5:
+        dp = 18
+    else if size <= 20.5:
+        dp = 20
+    try IconRec rec = g_icon_index[k][name_key(name, fill, dp)] else:
+        return
+    // Into the atlas once per (sheet, name, fill, size).
+    u64 key = tile_key(TILE_ICON, k, dp, i32(name_key(name, fill, 0) & 0x7FFF), i32((name_key(name, fill, 0) >> 15) & 0x7FFF))
+    (Tile t, bool found) = tile_find(key)
+    if !found:
+        (i32 ax, i32 ay, bool ok) = atlas_alloc(rec.w, rec.h)
+        if !ok:
+            return
+        Sheet s = g_sheets[k]
+        for yy in 0..<rec.h:
+            for xx in 0..<rec.w:
+                atlas_set(ax + i32(xx), ay + i32(yy), s.px[i64(rec.y + i32(yy)) * i64(s.w) + i64(rec.x + i32(xx))])
+        t = Tile((ax, ay, rec.w, rec.h))
+        tile_store(key, t)
+    i32 dpx = px(size)
+    i32 x0 = px(x)
+    i32 y0 = px(y)
+    if flip_v:
+        quad_px(f32(x0), f32(y0), f32(dpx), f32(dpx), [f32(t.x), f32(t.y + t.h), f32(t.w), f32(0 - t.h)], col)
+    else:
+        quad_px(f32(x0), f32(y0), f32(dpx), f32(dpx), [f32(t.x), f32(t.y), f32(t.w), f32(t.h)], col)
+
+// Centre an icon in `r`.
+void icon_in(Rect r, string8 name, f32 size, [4]u8 col, bool fill = false):
+    icon(name, r.x + (r.w - size) * 0.5, r.y + (r.h - size) * 0.5, size, col, fill)
+
+// ── Brand images (RGBA) ────────────────────────────────────────────────────
+
+type Image: (Tile t, i32 w, i32 h, i32 gen, ref []u8 px, bool ok)
+
+private {u64: Image} g_images
+
+// Draw the image `assets/brand/<name>@Nx.bta` with its top-left at (x, y),
+// `h` dp tall (width from the aspect ratio). Answers the width drawn (dp).
+f32 image(string8 name, f32 x, f32 y, f32 h, [4]u8 tint = WHITE):
+    i32 k = 2 if scale() > 1.25 else 1
+    u64 key = name_key(name, false, k)
+    Image im
+    try im = g_images[key] else:
+        using keep():
+            (Sheet s, bool ok) = read_bta(path.join(find_assets(), "brand", #format(name, "@", k, "x.bta")))
+            im.ok = ok && s.ch == 4
+            im.px = s.px
+            im.w = s.w
+            im.h = s.h
+            im.gen = -1
+            g_images[key] = im
+    if !im.ok:
+        return 0.0
+    if im.gen != atlas_gen():
+        (i32 ax, i32 ay, bool ok) = atlas_alloc(im.w, im.h)
+        if !ok:
+            return 0.0
+        atlas_put_rgba(ax, ay, im.w, im.h, im.px[:])
+        im.t = Tile((ax, ay, im.w, im.h))
+        im.gen = atlas_gen()
+        g_images[key] = im
+    f32 w = h * f32(im.w) / f32(im.h)
+    (i32 x0, i32 y0, i32 pw, i32 ph) = snap(Rect((x, y, w, h)))
+    quad_px(f32(x0), f32(y0), f32(pw), f32(ph), [f32(im.t.x), f32(im.t.y), f32(im.t.w), f32(im.t.h)], tint)
+    return w

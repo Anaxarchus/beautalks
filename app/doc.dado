@@ -1,0 +1,306 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// The open document: a radio image (read from the radio, or a backup) as
+// one decoded radio.Channel per slot, edits, undo/redo, validation through
+// the library (radio.validate_channel), and the image to write
+// (radio.encode_channel of every changed, storable slot over the image that
+// was read). Nothing here knows a protocol.
+package main
+
+import "core:strings"
+import btui "../ui"
+import "../radio"
+
+const i32 SRC_NONE = 0
+const i32 SRC_RADIO = 1
+const i32 SRC_BACKUP = 2
+const i32 SRC_PROFILE = 3
+
+type Doc:
+    bool open
+    i64 mi
+    i32 source
+    ref []u8 base
+    ref []radio.Channel base_rows
+    ref []radio.Channel rows
+    ref []char8 title
+    ref []char8 path
+    ref []char8 fingerprint
+    i32 status_by
+    ref []char8 status_detail
+    ref [](ref []radio.Channel) undo
+    ref [](ref []radio.Channel) redo
+
+Doc g_doc
+
+^const radio.Model doc_model():
+    return &g_models[g_doc.mi]
+
+i32 doc_count():
+    return i32(#len(g_doc.rows))
+
+private ref []radio.Channel decode_all(^const radio.Model m, []u8 img):
+    ref []radio.Channel out = nil
+    for i in 0..<i64(m^.layout.count):
+        i32 number = m^.layout.first + i32(i)
+        radio.Channel c
+        try c = radio.decode_channel(m, img, number) else:
+            c = radio.empty_channel(number)
+        out = #append(out, c)
+    return out
+
+private void free_stack(^ref [](ref []radio.Channel) st):
+    for s in st^:
+        #delete(s)
+    #delete(st^)
+    st^ = nil
+
+// Open an image of model `mi` as the document.
+void doc_open(i64 mi, []u8 img, i32 source, string8 title, string8 file):
+    using app_keep():
+        #delete(g_doc.base)
+        #delete(g_doc.base_rows)
+        #delete(g_doc.rows)
+        #delete(g_doc.title)
+        #delete(g_doc.path)
+        free_stack(&g_doc.undo)
+        free_stack(&g_doc.redo)
+        g_doc.mi = mi
+        g_doc.source = source
+        g_doc.base = radio.copy_image(img)
+        g_doc.base_rows = decode_all(&g_models[mi], img)
+        g_doc.rows = decode_all(&g_models[mi], img)
+        g_doc.title = strings.clone(title)
+        g_doc.path = strings.clone(file)
+        g_doc.open = true
+    g_table_dirty = true
+
+void doc_set_status(string8 fingerprint, i32 by, string8 detail):
+    using app_keep():
+        #delete(g_doc.fingerprint)
+        #delete(g_doc.status_detail)
+        g_doc.fingerprint = strings.clone(fingerprint)
+        g_doc.status_by = by
+        g_doc.status_detail = strings.clone(detail)
+
+// Replace the working rows with what `img` holds (a profile applied onto
+// the image), keeping the base (what is on the radio) for the review.
+void doc_take_rows(^const radio.Model m, []u8 img):
+    doc_snapshot()
+    using app_keep():
+        #delete(g_doc.rows)
+        g_doc.rows = decode_all(m, img)
+    g_table_dirty = true
+
+// ── undo ─────────────────────────────────────────────────────────────────────
+
+// Call before every edit.
+void doc_snapshot():
+    using app_keep():
+        ref []radio.Channel s = nil
+        for c in g_doc.rows:
+            s = #append(s, c)
+        g_doc.undo = #append(g_doc.undo, s)
+        if #len(g_doc.undo) > 100:
+            #delete(g_doc.undo[0])
+            for i in 1..<#len(g_doc.undo):
+                g_doc.undo[i - 1] = g_doc.undo[i]
+            g_doc.undo = #resize(g_doc.undo, #len(g_doc.undo) - 1)
+        free_stack(&g_doc.redo)
+
+bool doc_undo():
+    i64 n = #len(g_doc.undo)
+    if n == 0:
+        return false
+    using app_keep():
+        g_doc.redo = #append(g_doc.redo, g_doc.rows)
+        g_doc.rows = g_doc.undo[n - 1]
+        g_doc.undo = #resize(g_doc.undo, n - 1)
+    g_table_dirty = true
+    return true
+
+bool doc_redo():
+    i64 n = #len(g_doc.redo)
+    if n == 0:
+        return false
+    using app_keep():
+        g_doc.undo = #append(g_doc.undo, g_doc.rows)
+        g_doc.rows = g_doc.redo[n - 1]
+        g_doc.redo = #resize(g_doc.redo, n - 1)
+    g_table_dirty = true
+    return true
+
+// ── comparing and validating ─────────────────────────────────────────────────
+
+bool same_channel(^radio.Channel a, ^radio.Channel b):
+    if a.empty != b.empty:
+        return false
+    if a.empty:
+        return true
+    if a.rx_hz != b.rx_hz || a.tx_hz != b.tx_hz || a.power != b.power || a.mode != b.mode:
+        return false
+    if a.scan != b.scan || a.bcl != b.bcl:
+        return false
+    if !radio.tone_equal(a.rx_tone, b.rx_tone) || !radio.tone_equal(a.tx_tone, b.tx_tone):
+        return false
+    return radio.channel_name(a) == radio.channel_name(b)
+
+bool row_changed(i32 i):
+    return !same_channel(&g_doc.rows[i], &g_doc.base_rows[i])
+
+i32 changed_count():
+    i32 n = 0
+    for i in 0..<doc_count():
+        if row_changed(i32(i)):
+            n += 1
+    return n
+
+// The library's issues for a slot (empty slots have none).
+i64 row_issues(i32 i, []radio.Issue out):
+    ^radio.Channel c = &g_doc.rows[i]
+    if c.empty:
+        return 0
+    return radio.validate_channel(doc_model(), c, out)
+
+// Hardware problems that stop a slot from being written (the library's
+// issues: out of band, unstorable tones, characters, power).
+bool row_blocked(i32 i):
+    [12]radio.Issue is
+    i64 n = row_issues(i, is[:])
+    return n > 0
+
+i32 problem_count():
+    i32 n = 0
+    for i in 0..<doc_count():
+        if row_blocked(i32(i)):
+            n += 1
+    return n
+
+i32 used_count():
+    i32 n = 0
+    for c in g_doc.rows:
+        if !c.empty:
+            n += 1
+    return n
+
+// The image to write: the image as read, with every changed slot that the
+// radio can store encoded into it. Answers (image, written, skipped).
+(ref []u8, i32, i32) doc_build_image():
+    ref []u8 img = radio.copy_image(g_doc.base)
+    i32 written = 0
+    i32 skipped = 0
+    for i in 0..<doc_count():
+        if !row_changed(i32(i)):
+            continue
+        if row_blocked(i32(i)):
+            skipped += 1
+            continue
+        try radio.encode_channel(doc_model(), img, &g_doc.rows[i]) else:
+            skipped += 1
+            continue
+        written += 1
+    return (img, written, skipped)
+
+// After a successful write: what was written is now what is on the radio.
+void doc_mark_written(ref []u8 img):
+    using app_keep():
+        #delete(g_doc.base)
+        #delete(g_doc.base_rows)
+        g_doc.base = radio.copy_image(img)
+        g_doc.base_rows = decode_all(doc_model(), img)
+        #delete(g_doc.rows)
+        g_doc.rows = decode_all(doc_model(), img)
+    g_table_dirty = true
+
+// ── text helpers ─────────────────────────────────────────────────────────────
+
+// MHz with 4 decimals, or 5-6 when the frequency needs them (146.5200,
+// 462.5625, 151.82000 stays 151.8200, 156.0125).
+ref []char8 mhz_text(i64 hz):
+    i64 whole = hz / 1000000
+    i64 frac = hz % 1000000
+    if frac < 0:
+        frac = 0 - frac
+    strings.Builder b = strings.builder(16)
+    radio.append_int(&b, whole)
+    strings.append_char(&b, '.')
+    // 5 decimals (12.5 kHz steps show whole, and a column lines up); 6 when needed
+    i64 digits = 5
+    if frac % 10 != 0:
+        digits = 6
+    i64 v = frac
+    for _ in digits..<6:
+        v = v / 10
+    radio.append_padded(&b, v, digits)
+    return strings.finish(&b)
+
+// A frequency for people ("146.52", "136" for 135.999999): the library's
+// formatter, so the app and the library's messages agree.
+ref []char8 mhz_short(i64 hz):
+    strings.Builder b = strings.builder(16)
+    radio.append_mhz_short(&b, hz)
+    return strings.finish(&b)
+
+// A band list for people: "108–136, 136–174 MHz" (radio.append_bands).
+ref []char8 band_words(string8 bands):
+    strings.Builder b = strings.builder(64)
+    radio.append_bands(&b, bands)
+    return strings.finish(&b)
+
+// What a model receives (and transmits, when that differs), in words.
+ref []char8 model_bands_words(^const radio.Model m):
+    string8 rx = m.rx_bands if #len(m.rx_bands) > 0 else m.tx_bands
+    ref []char8 r = band_words(rx)
+    string8 rs = r
+    if rx == m.tx_bands:
+        return #format("Receives and transmits ", rs)
+    ref []char8 tx = band_words(m.tx_bands)
+    string8 ts = tx
+    return #format("Receives ", rs, "  ·  transmits ", ts)
+
+ref []char8 tone_text(radio.Tone t):
+    if t.kind == radio.ToneKind.OFF:
+        return strings.clone("Off")
+    strings.Builder b = strings.builder(16)
+    radio.append_tone(&b, t)
+    return strings.finish(&b)
+
+// The duplex of a channel: 0 none, 1 plus, 2 minus, 3 split, 4 off.
+i32 dup_of(^radio.Channel c):
+    if c.tx_hz < 0:
+        return 4
+    i64 d = c.tx_hz - c.rx_hz
+    if d == 0:
+        return 0
+    i64 ad = d if d > 0 else 0 - d
+    if ad > 10000000:
+        return 3
+    return 1 if d > 0 else 2
+
+// The usual repeater offset for a frequency (2 m 0.6 MHz, 70 cm 5 MHz).
+i64 band_offset(i64 rx):
+    if rx >= 400000000:
+        return 5000000
+    return 600000
+
+[5]string8 DUP_NAMES = ["None", "Plus", "Minus", "Split", "Off"]
+
+// A licence / service note for a frequency, from the channel library when
+// it lists that frequency, else from the amateur bands. Advisory only.
+// The licence in full for the Info chip's tooltip ("" when unknown).
+string8 service_full(i64 rx):
+    try LibNote n = g_notes[rx] else:
+        (string8 t, i32 _) = service_note(rx)
+        if t == "Check licence":
+            return "beautalks has no licence note for this frequency. Check the rules where you use it."
+        return ""
+    return n.full
+
+(string8 note, i32 tone) service_note(i64 rx):
+    try LibNote n = g_notes[rx] else:
+        if (rx >= 144000000 && rx <= 148000000) || (rx >= 420000000 && rx <= 450000000) || (rx >= 222000000 && rx <= 225000000):
+            return ("Amateur licence", btui.TONE_NEUTRAL)
+        // every channel keeps an advisory chip, even with an error
+        return ("Check licence", btui.TONE_NEUTRAL)
+    return (n.text, n.tone)

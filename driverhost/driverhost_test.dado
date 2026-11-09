@@ -12,7 +12,7 @@ import "core:os/fs"
 
 const string8 ENGINE = "drivers/engines/uv17pro"
 const string8 MODEL = "models/uv-5rm.ini"
-const string8 IMAGE = "testdata/uv5rm_backup.img"
+const string8 IMAGE = "testdata/uv5rm.img"
 
 // Radio address ranges of the UV-5RM (from its INI).
 const [4]i64 REG_START = [0x0000, 0x9000, 0xA000, 0xD000]

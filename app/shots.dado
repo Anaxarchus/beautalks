@@ -1,0 +1,181 @@
+// beautalks - radio programming software
+// Copyright (C) 2026 Anaxarchus. Licensed under the GNU GPL v3 or later.
+//
+// `--shot NAME`: drive the app to one screen by itself (against a radio or
+// the emulator on --port), for tools/app_shots.sh. Every step is the same
+// call a click makes; nothing here is used otherwise.
+package main
+
+import "core:fmt"
+import btui "../ui"
+import "../radio"
+
+private i32 g_shot_frame
+private i32 g_shot_stage
+private i32 g_shot_idle
+private i32 g_shot_seen_stage
+private bool g_shot_told
+
+// Tell the script the screen has settled: nothing left to drive and no job
+// running for 40 frames (for "detecting" and "writing", a job running for a
+// while instead). It prints once on stderr.
+private void shot_ready_check():
+    bool want_busy = shot("detecting") || shot("writing")
+    i32 last = 2 if shot("writing") else 1
+    bool settled = job_busy() if want_busy else !job_busy()
+    if !settled || g_shot_stage != g_shot_seen_stage || (want_busy && g_shot_stage < last):
+        g_shot_seen_stage = g_shot_stage
+        g_shot_idle = 0
+        return
+    g_shot_idle += 1
+    i32 need = 150 if shot("writing") else 40
+    if g_shot_idle == need && !g_shot_told:
+        g_shot_told = true
+        btui.snackbar_hide()
+        fmt.eprintln("SHOT READY")
+
+private bool shot(string8 n):
+    return eq_s(g_shot) == n
+
+// Demo edits so the editor shows changed, error and warning cells.
+private void demo_edits():
+    if !g_doc.open || doc_count() < 8:
+        return
+    i32 a = -1
+    i32 b = -1
+    i32 c = -1
+    for i in 0..<doc_count():
+        if !g_doc.rows[i].empty:
+            if a < 0:
+                a = i32(i)
+            else if b < 0:
+                b = i32(i)
+            else if c < 0 && i > 4:
+                c = i32(i)
+    if c < 0:
+        return
+    doc_snapshot()
+    radio.set_channel_name(&g_doc.rows[a], "BASECAMP")
+    g_doc.rows[b].tx_tone = radio.Tone(kind: radio.ToneKind.CTCSS, value: 1000, inverted: false)
+    g_doc.rows[b].rx_tone = radio.Tone(kind: radio.ToneKind.CTCSS, value: 1000, inverted: false)
+    g_doc.rows[c].rx_hz = 30500000
+    g_doc.rows[c].tx_hz = 30500000
+
+void shot_step():
+    if #len(g_shot) == 0:
+        return
+    g_shot_frame += 1
+    btui.animating()
+    if g_shot_frame < 3:
+        return
+    shot_ready_check()
+    if g_shot_stage == 0:
+        g_shot_stage = 1
+        if shot("radio") || shot("radios") || shot("backups") || shot("settings"):
+            if shot("radios"):
+                g_page = PAGE_RADIOS
+            if shot("backups"):
+                g_page = PAGE_BACKUPS
+            if shot("settings"):
+                g_page = PAGE_SETTINGS
+            return
+        // "error": a real detection against an emulator that never answers
+        if shot("detecting") || shot("identity") || shot("which") || shot("error"):
+            start_detect(best_port())
+            return
+        // the UV-5RE answers like several models: these shots name it, as
+        // the "Which radio is this?" choice would (and then remembers)
+        bool five_re = shot("untested") || shot("verify") || shot("verify-channels") || shot("verify-power") || shot("verify-pass")
+        start_read(best_port(), "uv-5r" if five_re else "")
+        return
+    if job_busy():
+        return
+    if g_shot_stage == 1:
+        g_shot_stage = 2
+        btui.snackbar_hide()
+        if shot("error"):
+            g_err_show_log = true
+        if shot("which"):
+            ^Job j = job_prepare(JOB_DETECT)
+            using app_keep():
+                // the tested UV-5R first (as detection orders them), then kin
+                i64 first = model_index("uv-5r")
+                if first >= 0:
+                    j.cands = #append(j.cands, first)
+                    j.matches = #append(j.matches, radio.MatchKind.TESTED)
+                for k in 0..<#len(g_models):
+                    if g_models[k].engine == "uv5r" && #len(j.cands) < 4 && i64(k) != first:
+                        j.cands = #append(j.cands, i64(k))
+                        j.matches = #append(j.matches, radio.MatchKind.PROTOCOL if #len(j.cands) > 1 else radio.MatchKind.TESTED)
+                j.how = strings_clone("ident AA 30 76 04 00 05 20 DD")
+            which_radio_open(j)
+            return
+        if shot("channels") || shot("channels-dark") || shot("tone") || shot("review") || shot("untested") || shot("confirm") || shot("writing") || shot("result") || shot("profiles") || shot("apply") || shot("apply-keep") || shot("library"):
+            demo_edits()
+        if shot("channels-error"):
+            demo_edits()
+        if shot("tone"):
+            tone_open(g_doc.rows[1].tx_tone, 1, K_TXT, 0)
+        if shot("review") || shot("untested") || shot("confirm") || shot("writing") || shot("result"):
+            // the error row is not written; fix it for the write screens
+            for i in 0..<doc_count():
+                if g_doc.rows[i].rx_hz == 30500000:
+                    g_doc.rows[i].rx_hz = 146550000
+                    g_doc.rows[i].tx_hz = 146550000
+            write_flow_open()
+        if shot("untested"):
+            g_wf = WF_UNTESTED
+        if shot("confirm") || shot("writing") || shot("result"):
+            g_wf = WF_CONFIRM
+            g_wf_ack = true
+        if shot("writing") || shot("result"):
+            begin_write()
+        if shot("verify") || shot("verify-channels") || shot("verify-power") || shot("verify-pass"):
+            verify_flow_open(true)
+            g_vf_consent = true
+        if shot("verify-channels") || shot("verify-power") || shot("verify-pass"):
+            g_vf = VF_READING
+            start_verify_begin()
+        if shot("profiles") || shot("apply") || shot("apply-keep") || shot("library"):
+            profile_from_doc()
+        if shot("library"):
+            g_pf_mode = PF_LIBRARY
+            g_lib_set = 7
+        if shot("apply") || shot("apply-keep"):
+            using app_keep():
+                radio.Entry bad = g_prof.entries[0]
+                bad.rx_hz = 30500000
+                bad.tx_hz = 30500000
+                bad.name = g_prof.add_text("LOWBAND")
+                g_prof.entries = #append(g_prof.entries, bad)
+                radio.Entry longn = g_prof.entries[1]
+                longn.name = g_prof.add_text("Kenai Lake Trail")
+                g_prof.entries = #append(g_prof.entries, longn)
+            apply_open()
+            // the skipped row selected: its detail line shows in full
+            g_at.cur_row = 0
+            if shot("apply-keep"):
+                g_ap_pack = 1
+                g_prof.entries[2].slot = g_prof.entries[1].slot
+                apply_run()
+                g_at.cur_row = 1
+        return
+    if g_shot_stage == 2 && !job_busy():
+        g_shot_stage = 3
+        if shot("channels-error"):
+            // the table's view is built by now: put the cursor on the error
+            for i in 0..<#len(g_view):
+                if g_doc.rows[g_view[i]].rx_hz == 30500000:
+                    g_ct.cur_row = i32(i)
+            g_ct.cur_col = 2
+            btui.set_focus(btui.id("chan"))
+            btui.show_focus_ring()
+        if (shot("verify-power") || shot("verify-pass")) && g_vf == VF_CHANNELS:
+            g_vf = VF_WRITING
+            start_verify_step(JOB_VERIFY_WRITE)
+        return
+    if g_shot_stage == 3 && !job_busy():
+        g_shot_stage = 4
+        if shot("verify-pass") && g_vf == VF_POWER:
+            if record(true):
+                g_vf = VF_PASS
