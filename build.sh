@@ -22,7 +22,7 @@
 #       --yes             do not ask before tagging and publishing
 #
 # Environment: BEAUTALKS_GUI_PKG (default below), BEAUTALKS_REPO (owner/repo),
-# BEAUTALKS_MIN_MACOS (default 11.0), BEAUTALKS_MAC_DADO_FLAGS (e.g. --no-lto),
+# BEAUTALKS_MIN_MACOS (default 14.0: sokol_app's Metal backend uses CADisplayLink unguarded, macOS 14+), BEAUTALKS_MAC_DADO_FLAGS (e.g. --no-lto),
 # ZIG (the pinned zig, found from `dado` otherwise).
 #
 # Bash 3.2 (macOS's /bin/bash) compatible on purpose.
@@ -38,7 +38,7 @@ GUI_PKG="${BEAUTALKS_GUI_PKG:-app}"
 CLI_PKG="cli"
 TEST_PKGS="radio cli driverhost updater ui"
 REPO="${BEAUTALKS_REPO:-Anaxarchus/beautalks}"
-MIN_MACOS="${BEAUTALKS_MIN_MACOS:-11.0}"
+MIN_MACOS="${BEAUTALKS_MIN_MACOS:-14.0}"
 SYSROOT_ID="jammy-1"
 SYSROOT_TGZ="$ROOT/tools/release/linux-sysroot-x86_64-$SYSROOT_ID.tar.gz"
 WIN_DADO_TARGET="x86_64-w64-mingw32"

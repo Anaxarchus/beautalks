@@ -43,6 +43,9 @@ const u32 MOD_SHIFT = 0x1
 const u32 MOD_CTRL = 0x2
 const u32 MOD_ALT = 0x4
 const u32 MOD_SUPER = 0x8
+// In a take_key/peek_key `want`: "the platform's command modifier" (Cmd on
+// macOS, Ctrl elsewhere). To SEND one (tests), use cmd_mod().
+const u32 MOD_CMD = MOD_CTRL
 
 type KeyEv: (i32 key, u32 mods, bool repeat, bool taken)
 
@@ -291,22 +294,36 @@ u32 mods():
 bool shift_down():
     return (g_mods & MOD_SHIFT) != 0
 
+// The platform's key conventions: on macOS Cmd is the command modifier
+// (copy, paste, undo, to the first/last row) and Alt moves by word; elsewhere
+// Ctrl does both. A runtime switch, so tests check the macOS mapping on any
+// system (set_mac_keys, or BTUI_MAC_KEYS=1 for a headless run).
+private bool g_mac_keys = #OS == #DARWIN
+
+void set_mac_keys(bool on):
+    g_mac_keys = on
+
+bool mac_keys():
+    return g_mac_keys
+
+// The modifier a real command shortcut arrives with (Cmd / Ctrl).
+u32 cmd_mod():
+    return MOD_SUPER if g_mac_keys else MOD_CTRL
+
+// The modifier that moves or deletes by word (Alt / Ctrl).
+u32 word_mod():
+    return MOD_ALT if g_mac_keys else MOD_CTRL
+
 // Cmd on macOS, Ctrl elsewhere.
 bool cmd_down():
     return is_cmd(g_mods)
 
 bool is_cmd(u32 m):
-    when #OS == #DARWIN:
-        return (m & MOD_SUPER) != 0
-    else:
-        return (m & MOD_CTRL) != 0
+    return (m & cmd_mod()) != 0
 
 // The label for the command modifier in menus and tooltips.
 string8 cmd_label():
-    when #OS == #DARWIN:
-        return "⌘"
-    else:
-        return "Ctrl+"
+    return "⌘" if g_mac_keys else "Ctrl+"
 
 // Wheel this frame in "lines" (sokol units); see push_wheel.
 f32 wheel_x():

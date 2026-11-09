@@ -77,7 +77,7 @@ private void frame():
     else:
         forms_page(area)
     // global shortcuts nobody took
-    if btui.take_key(btui.KEY_D, btui.MOD_CTRL):
+    if btui.take_key(btui.KEY_D, btui.MOD_CMD):
         btui.set_dark(!btui.is_dark())
     if btui.snackbar(area):
         btui.snackbar_show("Restored the previous channel list")

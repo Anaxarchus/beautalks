@@ -228,6 +228,9 @@ bool headless_up(f32 w, f32 h, f32 scale, FrameFn frame):
     g_frame_fn = frame
     up_common(true)
     set_viewport(w, h, scale)
+    // a headless run can check the macOS key mapping on any system
+    if os_env("BTUI_MAC_KEYS") == "1":
+        set_mac_keys(true)
     return true
 
 // Advance the clock by `dt` seconds and build one frame from the queued input.

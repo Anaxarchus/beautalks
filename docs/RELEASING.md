@@ -67,7 +67,7 @@ output goes to `dist/<version>/logs/`, with its tail printed if it fails):
    compiled `drivers/engines/*.js` differ from the committed ones, the release stops: commit them
    first, so the tag holds exactly what ships. (`--no-repo-manifest`: the release does not dirty
    `drivers/manifest.json`; the uploaded `drivers-manifest.json` is the record.)
-4. **macOS.** `arm64` and `x86_64` builds with Apple clang (`MACOSX_DEPLOYMENT_TARGET=11.0`), joined
+4. **macOS.** `arm64` and `x86_64` builds with Apple clang (`MACOSX_DEPLOYMENT_TARGET=14.0`), joined
    with `lipo` into a universal binary. If the Intel half fails it ships Apple silicon only, says
    so in the warnings and in the release notes (`--mac-arch arm64` skips the attempt). Then
    `beautalks-cli version` must print `beautalks <version>`. Then `beautalks.app`, zipped with `ditto -c -k --keepParent`, and a `.dmg` with an Applications
@@ -105,7 +105,7 @@ Inside the app bundle:
 
 ```
 beautalks.app/Contents/
-  Info.plist           io.github.anaxarchus.beautalks, version, LSMinimumSystemVersion 11.0,
+  Info.plist           io.github.anaxarchus.beautalks, version, LSMinimumSystemVersion 14.0,
                        NSHighResolutionCapable (packaging/macos/Info.plist.in)
   MacOS/beautalks      the GUI;  MacOS/beautalks-cli  the CLI
   Resources/beautalks.icns
@@ -133,7 +133,7 @@ lipo -archs $D/stage/mac/beautalks.app/Contents/MacOS/beautalks       # arm64 x8
 lipo -archs $D/stage/mac/beautalks.app/Contents/MacOS/beautalks-cli
 plutil -p $D/stage/mac/beautalks.app/Contents/Info.plist | head -20
 otool -L $D/stage/mac/beautalks.app/Contents/MacOS/beautalks           # only /System and /usr/lib
-vtool -show-build $D/stage/mac/beautalks.app/Contents/MacOS/beautalks | grep minos   # 11.0
+vtool -show-build $D/stage/mac/beautalks.app/Contents/MacOS/beautalks | grep minos   # 14.0
 open $D/stage/mac/beautalks.app            # window opens, fonts and icons drawn, the Dock icon is purple "b"
 $D/stage/mac/beautalks.app/Contents/MacOS/beautalks-cli models | head -3   # models found from any directory
 cd /tmp && unzip -q -o ~/dev/Dado/beautalks/$D/assets/beautalks-$V-macos-*.zip && open beautalks.app; cd -

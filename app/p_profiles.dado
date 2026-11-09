@@ -393,7 +393,7 @@ void profiles_page(btui.Rect sheet):
     btui.TableEvent ev = btui.table("prof", tr, g_pcols[:], i32(#len(g_prof.entries)), &g_pt, ptext, pdeco, pmsg)
     if ev.kind != btui.TEV_NONE:
         papply(ev)
-    if btui.take_key(btui.KEY_S, btui.MOD_CTRL):
+    if btui.take_key(btui.KEY_S, btui.MOD_CMD):
         prof_save()
 
 private void prof_delete_selected():

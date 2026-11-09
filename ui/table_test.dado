@@ -42,6 +42,55 @@ private void frame():
 private void step():
     headless_frame(0.016)
 
+// Put the cursor on `row` (column Name) with only that row selected, the
+// way a plain arrow key does.
+private void cursor_at(i32 row):
+    set_focus(id("t"))
+    g_ts.editing = false
+    g_ts.cur_col = 1
+    g_ts.cur_row = row - 1
+    push_key(KEY_DOWN, 0)
+    step()
+
+private bool command_keys(bool mac):
+    bool ok = true
+    string8 keys = "Cmd" if mac else "Ctrl"
+    // Cmd/Ctrl+End to the last row
+    cursor_at(500)
+    push_key(KEY_END, cmd_mod())
+    step()
+    for i in 0..<40:
+        step()
+    ok = #expect(g_ts.cur_row == 999 && g_max_row == 999, keys, "+End reaches row 1000 (cursor ", g_ts.cur_row, ", asked up to ", g_max_row, ")") && ok
+    // the other modifier is not the command key: End alone goes to the last column
+    cursor_at(500)
+    push_key(KEY_END, MOD_SUPER if !mac else MOD_CTRL)
+    step()
+    ok = #expect(g_ts.cur_row == 500, "the other modifier+End stays on the row (", keys, " mapping)") && ok
+    // Shift+Up extends the selection
+    cursor_at(999)
+    push_key(KEY_UP, MOD_SHIFT)
+    push_key(KEY_UP, MOD_SHIFT)
+    step()
+    ok = #expect(table_selected_count(&g_ts) == 3 && g_ts.cur_row == 997, "shift extends: ", table_selected_count(&g_ts)) && ok
+    // typing starts an edit that replaces the value; Enter commits and moves down
+    cursor_at(997)
+    g_events = 0
+    push_text("Truck")
+    step()
+    ok = #expect(g_ts.editing && field_text(&g_ts.edit) == "Truck", "typing edits (", keys, "): '", field_text(&g_ts.edit), "'") && ok
+    push_key(KEY_ENTER, 0)
+    step()
+    ok = #expect(g_last.kind == TEV_COMMIT && g_last.text == "Truck" && g_last.row == 997 && g_last.col == 1, "Enter commits (", keys, "): ", g_last.kind, " ", g_last.row) && ok
+    ok = #expect(!g_ts.editing && g_ts.cur_row == 998, "and moves down (", keys, ")") && ok
+    // Cmd/Ctrl+A selects every row
+    cursor_at(10)
+    push_key(KEY_A, cmd_mod())
+    step()
+    ok = #expect(table_selected_count(&g_ts) == 1000, keys, "+A selects all: ", table_selected_count(&g_ts)) && ok
+    cursor_at(997)
+    return ok
+
 i32 test():
     bool ok = #expect(headless_up(800.0, 600.0, 1.0, frame), "headless up")
     _ = load_assets()
@@ -76,26 +125,15 @@ i32 test():
     i32 row = g_ts.cur_row
     f32 y = f32(row) * ROW_H
     ok = #expect(row > 15 && g_ts.scroll.y <= y && g_ts.scroll.y + 400.0 - HEAD_H >= y + ROW_H, "page down scrolls: row ", row, " scroll ", g_ts.scroll.y) && ok
-    // Ctrl+End to the last row
-    push_key(KEY_END, MOD_CTRL)
-    step()
-    for i in 0..<40:
-        step()
-    ok = #expect(g_ts.cur_row == 999 && g_max_row == 999, "Ctrl+End reaches row 1000 (asked up to ", g_max_row, ")") && ok
-    // Shift+Up extends the selection
-    push_key(KEY_UP, MOD_SHIFT)
-    push_key(KEY_UP, MOD_SHIFT)
-    step()
-    ok = #expect(table_selected_count(&g_ts) == 3, "shift extends: ", table_selected_count(&g_ts)) && ok
-    // typing starts an edit that replaces the value; Enter commits and moves down
-    g_events = 0
-    push_text("Truck")
-    step()
-    ok = #expect(g_ts.editing && field_text(&g_ts.edit) == "Truck", "typing edits: '", field_text(&g_ts.edit), "'") && ok
-    push_key(KEY_ENTER, 0)
-    step()
-    ok = #expect(g_last.kind == TEV_COMMIT && g_last.text == "Truck" && g_last.row == 997 && g_last.col == 1, "Enter commits: ", g_last.kind, " ", g_last.row) && ok
-    ok = #expect(!g_ts.editing && g_ts.cur_row == 998, "and moves down") && ok
+    // the command-key steps, with this system's key mapping and then the
+    // other one (macOS: Cmd; elsewhere: Ctrl); each step starts from a state
+    // set here, so one failure doesn't drag the next ones down with it
+    bool native = mac_keys()
+    for pass in 0..<2:
+        bool mac = native if pass == 0 else !native
+        set_mac_keys(mac)
+        ok = command_keys(mac) && ok
+    set_mac_keys(native)
     // Esc cancels an edit
     push_key(KEY_F2, 0)
     step()

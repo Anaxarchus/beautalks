@@ -233,6 +233,8 @@ i32 test():
     g_theme_forced = true
     btui.set_dark(false)
     ok = #expect(btui.headless_up(1440.0, 900.0, 1.0, app_frame), "headless up") && ok
+    if btui.os_env("BTUI_MAC_KEYS") == "1":
+        ok = #expect(btui.mac_keys(), "BTUI_MAC_KEYS=1: the macOS key mapping is on") && ok
     app_init()
     ok = #expect(#len(g_models) > 10 && #len(g_sets) > 5, "models and channel library loaded") && ok
 
@@ -280,6 +282,14 @@ i32 test():
     // undo and redo
     ok = #expect(doc_undo() && g_doc.rows[s0].tx_tone.kind == radio.ToneKind.OFF, "undo the tone") && ok
     ok = #expect(doc_redo() && g_doc.rows[s0].tx_tone.value == 1000, "redo the tone") && ok
+    // the same by keyboard, with the platform's command key (Cmd on macOS)
+    btui.clear_focus()
+    btui.push_key(btui.KEY_Z, btui.cmd_mod())
+    settle()
+    ok = #expect(g_doc.rows[s0].tx_tone.kind == radio.ToneKind.OFF, btui.cmd_label(), "Z undoes") && ok
+    btui.push_key(btui.KEY_Z, btui.cmd_mod() | btui.MOD_SHIFT)
+    settle()
+    ok = #expect(g_doc.rows[s0].tx_tone.value == 1000, btui.cmd_label(), "Shift+Z redoes") && ok
     ok = #expect(changed_count() == 1 && problem_count() == 0, "one changed slot, no problems") && ok
     // write: review -> confirm -> progress -> result
     write_flow_open()

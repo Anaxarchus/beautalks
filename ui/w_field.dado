@@ -122,15 +122,13 @@ i32 field_keys(^Field f, bool(i32) accept = nil):
     string8 s = f.text
     i64 n = #len(s)
     // word moves: Alt on macOS, Ctrl elsewhere; line moves: Cmd on macOS
-    u32 word_mod = MOD_ALT
-    when #OS != #DARWIN:
-        word_mod = MOD_CTRL
+    u32 wmod = word_mod()
     for i in 0..<key_count():
         KeyEv k = key_at(i)
         if k.taken:
             continue
         bool shift = (k.mods & MOD_SHIFT) != 0
-        bool word = (k.mods & word_mod) != 0
+        bool word = (k.mods & wmod) != 0
         bool cmdk = is_cmd(k.mods)
         i64 old_c = f.caret
         bool used = true
@@ -140,7 +138,7 @@ i32 field_keys(^Field f, bool(i32) accept = nil):
             if field_has_selection(f) && !shift:
                 (i64 a, i64 _) = field_selection(f)
                 f.caret = a
-            else if cmdk && #OS == #DARWIN:
+            else if cmdk && mac_keys():
                 f.caret = 0
             else if word:
                 f.caret = word_left(s, f.caret)
@@ -150,7 +148,7 @@ i32 field_keys(^Field f, bool(i32) accept = nil):
             if field_has_selection(f) && !shift:
                 (i64 _, i64 b) = field_selection(f)
                 f.caret = b
-            else if cmdk && #OS == #DARWIN:
+            else if cmdk && mac_keys():
                 f.caret = n
             else if word:
                 f.caret = word_right(s, f.caret)

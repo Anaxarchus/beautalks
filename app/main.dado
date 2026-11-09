@@ -148,13 +148,13 @@ private void leave_flows():
     verify_flow_close()
 
 private void global_keys():
-    if btui.take_key(btui.KEY_Z, btui.MOD_CTRL):
+    if btui.take_key(btui.KEY_Z, btui.MOD_CMD):
         if g_doc.open && doc_undo():
             btui.snackbar_show("Undone")
-    if btui.take_key(btui.KEY_Z, btui.MOD_CTRL | btui.MOD_SHIFT) || btui.take_key(btui.KEY_Y, btui.MOD_CTRL):
+    if btui.take_key(btui.KEY_Z, btui.MOD_CMD | btui.MOD_SHIFT) || btui.take_key(btui.KEY_Y, btui.MOD_CMD):
         if g_doc.open && doc_redo():
             btui.snackbar_show("Redone")
-    if btui.take_key(btui.KEY_D, btui.MOD_CTRL | btui.MOD_SHIFT):
+    if btui.take_key(btui.KEY_D, btui.MOD_CMD | btui.MOD_SHIFT):
         btui.set_dark(!btui.is_dark())
 
 // ── the port watcher, each frame ─────────────────────────────────────────────

@@ -49,6 +49,54 @@ private void click(f32 x, f32 y):
     step()
     step()
 
+// The field focused, holding `text`, caret at the end.
+private void field_with(string8 text):
+    set_focus(id("f#tf"))
+    field_set(&g_f, text)
+    step()
+
+private bool field_keys_test(bool mac):
+    bool ok = true
+    string8 keys = "Cmd" if mac else "Ctrl"
+    field_with("")
+    i32 e0 = g_edits
+    push_text("Truck radio")
+    step()
+    ok = #expect(field_text(&g_f) == "Truck radio" && g_edits == e0 + 1, "typing (", keys, "): '", field_text(&g_f), "'") && ok
+    // select a word with Shift+Left and replace it
+    field_with("Truck radio")
+    for _ in 0..<5:
+        push_key(KEY_LEFT, MOD_SHIFT)
+    step()
+    push_text("van")
+    step()
+    ok = #expect(field_text(&g_f) == "Truck van", "replace the selection: '", field_text(&g_f), "'") && ok
+    // word delete (Alt on macOS, Ctrl elsewhere)
+    field_with("Truck van")
+    push_key(KEY_BACKSPACE, word_mod())
+    step()
+    ok = #expect(field_text(&g_f) == "Truck ", "word backspace (", keys, "): '", field_text(&g_f), "'") && ok
+    // select all + cut
+    field_with("Truck ")
+    clipboard_set("")
+    push_key(KEY_A, cmd_mod())
+    push_key(KEY_X, cmd_mod())
+    step()
+    ok = #expect(field_text(&g_f) == "" && clipboard_get() == "Truck ", keys, "+A, ", keys, "+X cut: '", field_text(&g_f), "' clip '", clipboard_get(), "'") && ok
+    // paste twice
+    field_with("")
+    clipboard_set("Truck ")
+    push_key(KEY_V, cmd_mod())
+    push_key(KEY_V, cmd_mod())
+    step()
+    ok = #expect(field_text(&g_f) == "Truck Truck ", keys, "+V twice: '", field_text(&g_f), "'") && ok
+    // the other modifier is not a command: no paste
+    field_with("")
+    push_key(KEY_V, MOD_SUPER if !mac else MOD_CTRL)
+    step()
+    ok = #expect(field_text(&g_f) == "", "the other modifier+V doesn't paste (", keys, " mapping)") && ok
+    return ok
+
 i32 test():
     bool ok = #expect(headless_up(800.0, 600.0, 1.0, frame), "headless up")
     _ = load_assets()
@@ -86,33 +134,20 @@ i32 test():
     push_key(KEY_TAB, MOD_SHIFT)
     step()
     ok = #expect(focus_id() == id("A"), "Shift+Tab goes back") && ok
-    // text field: click to focus, type, select a word, replace it
+    // text field: click to focus
     click(100.0, 148.0)
     ok = #expect(focus_id() == id("f#tf"), "click focuses the field") && ok
-    push_text("Truck radio")
-    step()
-    ok = #expect(field_text(&g_f) == "Truck radio" && g_edits == 1, "typing: '", field_text(&g_f), "'") && ok
-    push_key(KEY_LEFT, MOD_SHIFT)
-    push_key(KEY_LEFT, MOD_SHIFT)
-    push_key(KEY_LEFT, MOD_SHIFT)
-    push_key(KEY_LEFT, MOD_SHIFT)
-    push_key(KEY_LEFT, MOD_SHIFT)
-    step()
-    push_text("van")
-    step()
-    ok = #expect(field_text(&g_f) == "Truck van", "replace the selection: '", field_text(&g_f), "'") && ok
-    // word delete, select all + cut + paste through the clipboard
-    push_key(KEY_BACKSPACE, MOD_ALT if #OS == #DARWIN else MOD_CTRL)
-    step()
-    ok = #expect(field_text(&g_f) == "Truck ", "word backspace: '", field_text(&g_f), "'") && ok
-    push_key(KEY_A, MOD_CTRL)
-    push_key(KEY_X, MOD_CTRL)
-    step()
-    ok = #expect(field_text(&g_f) == "" && clipboard_get() == "Truck ", "cut") && ok
-    push_key(KEY_V, MOD_CTRL)
-    push_key(KEY_V, MOD_CTRL)
-    step()
-    ok = #expect(field_text(&g_f) == "Truck Truck ", "paste twice: '", field_text(&g_f), "'") && ok
+    // editing keys, with this system's key mapping and then the other one
+    // (macOS: Cmd for commands, Alt for words; elsewhere Ctrl for both). Each
+    // step sets its own starting text, so a failure doesn't cascade. The
+    // clipboard in a headless run is the toolkit's own (never the system
+    // pasteboard), so this is the same on every system.
+    bool native = mac_keys()
+    for pass in 0..<2:
+        bool mac = native if pass == 0 else !native
+        set_mac_keys(mac)
+        ok = field_keys_test(mac) && ok
+    set_mac_keys(native)
     // the number filter, driving the editing core directly
     Field nf
     field_set(&nf, "146")

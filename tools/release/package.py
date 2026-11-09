@@ -131,6 +131,9 @@ def models_by_status():
             t = f.read()
         name = (ini_value(t, "model", "vendor") + " " + ini_value(t, "model", "name")).strip()
         status = ini_value(t, "model", "tested")
+        notes = ini_value(t, "model", "notes")
+        if status == "write" and notes:
+            name = "%s: %s" % (name, notes)
         (write if status == "write" else read if status == "read" else untested).append(name)
     return write, read, untested
 
@@ -210,8 +213,11 @@ def cmd_notes(a):
     if read:
         lines.append("Read checked on hardware (writing stays disabled): " + ", ".join(read) + ".\n")
     if untested:
-        lines.append("%d more model definitions ship as **untested**: beautalks can try to read them, and "
-                     "refuses to write to them until they are verified (`beautalks-cli verify`).\n" % len(untested))
+        lines.append("%d more model definitions ship as **untested**: beautalks can read them. Before the first "
+                     "write it offers a guided verification (an identical write-back, then you confirm the radio "
+                     "still works), which marks that radio as tested on your computer; writing without it needs an "
+                     "explicit risk confirmation. A backup is always taken first and every write is read back to "
+                     "verify.\n" % len(untested))
     built = [n for n, f in (("macOS (native, Apple clang)", a.mac_zip), ("Windows", a.win_zip), ("Linux", a.lin_tar)) if f]
     lines.append("Built: %s. Windows and Linux are cross-compiled with Dado %s's pinned zig; "
                  "radios have so far been tested from macOS only.\n" % (", ".join(built), a.dado_version))
